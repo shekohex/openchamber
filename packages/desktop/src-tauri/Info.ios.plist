@@ -4,6 +4,8 @@
 <dict>
 	<key>NSLocalNetworkUsageDescription</key>
 	<string>OpenChamber needs local network access in development to connect to the local web server.</string>
+	<key>NSFaceIDUsageDescription</key>
+	<string>OpenChamber uses Face ID to unlock the app.</string>
 	<key>NSAppTransportSecurity</key>
 	<dict>
 		<key>NSAllowsLocalNetworking</key>

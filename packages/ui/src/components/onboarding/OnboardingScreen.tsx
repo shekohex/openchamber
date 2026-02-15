@@ -1,6 +1,6 @@
 import React from 'react';
 import { RiFileCopyLine, RiCheckLine, RiExternalLinkLine } from '@remixicon/react';
-import { isDesktopShell, isTauriShell } from '@/lib/desktop';
+import { isDesktopShell, isTauriShell, writeTextToClipboard } from '@/lib/desktop';
 import { Input } from '@/components/ui/input';
 import { Button } from '@/components/ui/button';
 import { updateDesktopSettings } from '@/lib/persistence';
@@ -147,7 +147,9 @@ export function OnboardingScreen({ onCliAvailable }: OnboardingScreenProps) {
 
   const handleCopy = React.useCallback(async () => {
     try {
-      await navigator.clipboard.writeText(INSTALL_COMMAND);
+      if (!(await writeTextToClipboard(INSTALL_COMMAND))) {
+        throw new Error('copy failed');
+      }
       setCopied(true);
       setTimeout(() => setCopied(false), 2000);
     } catch (err) {

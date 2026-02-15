@@ -240,6 +240,12 @@ const applyDesktopUiPreferences = (settings: DesktopSettings) => {
       store.setNotificationMode(settings.notificationMode);
     }
   }
+  if (typeof settings.mobileHapticsEnabled === 'boolean' && settings.mobileHapticsEnabled !== store.mobileHapticsEnabled) {
+    store.setMobileHapticsEnabled(settings.mobileHapticsEnabled);
+  }
+  if (typeof settings.biometricLockEnabled === 'boolean' && settings.biometricLockEnabled !== store.biometricLockEnabled) {
+    store.setBiometricLockEnabled(settings.biometricLockEnabled);
+  }
   if (typeof settings.notifyOnSubtasks === 'boolean' && settings.notifyOnSubtasks !== store.notifyOnSubtasks) {
     store.setNotifyOnSubtasks(settings.notifyOnSubtasks);
   }
@@ -425,6 +431,12 @@ const sanitizeWebSettings = (payload: unknown): DesktopSettings | null => {
   }
   if (typeof candidate.notificationMode === 'string' && (candidate.notificationMode === 'always' || candidate.notificationMode === 'hidden-only')) {
     result.notificationMode = candidate.notificationMode;
+  }
+  if (typeof candidate.mobileHapticsEnabled === 'boolean') {
+    result.mobileHapticsEnabled = candidate.mobileHapticsEnabled;
+  }
+  if (typeof candidate.biometricLockEnabled === 'boolean') {
+    result.biometricLockEnabled = candidate.biometricLockEnabled;
   }
   if (typeof candidate.notifyOnSubtasks === 'boolean') {
     result.notifyOnSubtasks = candidate.notifyOnSubtasks;

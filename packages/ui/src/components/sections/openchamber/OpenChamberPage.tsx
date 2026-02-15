@@ -100,7 +100,7 @@ export const OpenChamberPage: React.FC<OpenChamberPageProps> = ({ section, userC
 
 // Visual section: Theme Mode, Font Size, Spacing, Corner Radius, Input Bar Offset (mobile)
 const VisualSectionContent: React.FC = () => {
-    return <OpenChamberVisualSettings visibleSettings={['theme', 'fontSize', 'terminalFontSize', 'spacing', 'cornerRadius', 'inputBarOffset', 'terminalQuickKeys']} />;
+    return <OpenChamberVisualSettings visibleSettings={['theme', 'fontSize', 'terminalFontSize', 'spacing', 'cornerRadius', 'inputBarOffset', 'terminalQuickKeys', 'mobileHaptics']} />;
 };
 
 // Chat section: Default Tool Output, Diff layout, Show reasoning traces, Queue mode, Persist draft

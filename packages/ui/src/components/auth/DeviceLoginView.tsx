@@ -8,7 +8,7 @@ import { resolveInstanceApiBaseUrlAfterLogin } from '@/lib/auth/resolveInstanceA
 import { setToken } from '@/lib/auth/tokenStorage';
 import { useInstancesStore } from '@/stores/useInstancesStore';
 import { useUIStore } from '@/stores/useUIStore';
-import { isMobileRuntime } from '@/lib/desktop';
+import { openExternalUrl, writeTextToClipboard } from '@/lib/desktop';
 
 type DeviceLoginViewProps = {
   forceOpen?: boolean;
@@ -178,7 +178,10 @@ export const DeviceLoginView: React.FC<DeviceLoginViewProps> = ({ forceOpen = fa
 
   const handleCopy = React.useCallback(async (text: string, label: string) => {
     try {
-      await navigator.clipboard.writeText(text);
+      const copied = await writeTextToClipboard(text);
+      if (!copied) {
+        throw new Error('copy_failed');
+      }
       toast.success(`${label} copied`);
     } catch {
       toast.error(`Failed to copy ${label.toLowerCase()}`);
@@ -186,37 +189,10 @@ export const DeviceLoginView: React.FC<DeviceLoginViewProps> = ({ forceOpen = fa
   }, []);
 
   const openVerificationUrl = React.useCallback(async (url: string) => {
-    if (typeof window === 'undefined') {
-      return;
-    }
-
-    type TauriShell = { shell?: { open?: (value: string) => Promise<unknown> } };
-    const tauri = (window as unknown as { __TAURI__?: TauriShell }).__TAURI__;
-
-    if (tauri?.shell?.open) {
-      try {
-        await tauri.shell.open(url);
-        return;
-      } catch (error) {
-        void error;
-      }
-    }
-
-    if (isMobileRuntime()) {
+    const opened = await openExternalUrl(url);
+    if (!opened && typeof window !== 'undefined') {
       window.location.assign(url);
-      return;
     }
-
-    try {
-      const popup = window.open(url, '_blank', 'noopener,noreferrer');
-      if (popup) {
-        return;
-      }
-    } catch (error) {
-      void error;
-    }
-
-    window.location.assign(url);
   }, []);
 
   const canStart = phase !== 'starting' && phase !== 'pending' && instanceUrl.trim().length > 0;

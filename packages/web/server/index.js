@@ -1449,6 +1449,12 @@ const sanitizeSettingsUpdate = (payload) => {
       result.notificationMode = mode;
     }
   }
+  if (typeof candidate.mobileHapticsEnabled === 'boolean') {
+    result.mobileHapticsEnabled = candidate.mobileHapticsEnabled;
+  }
+  if (typeof candidate.biometricLockEnabled === 'boolean') {
+    result.biometricLockEnabled = candidate.biometricLockEnabled;
+  }
   if (typeof candidate.notifyOnSubtasks === 'boolean') {
     result.notifyOnSubtasks = candidate.notifyOnSubtasks;
   }

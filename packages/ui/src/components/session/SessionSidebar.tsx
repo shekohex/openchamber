@@ -1,7 +1,7 @@
 import React from 'react';
 import type { Session } from '@opencode-ai/sdk/v2';
 import { toast } from '@/components/ui';
-import { isDesktopLocalOriginActive, isDesktopShell, isMobileRuntime as detectMobileRuntime, isTauriShell, isVSCodeRuntime } from '@/lib/desktop';
+import { isDesktopLocalOriginActive, isDesktopShell, isMobileRuntime as detectMobileRuntime, isTauriShell, isVSCodeRuntime, writeTextToClipboard } from '@/lib/desktop';
 import {
   DndContext,
   DragOverlay,
@@ -966,8 +966,7 @@ export const SessionSidebar: React.FC<SessionSidebarProps> = ({
   );
 
   const handleCopyShareUrl = React.useCallback((url: string, sessionId: string) => {
-    navigator.clipboard
-      .writeText(url)
+    writeTextToClipboard(url)
       .then(() => {
         setCopiedSessionId(sessionId);
         if (copyTimeout.current) {

@@ -4,6 +4,8 @@ import { Input } from '@/components/ui/input';
 import { toast } from '@/components/ui';
 import { resolveRuntimeApiBaseUrl } from '@/lib/instances/runtimeApiBaseUrl';
 import { useUIStore } from '@/stores/useUIStore';
+import { authenticateWithBiometrics, getBiometricStatus, isNativeMobileApp } from '@/lib/desktop';
+import { Switch } from '@/components/ui/switch';
 
 type DeviceRecord = {
   id: string;
@@ -34,18 +36,33 @@ const getApiBase = (): string => resolveRuntimeApiBaseUrl().replace(/\/+$/, '');
 
 export const DevicesSettings: React.FC<DevicesSettingsProps> = ({ prefillUserCode }) => {
   const setDeviceLoginOpen = useUIStore((state) => state.setDeviceLoginOpen);
+  const biometricLockEnabled = useUIStore((state) => state.biometricLockEnabled);
+  const setBiometricLockEnabled = useUIStore((state) => state.setBiometricLockEnabled);
+  const isNativeMobile = React.useMemo(() => isNativeMobileApp(), []);
   const [devices, setDevices] = React.useState<DeviceRecord[]>([]);
   const [isLoading, setIsLoading] = React.useState(false);
   const [busyId, setBusyId] = React.useState<string | null>(null);
   const [approveCode, setApproveCode] = React.useState(prefillUserCode || '');
   const [approveName, setApproveName] = React.useState('');
   const [approveError, setApproveError] = React.useState<string | null>(null);
+  const [biometricAvailable, setBiometricAvailable] = React.useState(false);
 
   React.useEffect(() => {
     if (typeof prefillUserCode === 'string' && prefillUserCode.trim().length > 0) {
       setApproveCode(prefillUserCode.trim());
     }
   }, [prefillUserCode]);
+
+  React.useEffect(() => {
+    if (!isNativeMobile) {
+      setBiometricAvailable(false);
+      return;
+    }
+
+    void getBiometricStatus().then((status) => {
+      setBiometricAvailable(status.isAvailable);
+    });
+  }, [isNativeMobile]);
 
   const loadDevices = React.useCallback(async () => {
     setIsLoading(true);
@@ -165,12 +182,66 @@ export const DevicesSettings: React.FC<DevicesSettingsProps> = ({ prefillUserCod
     }
   }, []);
 
+  const handleBiometricToggle = React.useCallback(async (checked: boolean) => {
+    if (!isNativeMobile) {
+      setBiometricLockEnabled(false);
+      return;
+    }
+
+    if (!checked) {
+      setBiometricLockEnabled(false);
+      return;
+    }
+
+    const status = await getBiometricStatus();
+    if (!status.isAvailable) {
+      setBiometricLockEnabled(false);
+      toast.error('Biometric authentication is unavailable on this device');
+      return;
+    }
+
+    const authenticated = await authenticateWithBiometrics('Unlock OpenChamber', {
+      allowDeviceCredential: true,
+      title: 'Unlock OpenChamber',
+      subtitle: 'Use biometrics to enable app lock',
+      confirmationRequired: false,
+    });
+
+    if (!authenticated) {
+      setBiometricLockEnabled(false);
+      toast.error('Biometric verification failed');
+      return;
+    }
+
+    setBiometricLockEnabled(true);
+    toast.success('Biometric lock enabled');
+  }, [isNativeMobile, setBiometricLockEnabled]);
+
   return (
     <div className="space-y-6">
       <div className="space-y-1">
         <h3 className="typography-ui-header font-semibold text-foreground">Devices</h3>
         <p className="typography-meta text-muted-foreground">Approve pending devices and revoke existing tokens.</p>
       </div>
+
+      {isNativeMobile && (
+        <div className="flex items-center justify-between rounded-lg border border-border/50 bg-background/60 p-3">
+          <div className="space-y-0.5">
+            <div className="typography-ui text-foreground">Require biometric unlock</div>
+            <p className="typography-micro text-muted-foreground">
+              Protect app access with Face ID or fingerprint.
+            </p>
+          </div>
+          <Switch
+            checked={biometricLockEnabled && biometricAvailable}
+            onCheckedChange={(checked) => {
+              void handleBiometricToggle(checked);
+            }}
+            disabled={!biometricAvailable && !biometricLockEnabled}
+            className="data-[state=checked]:bg-status-info"
+          />
+        </div>
+      )}
 
       <div className="space-y-3 rounded-lg border border-border/50 bg-background/60 p-3">
         <div className="typography-ui-label text-foreground">Approve Device</div>

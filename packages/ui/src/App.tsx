@@ -26,7 +26,7 @@ import { usePushVisibilityBeacon } from '@/hooks/usePushVisibilityBeacon';
 import { GitPollingProvider } from '@/hooks/useGitPolling';
 import { useConfigStore } from '@/stores/useConfigStore';
 import { hasModifier } from '@/lib/utils';
-import { isDesktopLocalOriginActive, isDesktopShell, isMobileRuntime, isTauriShell } from '@/lib/desktop';
+import { authenticateWithBiometrics, getBiometricStatus, isDesktopLocalOriginActive, isDesktopShell, isMobileRuntime, isNativeMobileApp, isTauriShell } from '@/lib/desktop';
 import { OnboardingScreen } from '@/components/onboarding/OnboardingScreen';
 import { useSessionStore } from '@/stores/useSessionStore';
 import { useDirectoryStore } from '@/stores/useDirectoryStore';
@@ -75,7 +75,11 @@ function App({ apis }: AppProps) {
   const touchInstance = useInstancesStore((state) => state.touchInstance);
   const isDeviceLoginOpen = useUIStore((state) => state.isDeviceLoginOpen);
   const setDeviceLoginOpen = useUIStore((state) => state.setDeviceLoginOpen);
+  const biometricLockEnabled = useUIStore((state) => state.biometricLockEnabled);
+  const setBiometricLockEnabled = useUIStore((state) => state.setBiometricLockEnabled);
   const appReadyDispatchedRef = React.useRef(false);
+  const [biometricRequired, setBiometricRequired] = React.useState(false);
+  const [biometricBusy, setBiometricBusy] = React.useState(false);
 
   React.useEffect(() => {
     setIsVSCodeRuntime(apis.runtime.isVSCode);
@@ -329,6 +333,41 @@ function App({ apis }: AppProps) {
 
   const isMobileShellRuntime = React.useMemo(() => isMobileRuntime(), []);
 
+  const requestBiometricUnlock = React.useCallback(async () => {
+    if (!isNativeMobileApp() || !biometricLockEnabled) {
+      setBiometricRequired(false);
+      return true;
+    }
+
+    setBiometricBusy(true);
+    try {
+      const status = await getBiometricStatus();
+      if (!status.isAvailable) {
+        setBiometricRequired(true);
+        return false;
+      }
+
+      const authenticated = await authenticateWithBiometrics('Unlock OpenChamber', {
+        allowDeviceCredential: true,
+        title: 'Unlock OpenChamber',
+        subtitle: 'Authenticate to continue',
+        confirmationRequired: false,
+      });
+      setBiometricRequired(!authenticated);
+      return authenticated;
+    } finally {
+      setBiometricBusy(false);
+    }
+  }, [biometricLockEnabled]);
+
+  React.useEffect(() => {
+    if (!isNativeMobileApp() || !biometricLockEnabled) {
+      setBiometricRequired(false);
+      return;
+    }
+    void requestBiometricUnlock();
+  }, [biometricLockEnabled, requestBiometricUnlock]);
+
   const connectionRecoveryDialog = showConnectionRecoveryDialog ? (
     <Dialog open={showConnectionRecoveryDialog} onOpenChange={() => {}}>
       <DialogContent className="max-w-md" showCloseButton={false}>
@@ -367,6 +406,34 @@ function App({ apis }: AppProps) {
           </Button>
           <Button type="button" onClick={() => void handleRetryConnection()} disabled={isRetryingConnection}>
             {isRetryingConnection ? 'Retrying...' : 'Retry'}
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  ) : null;
+
+  const biometricLockDialog = biometricRequired ? (
+    <Dialog open={biometricRequired} onOpenChange={() => {}}>
+      <DialogContent className="max-w-md" showCloseButton={false}>
+        <DialogHeader>
+          <DialogTitle>Unlock OpenChamber</DialogTitle>
+          <DialogDescription>
+            Biometric verification is required to access this app.
+          </DialogDescription>
+        </DialogHeader>
+        <DialogFooter>
+          <Button
+            type="button"
+            variant="outline"
+            onClick={() => {
+              setBiometricLockEnabled(false);
+              setBiometricRequired(false);
+            }}
+          >
+            Disable lock
+          </Button>
+          <Button type="button" onClick={() => void requestBiometricUnlock()} disabled={biometricBusy}>
+            {biometricBusy ? 'Checking...' : 'Unlock'}
           </Button>
         </DialogFooter>
       </DialogContent>
@@ -426,16 +493,17 @@ function App({ apis }: AppProps) {
           <FireworksProvider>
             <VoiceProvider>
               <div className="h-full text-foreground bg-background">
-                <MainLayout />
-                <Toaster />
-                <ConfigUpdateOverlay />
-                <AboutDialogWrapper />
+              <MainLayout />
+              <Toaster />
+              <ConfigUpdateOverlay />
+              <AboutDialogWrapper />
                 {showMemoryDebug && (
                   <MemoryDebugPanel onClose={() => setShowMemoryDebug(false)} />
                 )}
-                {connectionRecoveryDialog}
-              </div>
-            </VoiceProvider>
+              {connectionRecoveryDialog}
+              {biometricLockDialog}
+            </div>
+          </VoiceProvider>
           </FireworksProvider>
         </GitPollingProvider>
       </RuntimeAPIProvider>

@@ -509,6 +509,8 @@ export interface SettingsPayload {
   showTextJustificationActivity?: boolean;
   nativeNotificationsEnabled?: boolean;
   notificationMode?: 'always' | 'hidden-only';
+  mobileHapticsEnabled?: boolean;
+  biometricLockEnabled?: boolean;
   autoDeleteEnabled?: boolean;
   autoDeleteAfterDays?: number;
   queueModeEnabled?: boolean;
