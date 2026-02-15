@@ -1,4 +1,4 @@
-import type { ProjectEntry } from '@/lib/api/types';
+import type { ProjectEntry, RuntimeDescriptor } from '@/lib/api/types';
 
 export type AssistantNotificationPayload = {
   title?: string;
@@ -128,10 +128,37 @@ type TauriGlobal = {
   };
 };
 
+const getRuntimeDescriptor = (): RuntimeDescriptor | null => {
+  if (typeof window === 'undefined') {
+    return null;
+  }
+  const apis = (window as { __OPENCHAMBER_RUNTIME_APIS__?: { runtime?: RuntimeDescriptor } }).__OPENCHAMBER_RUNTIME_APIS__;
+  return apis?.runtime ?? null;
+};
+
 export const isTauriShell = (): boolean => {
   if (typeof window === 'undefined') return false;
   const tauri = (window as unknown as { __TAURI__?: TauriGlobal }).__TAURI__;
   return typeof tauri?.core?.invoke === 'function';
+};
+
+const isLikelyMobileUserAgent = (): boolean => {
+  if (typeof navigator === 'undefined') {
+    return false;
+  }
+  const ua = navigator.userAgent.toLowerCase();
+  return /iphone|ipad|ipod|android|mobile/.test(ua);
+};
+
+export const isTauriMobileShell = (): boolean => {
+  const runtime = getRuntimeDescriptor();
+  if (runtime?.platform === 'mobile') {
+    return true;
+  }
+  if (runtime?.platform === 'desktop' || runtime?.platform === 'vscode') {
+    return false;
+  }
+  return isTauriShell() && isLikelyMobileUserAgent();
 };
 
 const normalizeOrigin = (raw: string): string | null => {
@@ -160,6 +187,21 @@ export const isDesktopLocalOriginActive = (): boolean => {
 // (Remote pages can temporarily lose window.__TAURI__ if URL doesn't match remote allowlist.)
 export const isDesktopShell = (): boolean => {
   if (typeof window === 'undefined') return false;
+  if (isTauriMobileShell()) {
+    return false;
+  }
+  const runtime = getRuntimeDescriptor();
+  if (runtime) {
+    if (runtime.platform === 'mobile') {
+      return false;
+    }
+    if (runtime.platform === 'desktop' || runtime.isDesktop) {
+      return true;
+    }
+    if (runtime.platform === 'web' || runtime.platform === 'vscode') {
+      return false;
+    }
+  }
   if (typeof window.__OPENCHAMBER_LOCAL_ORIGIN__ === 'string' && window.__OPENCHAMBER_LOCAL_ORIGIN__.length > 0) {
     return true;
   }
@@ -167,22 +209,27 @@ export const isDesktopShell = (): boolean => {
 };
 
 export const isVSCodeRuntime = (): boolean => {
-  if (typeof window === "undefined") return false;
-  const apis = (window as { __OPENCHAMBER_RUNTIME_APIS__?: { runtime?: { isVSCode?: boolean } } }).__OPENCHAMBER_RUNTIME_APIS__;
-  return apis?.runtime?.isVSCode === true;
+  const runtime = getRuntimeDescriptor();
+  return runtime?.isVSCode === true || runtime?.platform === 'vscode';
+};
+
+export const isMobileRuntime = (): boolean => {
+  const runtime = getRuntimeDescriptor();
+  return runtime?.platform === 'mobile' || isTauriMobileShell();
 };
 
 export const isWebRuntime = (): boolean => {
   if (typeof window === "undefined") return false;
-  const apis = (window as { __OPENCHAMBER_RUNTIME_APIS__?: { runtime?: { platform?: string } } }).__OPENCHAMBER_RUNTIME_APIS__;
-  const platform = apis?.runtime?.platform;
+  if (isTauriMobileShell()) {
+    return false;
+  }
+  const platform = getRuntimeDescriptor()?.platform;
   if (platform === 'web') {
     return true;
   }
-  if (platform === 'desktop' || platform === 'vscode') {
+  if (platform === 'desktop' || platform === 'vscode' || platform === 'mobile') {
     return false;
   }
-  // Default: anything that's not VSCode behaves like web (HTTP UI).
   return !isVSCodeRuntime();
 };
 

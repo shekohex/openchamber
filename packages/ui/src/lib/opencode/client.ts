@@ -1786,7 +1786,12 @@ class OpencodeService {
       } else {
         healthUrl = `${normalizedBase}/health`;
       }
-      const response = await this.fetchWithAuth(healthUrl);
+      const response = await fetch(healthUrl, {
+        method: 'GET',
+        headers: {
+          Accept: 'application/json',
+        },
+      });
       if (!response.ok) {
         return false;
       }

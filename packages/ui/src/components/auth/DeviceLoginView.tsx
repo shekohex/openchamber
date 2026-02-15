@@ -8,6 +8,7 @@ import { resolveInstanceApiBaseUrlAfterLogin } from '@/lib/auth/resolveInstanceA
 import { setToken } from '@/lib/auth/tokenStorage';
 import { useInstancesStore } from '@/stores/useInstancesStore';
 import { useUIStore } from '@/stores/useUIStore';
+import { isMobileRuntime } from '@/lib/desktop';
 
 type DeviceLoginViewProps = {
   forceOpen?: boolean;
@@ -20,6 +21,7 @@ export const DeviceLoginView: React.FC<DeviceLoginViewProps> = ({ forceOpen = fa
   const addInstance = useInstancesStore((state) => state.addInstance);
   const setCurrentInstance = useInstancesStore((state) => state.setCurrentInstance);
   const setDefaultInstance = useInstancesStore((state) => state.setDefaultInstance);
+  const touchInstance = useInstancesStore((state) => state.touchInstance);
   const setDeviceLoginOpen = useUIStore((state) => state.setDeviceLoginOpen);
 
   const [instanceUrl, setInstanceUrl] = React.useState('');
@@ -151,6 +153,7 @@ export const DeviceLoginView: React.FC<DeviceLoginViewProps> = ({ forceOpen = fa
       });
       setDefaultInstance(instanceId);
       setCurrentInstance(instanceId);
+      touchInstance(instanceId);
 
       setPhase('success');
       setDeviceLoginOpen(false);
@@ -171,7 +174,7 @@ export const DeviceLoginView: React.FC<DeviceLoginViewProps> = ({ forceOpen = fa
       }
       setErrorMessage(message);
     }
-  }, [addInstance, clearPolling, deviceName, instanceUrl, setCurrentInstance, setDefaultInstance, setDeviceLoginOpen]);
+  }, [addInstance, clearPolling, deviceName, instanceUrl, setCurrentInstance, setDefaultInstance, setDeviceLoginOpen, touchInstance]);
 
   const handleCopy = React.useCallback(async (text: string, label: string) => {
     try {
@@ -180,6 +183,40 @@ export const DeviceLoginView: React.FC<DeviceLoginViewProps> = ({ forceOpen = fa
     } catch {
       toast.error(`Failed to copy ${label.toLowerCase()}`);
     }
+  }, []);
+
+  const openVerificationUrl = React.useCallback(async (url: string) => {
+    if (typeof window === 'undefined') {
+      return;
+    }
+
+    type TauriShell = { shell?: { open?: (value: string) => Promise<unknown> } };
+    const tauri = (window as unknown as { __TAURI__?: TauriShell }).__TAURI__;
+
+    if (tauri?.shell?.open) {
+      try {
+        await tauri.shell.open(url);
+        return;
+      } catch (error) {
+        void error;
+      }
+    }
+
+    if (isMobileRuntime()) {
+      window.location.assign(url);
+      return;
+    }
+
+    try {
+      const popup = window.open(url, '_blank', 'noopener,noreferrer');
+      if (popup) {
+        return;
+      }
+    } catch (error) {
+      void error;
+    }
+
+    window.location.assign(url);
   }, []);
 
   const canStart = phase !== 'starting' && phase !== 'pending' && instanceUrl.trim().length > 0;
@@ -237,7 +274,7 @@ export const DeviceLoginView: React.FC<DeviceLoginViewProps> = ({ forceOpen = fa
             <div className="flex flex-col items-center gap-2">
               {qrDataUrl ? <img src={qrDataUrl} alt="Device login QR" className="h-[180px] w-[180px] rounded border border-border/60 bg-background" /> : null}
               <Button type="button" variant="outline" size="sm" onClick={() => void handleCopy(flow.userCode, 'Code')}>Copy Code</Button>
-              <Button type="button" variant="outline" size="sm" onClick={() => window.open(flow.verificationUriComplete || flow.verificationUri, '_blank', 'noopener,noreferrer')}>Open Verification</Button>
+              <Button type="button" variant="outline" size="sm" onClick={() => void openVerificationUrl(flow.verificationUriComplete || flow.verificationUri)}>Open Verification</Button>
             </div>
           </div>
         )}

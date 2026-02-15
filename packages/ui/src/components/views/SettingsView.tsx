@@ -33,7 +33,7 @@ import { OpenChamberPage } from '@/components/sections/openchamber/OpenChamberPa
 import { OpenChamberSidebar, type OpenChamberSection } from '@/components/sections/openchamber/OpenChamberSidebar';
 import { ErrorBoundary } from '@/components/ui/ErrorBoundary';
 import { useDeviceInfo } from '@/lib/device';
-import { isVSCodeRuntime } from '@/lib/desktop';
+import { isDesktopShell, isVSCodeRuntime } from '@/lib/desktop';
 
 const getSettingsSections = (isVSCode: boolean) => {
   let filtered = SIDEBAR_SECTIONS.filter(section => section.id !== 'sessions');
@@ -105,21 +105,15 @@ export const SettingsView: React.FC<SettingsViewProps> = ({ onClose, forceMobile
   const startXRef = React.useRef(0);
   const startWidthRef = React.useRef(sidebarWidth);
 
-  const isTauri = React.useMemo(() => {
-    if (typeof window === 'undefined') return false;
-    return Boolean((window as unknown as { __TAURI__?: unknown }).__TAURI__);
-  }, []);
-
   const isMacPlatform = React.useMemo(() => {
     if (typeof navigator === 'undefined') return false;
     return /Macintosh|Mac OS X/.test(navigator.userAgent || '');
   }, []);
 
   const isVSCode = React.useMemo(() => isVSCodeRuntime(), []);
+  const isDesktopApp = React.useMemo(() => isDesktopShell(), []);
 
   const settingsSections = React.useMemo(() => getSettingsSections(isVSCode), [isVSCode]);
-
-  const isDesktopApp = isTauri;
 
   // Track container width for responsive tab labels
   React.useEffect(() => {

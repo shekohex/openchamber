@@ -41,7 +41,9 @@ export const MainLayout: React.FC = () => {
         multiRunLauncherPrefillPrompt,
     } = useUIStore();
 
-    const { isMobile } = useDeviceInfo();
+    const { isMobile, isTablet } = useDeviceInfo();
+    const isTabletLayout = isTablet;
+    const isPhoneLayout = isMobile && !isTabletLayout;
     const rightSidebarAutoClosedRef = React.useRef(false);
     const bottomTerminalAutoClosedRef = React.useRef(false);
 
@@ -185,6 +187,8 @@ export const MainLayout: React.FC = () => {
         }
 
         const root = document.documentElement;
+        const isTauriMobileRuntime = root.classList.contains('tauri-mobile-runtime');
+        const isTauriIOSRuntime = isTauriMobileRuntime && root.classList.contains('runtime-ios');
 
         let stickyKeyboardInset = 0;
         let ignoreOpenUntilZero = false;
@@ -242,7 +246,8 @@ export const MainLayout: React.FC = () => {
             const viewport = window.visualViewport;
 
             const height = viewport ? Math.round(viewport.height) : window.innerHeight;
-            const offsetTop = viewport ? Math.max(0, Math.round(viewport.offsetTop)) : 0;
+            const measuredOffsetTop = viewport ? Math.max(0, Math.round(viewport.offsetTop)) : 0;
+            const offsetTop = isTauriIOSRuntime ? 0 : measuredOffsetTop;
 
             root.style.setProperty('--oc-visual-viewport-offset-top', `${offsetTop}px`);
 
@@ -260,6 +265,7 @@ export const MainLayout: React.FC = () => {
             // - when not focused, treat only big deltas as keyboard (ignore toolbars)
             const openThreshold = isTextTarget ? 120 : 180;
             const measuredInset = rawInset >= openThreshold ? rawInset : 0;
+            const effectiveInset = isTauriIOSRuntime && !isTextTarget ? 0 : measuredInset;
 
             // Make the UI stable: treat keyboard inset as a step function.
             // - When opening: take the first big inset and hold it.
@@ -268,31 +274,31 @@ export const MainLayout: React.FC = () => {
             // - focus lost (handled via focusout)
             // - visual viewport height starts increasing while inset is non-zero
             if (ignoreOpenUntilZero) {
-                if (measuredInset === 0) {
+                if (effectiveInset === 0) {
                     ignoreOpenUntilZero = false;
                 }
                 stickyKeyboardInset = 0;
             } else if (stickyKeyboardInset === 0) {
-                if (measuredInset > 0 && isTextTarget) {
-                    stickyKeyboardInset = measuredInset;
+                if (effectiveInset > 0 && isTextTarget) {
+                    stickyKeyboardInset = effectiveInset;
                 }
             } else {
                 // Only detect closing-by-height when focus is NOT on text input
                 // (prevents false positives during Android keyboard animation)
                 const closingByHeight = !isTextTarget && height > previousHeight + 6;
 
-                if (measuredInset === 0) {
+                if (effectiveInset === 0) {
                     stickyKeyboardInset = 0;
                     setKeyboardOpen(false);
                 } else if (closingByHeight) {
                     forceKeyboardClosed();
-                } else if (measuredInset > 0 && isTextTarget) {
+                } else if (effectiveInset > 0 && isTextTarget) {
                     // When focus is on text input, track actual inset (allows settling
                     // to correct value after Android animation fluctuations)
-                    stickyKeyboardInset = measuredInset;
+                    stickyKeyboardInset = effectiveInset;
                     setKeyboardOpen(true);
-                } else if (measuredInset > stickyKeyboardInset) {
-                    stickyKeyboardInset = measuredInset;
+                } else if (effectiveInset > stickyKeyboardInset) {
+                    stickyKeyboardInset = effectiveInset;
                     setKeyboardOpen(true);
                 }
             }
@@ -317,7 +323,7 @@ export const MainLayout: React.FC = () => {
                 const rect = active.getBoundingClientRect();
                 const overlap = rect.bottom - viewportBottom;
                 const clearance = 8;
-                const keyboardInset = Math.max(stickyKeyboardInset, measuredInset);
+                const keyboardInset = Math.max(stickyKeyboardInset, effectiveInset);
                 const avoidOffset = overlap > clearance && keyboardInset > 0
                     ? Math.min(overlap, keyboardInset)
                     : 0;
@@ -391,7 +397,8 @@ export const MainLayout: React.FC = () => {
 
                 const currentViewport = window.visualViewport;
                 const height = currentViewport ? Math.round(currentViewport.height) : window.innerHeight;
-                const offsetTop = currentViewport ? Math.max(0, Math.round(currentViewport.offsetTop)) : 0;
+                const measuredOffsetTop = currentViewport ? Math.max(0, Math.round(currentViewport.offsetTop)) : 0;
+                const offsetTop = isTauriIOSRuntime ? 0 : measuredOffsetTop;
                 const layoutHeight = Math.round(root.clientHeight || window.innerHeight);
                 const viewportSum = height + offsetTop;
                 const rawInset = Math.max(0, layoutHeight - viewportSum);
@@ -442,7 +449,7 @@ export const MainLayout: React.FC = () => {
         <DiffWorkerProvider>
             <div
                 className={cn(
-                    'main-content-safe-area h-[100dvh]',
+                    'main-content-safe-area h-full',
                     isMobile ? 'flex flex-col' : 'flex',
                     'bg-background'
                 )}
@@ -452,7 +459,7 @@ export const MainLayout: React.FC = () => {
                 <OpenCodeStatusDialog />
                 <SessionDialogs />
 
-                {isMobile ? (
+                {isPhoneLayout ? (
                 <>
                     {/* Mobile: Header + content with drill-down pattern */}
                     {!(isSettingsDialogOpen || isMultiRunLauncherOpen) && <Header />}
@@ -493,6 +500,49 @@ export const MainLayout: React.FC = () => {
                     )}
 
                     {/* Mobile settings: full screen */}
+                    {isSettingsDialogOpen && (
+                        <div className="absolute inset-0 z-10 bg-background header-safe-area">
+                            <ErrorBoundary><SettingsView onClose={() => setSettingsDialogOpen(false)} /></ErrorBoundary>
+                        </div>
+                    )}
+                </>
+            ) : isTabletLayout ? (
+                <>
+                    {!(isSettingsDialogOpen || isMultiRunLauncherOpen) && <Header />}
+                    <div
+                        className={cn(
+                            'flex flex-1 overflow-hidden',
+                            (isSettingsDialogOpen || isMultiRunLauncherOpen) && 'hidden'
+                        )}
+                        style={{ paddingTop: 'var(--oc-header-height, 56px)' }}
+                    >
+                        <aside className="min-h-0 w-[clamp(17rem,35vw,24rem)] min-w-[17rem] max-w-[24rem] overflow-hidden border-r border-border/50 bg-sidebar">
+                            <ErrorBoundary><SessionSidebar mobileVariant /></ErrorBoundary>
+                        </aside>
+                        <main className="flex-1 overflow-hidden bg-background relative">
+                            <div className={cn('absolute inset-0', !isChatActive && 'invisible')}>
+                                <ErrorBoundary><ChatView /></ErrorBoundary>
+                            </div>
+                            {secondaryView && (
+                                <div className="absolute inset-0">
+                                    <ErrorBoundary>{secondaryView}</ErrorBoundary>
+                                </div>
+                            )}
+                        </main>
+                    </div>
+
+                    {isMultiRunLauncherOpen && (
+                        <div className="absolute inset-0 z-10 bg-background header-safe-area">
+                            <ErrorBoundary>
+                                <MultiRunLauncher
+                                    initialPrompt={multiRunLauncherPrefillPrompt}
+                                    onCreated={() => setMultiRunLauncherOpen(false)}
+                                    onCancel={() => setMultiRunLauncherOpen(false)}
+                                />
+                            </ErrorBoundary>
+                        </div>
+                    )}
+
                     {isSettingsDialogOpen && (
                         <div className="absolute inset-0 z-10 bg-background header-safe-area">
                             <ErrorBoundary><SettingsView onClose={() => setSettingsDialogOpen(false)} /></ErrorBoundary>

@@ -4,6 +4,15 @@ import { VSCodeLayout } from '@/components/layout/VSCodeLayout';
 import { AgentManagerView } from '@/components/views/agent-manager';
 import { FireworksProvider } from '@/contexts/FireworksContext';
 import { Toaster } from '@/components/ui/sonner';
+import { Button } from '@/components/ui/button';
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from '@/components/ui/dialog';
 import { MemoryDebugPanel } from '@/components/ui/MemoryDebugPanel';
 import { ErrorBoundary } from '@/components/ui/ErrorBoundary';
 import { useEventStream } from '@/hooks/useEventStream';
@@ -17,10 +26,11 @@ import { usePushVisibilityBeacon } from '@/hooks/usePushVisibilityBeacon';
 import { GitPollingProvider } from '@/hooks/useGitPolling';
 import { useConfigStore } from '@/stores/useConfigStore';
 import { hasModifier } from '@/lib/utils';
-import { isDesktopLocalOriginActive, isDesktopShell, isTauriShell } from '@/lib/desktop';
+import { isDesktopLocalOriginActive, isDesktopShell, isMobileRuntime, isTauriShell } from '@/lib/desktop';
 import { OnboardingScreen } from '@/components/onboarding/OnboardingScreen';
 import { useSessionStore } from '@/stores/useSessionStore';
 import { useDirectoryStore } from '@/stores/useDirectoryStore';
+import { useInstancesStore } from '@/stores/useInstancesStore';
 import { opencodeClient } from '@/lib/opencode/client';
 import { useFontPreferences } from '@/hooks/useFontPreferences';
 import { CODE_FONT_OPTION_MAP, DEFAULT_MONO_FONT, DEFAULT_UI_FONT, UI_FONT_OPTION_MAP } from '@/lib/fontOptions';
@@ -53,15 +63,27 @@ function App({ apis }: AppProps) {
   const currentDirectory = useDirectoryStore((state) => state.currentDirectory);
   const isSwitchingDirectory = useDirectoryStore((state) => state.isSwitchingDirectory);
   const [showMemoryDebug, setShowMemoryDebug] = React.useState(false);
+  const [connectionCheckCompleted, setConnectionCheckCompleted] = React.useState<boolean>(() => apis.runtime.isVSCode);
+  const [isRetryingConnection, setIsRetryingConnection] = React.useState(false);
   const { uiFont, monoFont } = useFontPreferences();
   const refreshGitHubAuthStatus = useGitHubAuthStore((state) => state.refreshStatus);
   const [isVSCodeRuntime, setIsVSCodeRuntime] = React.useState<boolean>(() => apis.runtime.isVSCode);
   const [showCliOnboarding, setShowCliOnboarding] = React.useState(false);
+  const instances = useInstancesStore((state) => state.instances);
+  const currentInstanceId = useInstancesStore((state) => state.currentInstanceId);
+  const setCurrentInstance = useInstancesStore((state) => state.setCurrentInstance);
+  const touchInstance = useInstancesStore((state) => state.touchInstance);
+  const isDeviceLoginOpen = useUIStore((state) => state.isDeviceLoginOpen);
+  const setDeviceLoginOpen = useUIStore((state) => state.setDeviceLoginOpen);
   const appReadyDispatchedRef = React.useRef(false);
 
   React.useEffect(() => {
     setIsVSCodeRuntime(apis.runtime.isVSCode);
   }, [apis.runtime.isVSCode]);
+
+  React.useEffect(() => {
+    setConnectionCheckCompleted(isVSCodeRuntime);
+  }, [isVSCodeRuntime]);
 
   React.useEffect(() => {
     registerRuntimeAPIs(apis);
@@ -125,16 +147,32 @@ function App({ apis }: AppProps) {
   }, [isInitialized]);
 
   React.useEffect(() => {
+    let cancelled = false;
+
     const init = async () => {
-      // VS Code runtime bootstraps config + sessions after the managed OpenCode instance reports "connected".
-      // Doing the default initialization here can race with startup and lead to one-shot failures.
       if (isVSCodeRuntime) {
+        if (!cancelled) {
+          setConnectionCheckCompleted(true);
+        }
         return;
       }
+
+      if (!cancelled) {
+        setConnectionCheckCompleted(false);
+      }
+
       await initializeApp();
+
+      if (!cancelled) {
+        setConnectionCheckCompleted(true);
+      }
     };
 
-    init();
+    void init();
+
+    return () => {
+      cancelled = true;
+    };
   }, [initializeApp, isVSCodeRuntime]);
 
   React.useEffect(() => {
@@ -188,7 +226,7 @@ function App({ apis }: AppProps) {
 
   const settingsAutoCreateWorktree = useConfigStore((state) => state.settingsAutoCreateWorktree);
   React.useEffect(() => {
-    if (!isTauriShell()) {
+    if (!isDesktopShell() || !isTauriShell()) {
       return;
     }
     const tauri = (window as unknown as { __TAURI__?: { core?: { invoke?: (cmd: string, args?: Record<string, unknown>) => Promise<unknown> } } }).__TAURI__;
@@ -257,6 +295,84 @@ function App({ apis }: AppProps) {
     window.location.reload();
   }, []);
 
+  const handleRetryConnection = React.useCallback(async () => {
+    setIsRetryingConnection(true);
+    try {
+      await initializeApp();
+      setConnectionCheckCompleted(true);
+    } finally {
+      setIsRetryingConnection(false);
+    }
+  }, [initializeApp]);
+
+  const sortedInstances = React.useMemo(() => {
+    return [...instances].sort((a, b) => (b.lastUsedAt ?? 0) - (a.lastUsedAt ?? 0));
+  }, [instances]);
+
+  const alternativeInstances = React.useMemo(() => {
+    return sortedInstances.filter((instance) => instance.id !== currentInstanceId);
+  }, [currentInstanceId, sortedInstances]);
+
+  const handleSwitchInstance = React.useCallback((instanceId: string) => {
+    if (!instanceId || instanceId === currentInstanceId) {
+      return;
+    }
+    setCurrentInstance(instanceId);
+    touchInstance(instanceId);
+    window.location.reload();
+  }, [currentInstanceId, setCurrentInstance, touchInstance]);
+
+  const showConnectionRecoveryDialog = connectionCheckCompleted
+    && !isVSCodeRuntime
+    && !isConnected
+    && !isDeviceLoginOpen;
+
+  const isMobileShellRuntime = React.useMemo(() => isMobileRuntime(), []);
+
+  const connectionRecoveryDialog = showConnectionRecoveryDialog ? (
+    <Dialog open={showConnectionRecoveryDialog} onOpenChange={() => {}}>
+      <DialogContent className="max-w-md" showCloseButton={false}>
+        <DialogHeader>
+          <DialogTitle>Connection required</DialogTitle>
+          <DialogDescription>
+            Unable to reach `{opencodeClient.getBaseUrl()}`. Retry, switch to another saved instance, or connect a new one.
+          </DialogDescription>
+        </DialogHeader>
+
+        {alternativeInstances.length > 0 ? (
+          <div className="flex flex-wrap gap-2">
+            {alternativeInstances.slice(0, 4).map((instance) => (
+              <Button
+                key={instance.id}
+                type="button"
+                variant="outline"
+                size="sm"
+                onClick={() => handleSwitchInstance(instance.id)}
+              >
+                {instance.label || instance.origin}
+              </Button>
+            ))}
+          </div>
+        ) : null}
+
+        <DialogFooter>
+          <Button
+            type="button"
+            variant="outline"
+            onClick={() => {
+              setDeviceLoginOpen(true);
+            }}
+          >
+            {isMobileShellRuntime ? 'Connect Another Instance' : 'Add Instance'}
+          </Button>
+          <Button type="button" onClick={() => void handleRetryConnection()} disabled={isRetryingConnection}>
+            {isRetryingConnection ? 'Retrying...' : 'Retry'}
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  ) : null;
+
   if (showCliOnboarding) {
     return (
       <ErrorBoundary>
@@ -281,6 +397,7 @@ function App({ apis }: AppProps) {
             <div className="h-full text-foreground bg-background">
               <AgentManagerView />
               <Toaster />
+              {connectionRecoveryDialog}
             </div>
           </RuntimeAPIProvider>
         </ErrorBoundary>
@@ -294,6 +411,7 @@ function App({ apis }: AppProps) {
             <div className="h-full text-foreground bg-background">
               <VSCodeLayout />
               <Toaster />
+              {connectionRecoveryDialog}
             </div>
           </FireworksProvider>
         </RuntimeAPIProvider>
@@ -315,6 +433,7 @@ function App({ apis }: AppProps) {
                 {showMemoryDebug && (
                   <MemoryDebugPanel onClose={() => setShowMemoryDebug(false)} />
                 )}
+                {connectionRecoveryDialog}
               </div>
             </VoiceProvider>
           </FireworksProvider>
