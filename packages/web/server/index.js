@@ -2158,11 +2158,30 @@ const isRequestOriginAllowed = async (req) => {
     return false;
   }
 
-  let normalizedOrigin = '';
+  let parsedOrigin;
   try {
-    normalizedOrigin = new URL(originHeader).origin;
+    parsedOrigin = new URL(originHeader);
   } catch {
     return false;
+  }
+
+  const protocol = parsedOrigin.protocol.toLowerCase();
+  const hostname = parsedOrigin.hostname.toLowerCase();
+  const isLocalTauriOrigin = (protocol === 'tauri:' || protocol === 'app:')
+    && (hostname === 'localhost' || hostname === 'tauri.localhost' || hostname === 'app.localhost');
+  if (isLocalTauriOrigin) {
+    return true;
+  }
+
+  const normalizedOrigin = parsedOrigin.origin;
+  if (normalizedOrigin === 'null') {
+    return false;
+  }
+
+  const isSecureTauriLocalhost = (protocol === 'https:' || protocol === 'http:')
+    && (hostname === 'tauri.localhost' || hostname === 'app.localhost');
+  if (isSecureTauriLocalhost) {
+    return true;
   }
 
   const allowedOrigins = await getRequestOriginCandidates(req);
@@ -5520,6 +5539,65 @@ async function main(options = {}) {
   expressApp = app;
   server = http.createServer(app);
 
+  const appendVaryHeader = (res, value) => {
+    const current = res.getHeader('Vary');
+    if (!current) {
+      res.setHeader('Vary', value);
+      return;
+    }
+    const values = String(current)
+      .split(',')
+      .map((item) => item.trim())
+      .filter(Boolean);
+    if (!values.includes(value)) {
+      values.push(value);
+      res.setHeader('Vary', values.join(', '));
+    }
+  };
+
+  const applyTrustedCorsHeaders = async (req, res, allowedMethods, allowCredentials = false) => {
+    const originHeader = typeof req.headers.origin === 'string' ? req.headers.origin.trim() : '';
+    if (!originHeader) {
+      return false;
+    }
+
+    const allowed = await isRequestOriginAllowed(req);
+    if (!allowed) {
+      return false;
+    }
+
+    res.setHeader('Access-Control-Allow-Origin', originHeader);
+    appendVaryHeader(res, 'Origin');
+    res.setHeader('Access-Control-Allow-Methods', allowedMethods);
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, Accept, X-Requested-With');
+    if (allowCredentials) {
+      res.setHeader('Access-Control-Allow-Credentials', 'true');
+    }
+
+    return true;
+  };
+
+  app.use('/health', async (req, res, next) => {
+    const corsApplied = await applyTrustedCorsHeaders(req, res, 'GET,OPTIONS');
+    if (req.method === 'OPTIONS') {
+      const originHeader = typeof req.headers.origin === 'string' ? req.headers.origin.trim() : '';
+      console.log(`[health] preflight origin=${originHeader || 'none'} allowed=${corsApplied ? 'yes' : 'no'}`);
+      return res.status(corsApplied ? 204 : 403).end();
+    }
+    return next();
+  });
+
+  app.use('/api', async (req, res, next) => {
+    if (req.path.startsWith('/auth/device') || req.path.startsWith('/auth/devices')) {
+      return next();
+    }
+    const corsApplied = await applyTrustedCorsHeaders(req, res, 'GET,POST,PATCH,DELETE,OPTIONS');
+    if (req.method === 'OPTIONS') {
+      return res.status(corsApplied ? 204 : 403).end();
+    }
+    return next();
+  });
+
   app.get('/health', (req, res) => {
     res.json({
       status: 'ok',
@@ -5603,13 +5681,9 @@ async function main(options = {}) {
   const authDeviceCorsMiddleware = async (req, res, next) => {
     const originHeader = typeof req.headers.origin === 'string' ? req.headers.origin.trim() : '';
     if (originHeader) {
-      const allowed = await isRequestOriginAllowed(req);
-      if (allowed) {
-        res.setHeader('Access-Control-Allow-Origin', originHeader);
-        res.setHeader('Vary', 'Origin');
-        res.setHeader('Access-Control-Allow-Methods', 'POST,OPTIONS');
-        res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, Accept');
-      }
+      res.setHeader('Access-Control-Allow-Origin', '*');
+      res.setHeader('Access-Control-Allow-Methods', 'POST,OPTIONS');
+      res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, Accept');
     }
     if (req.method === 'OPTIONS') {
       return res.status(204).end();
