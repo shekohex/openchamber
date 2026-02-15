@@ -20,3 +20,9 @@ src-tauri/sidecars/*.exe
 
 # OS-specific
 .DS_Store
+
+.bundle/
+vendor/bundle/
+fastlane/report.xml
+fastlane/Preview.html
+fastlane/test_output/
