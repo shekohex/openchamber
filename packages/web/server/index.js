@@ -2393,15 +2393,42 @@ const resolveRequestOrigin = async (req) => {
 
 const getBearerTokenFromRequest = (req) => {
   const value = typeof req.headers.authorization === 'string' ? req.headers.authorization.trim() : '';
-  if (!value) {
-    return null;
+  if (value) {
+    const match = value.match(/^Bearer\s+(.+)$/i);
+    if (!match || !match[1]) {
+      return null;
+    }
+    const token = match[1].trim();
+    return token.length > 0 ? token : null;
   }
-  const match = value.match(/^Bearer\s+(.+)$/i);
-  if (!match || !match[1]) {
+
+  const queryToken = (() => {
+    const fromExpressQuery = req.query?.access_token;
+    if (typeof fromExpressQuery === 'string' && fromExpressQuery.trim().length > 0) {
+      return fromExpressQuery.trim();
+    }
+    if (Array.isArray(fromExpressQuery) && typeof fromExpressQuery[0] === 'string' && fromExpressQuery[0].trim().length > 0) {
+      return fromExpressQuery[0].trim();
+    }
+
+    const rawUrl = typeof req.url === 'string' ? req.url : '';
+    if (!rawUrl) {
+      return null;
+    }
+
+    try {
+      const parsed = new URL(rawUrl, 'http://localhost');
+      const fromUrl = parsed.searchParams.get('access_token');
+      if (typeof fromUrl === 'string' && fromUrl.trim().length > 0) {
+        return fromUrl.trim();
+      }
+    } catch {
+    }
+
     return null;
-  }
-  const token = match[1].trim();
-  return token.length > 0 ? token : null;
+  })();
+
+  return queryToken;
 };
 
 const authenticateBearerDevice = async (req) => {
@@ -11170,17 +11197,24 @@ Context:
 
     const handleUpgrade = async () => {
       try {
-        if (uiAuthController?.enabled) {
-          const sessionToken = uiAuthController?.ensureSessionToken?.(req, null);
-          if (!sessionToken) {
-            rejectWebSocketUpgrade(socket, 401, 'UI authentication required');
-            return;
-          }
+        const authenticatedDevice = await authenticateBearerDevice(req);
+        if (authenticatedDevice) {
+          req.openchamberDevice = authenticatedDevice;
+        }
 
-          const originAllowed = await isRequestOriginAllowed(req);
-          if (!originAllowed) {
-            rejectWebSocketUpgrade(socket, 403, 'Invalid origin');
-            return;
+        if (uiAuthController?.enabled) {
+          if (!authenticatedDevice) {
+            const sessionToken = uiAuthController?.ensureSessionToken?.(req, null);
+            if (!sessionToken) {
+              rejectWebSocketUpgrade(socket, 401, 'UI authentication required');
+              return;
+            }
+
+            const originAllowed = await isRequestOriginAllowed(req);
+            if (!originAllowed) {
+              rejectWebSocketUpgrade(socket, 403, 'Invalid origin');
+              return;
+            }
           }
         }
 
