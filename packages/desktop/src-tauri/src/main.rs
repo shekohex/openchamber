@@ -432,11 +432,6 @@ fn desktop_set_window_title(window: tauri::WebviewWindow, title: Option<String>)
 }
 
 #[tauri::command]
-fn desktop_macos_tab_strip_visible(window: tauri::WebviewWindow) -> bool {
-    is_macos_tab_strip_visible_for_window(&window)
-}
-
-#[tauri::command]
 fn desktop_clear_cache(app: tauri::AppHandle) -> Result<(), String> {
     #[cfg(target_os = "macos")]
     {
@@ -2171,27 +2166,6 @@ fn is_macos_tab_strip_visible_for_window(_window: &tauri::WebviewWindow) -> bool
     false
 }
 
-#[cfg(target_os = "macos")]
-fn is_macos_tab_strip_visible(app: &tauri::AppHandle) -> bool {
-    let windows = app.webview_windows();
-
-    if let Some(focused) = windows
-        .values()
-        .find(|window| window.is_focused().unwrap_or(false))
-    {
-        return is_macos_tab_strip_visible_for_window(focused);
-    }
-
-    windows
-        .values()
-        .any(|window| is_macos_tab_strip_visible_for_window(window))
-}
-
-#[cfg(not(target_os = "macos"))]
-fn is_macos_tab_strip_visible(_app: &tauri::AppHandle) -> bool {
-    false
-}
-
 fn sync_macos_tab_strip_state(app: &tauri::AppHandle) {
     for window in app.webview_windows().values() {
         let visible = is_macos_tab_strip_visible_for_window(window);
@@ -2271,7 +2245,7 @@ fn schedule_window_state_persist(window: tauri::Window, immediate: bool) {
 fn create_window(app: &tauri::AppHandle, url: &str, local_origin: &str, restore_geometry: bool) -> Result<()> {
     let parsed = url::Url::parse(url).map_err(|err| anyhow!("Invalid URL: {err}"))?;
     let label = next_window_label();
-    let macos_tab_strip_visible_on_load = cfg!(target_os = "macos") && is_macos_tab_strip_visible(app);
+    let macos_tab_strip_visible_on_load = false;
 
     let init_script = build_init_script(local_origin, macos_tab_strip_visible_on_load);
 
@@ -2328,7 +2302,6 @@ fn create_window(app: &tauri::AppHandle, url: &str, local_origin: &str, restore_
 
     let _ = window.show();
     let _ = window.set_focus();
-    sync_macos_tab_strip_state(app);
 
     Ok(())
 }
@@ -2610,6 +2583,7 @@ fn main() {
             }
 
             if matches!(event, tauri::WindowEvent::Moved(_) | tauri::WindowEvent::Resized(_)) {
+                sync_macos_tab_strip_state(&app);
                 schedule_window_state_persist(window.clone(), false);
             }
 
@@ -2626,7 +2600,6 @@ fn main() {
             desktop_new_window_at_url,
             desktop_set_auto_worktree_menu,
             desktop_set_window_title,
-            desktop_macos_tab_strip_visible,
             desktop_clear_cache,
             desktop_open_path,
             desktop_filter_installed_apps,

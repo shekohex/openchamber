@@ -250,8 +250,6 @@ export const Header: React.FC = () => {
       return;
     }
 
-    let disposed = false;
-
     const applyVisibility = (visible: boolean) => {
       setMacosTabStripVisible((prev) => (prev === visible ? prev : visible));
     };
@@ -260,35 +258,11 @@ export const Header: React.FC = () => {
       return (window as unknown as { __OPENCHAMBER_MACOS_TAB_STRIP_VISIBLE__?: unknown }).__OPENCHAMBER_MACOS_TAB_STRIP_VISIBLE__ === true;
     };
 
-    const refreshFromDesktop = async () => {
-      let visible = readFromGlobal();
-
-      if (!isTauriShell()) {
-        applyVisibility(visible);
-        return;
-      }
-
-      try {
-        const tauri = (window as unknown as { __TAURI__?: { core?: { invoke?: (cmd: string, args?: Record<string, unknown>) => Promise<unknown> } } }).__TAURI__;
-        if (typeof tauri?.core?.invoke !== 'function') {
-          return;
-        }
-
-        const result = await tauri.core.invoke('desktop_macos_tab_strip_visible');
-        if (disposed || typeof result !== 'boolean') {
-          return;
-        }
-
-        visible = result;
-        (window as unknown as { __OPENCHAMBER_MACOS_TAB_STRIP_VISIBLE__?: boolean }).__OPENCHAMBER_MACOS_TAB_STRIP_VISIBLE__ = visible;
-      } catch {
-        // ignore
-      }
-
-      applyVisibility(visible);
+    const refreshFromDesktop = () => {
+      applyVisibility(readFromGlobal());
     };
 
-    void refreshFromDesktop();
+    refreshFromDesktop();
 
     const customEventHandler = (event: Event) => {
       const detail = (event as CustomEvent<{ visible?: unknown }>).detail;
@@ -298,26 +272,22 @@ export const Header: React.FC = () => {
         return;
       }
 
-      void refreshFromDesktop();
+      refreshFromDesktop();
     };
 
     const focusHandler = () => {
-      void refreshFromDesktop();
+      refreshFromDesktop();
     };
 
     const visibilityHandler = () => {
       if (!document.hidden) {
-        void refreshFromDesktop();
+        refreshFromDesktop();
       }
     };
 
     const resizeHandler = () => {
-      void refreshFromDesktop();
+      refreshFromDesktop();
     };
-
-    const intervalId = window.setInterval(() => {
-      void refreshFromDesktop();
-    }, 4000);
 
     window.addEventListener('openchamber:macos-tab-strip', customEventHandler as EventListener);
     window.addEventListener('focus', focusHandler);
@@ -325,8 +295,6 @@ export const Header: React.FC = () => {
     document.addEventListener('visibilitychange', visibilityHandler);
 
     return () => {
-      disposed = true;
-      window.clearInterval(intervalId);
       window.removeEventListener('openchamber:macos-tab-strip', customEventHandler as EventListener);
       window.removeEventListener('focus', focusHandler);
       window.removeEventListener('resize', resizeHandler);
