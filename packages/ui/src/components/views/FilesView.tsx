@@ -5,9 +5,6 @@ import {
   RiArrowDownSLine,
   RiClipboardLine,
   RiCloseLine,
-  RiCodeLine,
-  RiFileImageLine,
-  RiFileTextLine,
   RiFileCopy2Line,
   RiCheckLine,
   RiFolder3Fill,
@@ -71,6 +68,7 @@ import { useDirectoryShowHidden } from '@/lib/directoryShowHidden';
 import { useFilesViewShowGitignored } from '@/lib/filesViewShowGitignored';
 import { ErrorBoundary } from '@/components/ui/ErrorBoundary';
 import { useEffectiveDirectory } from '@/hooks/useEffectiveDirectory';
+import { FileTypeIcon } from '@/components/icons/FileTypeIcon';
 
 type FileNode = {
   name: string;
@@ -184,138 +182,8 @@ const isDirectoryReadError = (error: unknown): boolean => {
 
 const MAX_VIEW_CHARS = 200_000;
 
-const CODE_EXTENSIONS = new Set([
-  // JavaScript/TypeScript
-  'js', 'jsx', 'ts', 'tsx', 'mjs', 'cjs', 'mts', 'cts',
-  // Web
-  'html', 'htm', 'xhtml', 'css', 'scss', 'sass', 'less', 'styl', 'stylus',
-  'vue', 'svelte', 'astro',
-  // Shell/Scripts
-  'sh', 'bash', 'zsh', 'fish', 'ps1', 'psm1', 'bat', 'cmd',
-  // Python
-  'py', 'pyw', 'pyx', 'pxd', 'pxi',
-  // Ruby
-  'rb', 'erb', 'rake', 'gemspec',
-  // PHP
-  'php', 'phtml', 'php3', 'php4', 'php5', 'phps',
-  // Java/JVM
-  'java', 'kt', 'kts', 'scala', 'sc', 'groovy', 'gradle',
-  // C/C++/Objective-C
-  'c', 'h', 'cpp', 'cc', 'cxx', 'hpp', 'hxx', 'hh', 'm', 'mm',
-  // C#/F#/.NET
-  'cs', 'fs', 'fsx', 'fsi',
-  // Go
-  'go',
-  // Rust
-  'rs',
-  // Swift
-  'swift',
-  // Dart
-  'dart',
-  // Lua
-  'lua',
-  // Perl
-  'pl', 'pm', 'pod',
-  // R
-  'r', 'R', 'rmd',
-  // Julia
-  'jl',
-  // Haskell
-  'hs', 'lhs',
-  // Elixir/Erlang
-  'ex', 'exs', 'erl', 'hrl',
-  // Clojure
-  'clj', 'cljs', 'cljc', 'edn',
-  // Lisp/Scheme
-  'lisp', 'cl', 'el', 'scm', 'ss', 'rkt',
-  // OCaml/ReasonML
-  'ml', 'mli', 're', 'rei',
-  // Nim
-  'nim',
-  // Zig
-  'zig',
-  // V
-  'v',
-  // Crystal
-  'cr',
-  // Kotlin Script
-  'main.kts',
-  // SQL
-  'sql', 'psql', 'plsql',
-  // GraphQL
-  'graphql', 'gql',
-  // Solidity
-  'sol',
-  // Assembly
-  'asm', 's', 'S',
-  // Makefile variants
-  'mk',
-  // Nix
-  'nix',
-  // Terraform
-  'tf', 'tfvars',
-  // Puppet
-  'pp',
-  // Ansible
-  'ansible',
-]);
-
-const DATA_EXTENSIONS = new Set([
-  // JSON variants
-  'json', 'jsonc', 'json5', 'jsonl', 'ndjson', 'geojson',
-  // YAML
-  'yaml', 'yml',
-  // TOML
-  'toml',
-  // XML variants
-  'xml', 'xsl', 'xslt', 'xsd', 'dtd', 'plist',
-  // Config files
-  'ini', 'cfg', 'conf', 'config', 'env', 'properties',
-  // CSV/TSV
-  'csv', 'tsv',
-  // Lock files
-  'lock',
-]);
-
-const IMAGE_EXTENSIONS = new Set([
-  'png', 'jpg', 'jpeg', 'gif', 'svg', 'webp', 'ico', 'icns',
-  'bmp', 'tiff', 'tif', 'psd', 'ai', 'eps', 'raw', 'cr2', 'nef',
-  'heic', 'heif', 'avif', 'jxl',
-]);
-
-const DOCUMENT_EXTENSIONS = new Set([
-  // Markdown
-  'md', 'mdx', 'markdown', 'mdown', 'mkd',
-  // Text
-  'txt', 'text', 'rtf',
-  // Docs
-  'doc', 'docx', 'odt', 'pdf',
-  // ReStructuredText
-  'rst',
-  // AsciiDoc
-  'adoc', 'asciidoc',
-  // Org
-  'org',
-  // LaTeX
-  'tex', 'latex', 'bib',
-]);
-
-const getFileIcon = (extension?: string): React.ReactNode => {
-  const ext = extension?.toLowerCase();
-
-  if (ext && CODE_EXTENSIONS.has(ext)) {
-    return <RiCodeLine className="h-4 w-4 flex-shrink-0 text-[var(--status-info)]" />;
-  }
-  if (ext && DATA_EXTENSIONS.has(ext)) {
-    return <RiCodeLine className="h-4 w-4 flex-shrink-0 text-[var(--status-warning)]" />;
-  }
-  if (ext && IMAGE_EXTENSIONS.has(ext)) {
-    return <RiFileImageLine className="h-4 w-4 flex-shrink-0 text-[var(--status-success)]" />;
-  }
-  if (ext && DOCUMENT_EXTENSIONS.has(ext)) {
-    return <RiFileTextLine className="h-4 w-4 flex-shrink-0 text-muted-foreground" />;
-  }
-  return <RiFileTextLine className="h-4 w-4 flex-shrink-0 text-muted-foreground" />;
+const getFileIcon = (filePath: string, extension?: string): React.ReactNode => {
+  return <FileTypeIcon filePath={filePath} extension={extension} />;
 };
 
 const isMarkdownFile = (path: string): boolean => {
@@ -406,7 +274,7 @@ const FileRow: React.FC<FileRowProps> = ({
             <RiFolder3Fill className="h-4 w-4 flex-shrink-0 text-primary/60" />
           )
         ) : (
-          getFileIcon(node.extension)
+          getFileIcon(node.path, node.extension)
         )}
         <span
           className="min-w-0 flex-1 truncate typography-meta"
@@ -2354,7 +2222,7 @@ export const FilesView: React.FC<FilesViewProps> = ({ mode = 'full' }) => {
                       isActive ? 'bg-interactive-selection/70' : 'hover:bg-interactive-hover/40'
                     )}
                   >
-                    {getFileIcon(node.extension)}
+                    {getFileIcon(node.path, node.extension)}
                     <span
                       className="min-w-0 flex-1 truncate typography-meta"
                       style={{ direction: 'rtl', textAlign: 'left' }}

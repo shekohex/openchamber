@@ -9,7 +9,7 @@ import { cn, formatDirectoryName } from '@/lib/utils';
 import { getAgentColor } from '@/lib/agentColors';
 import { RiLoader4Line, RiAddLine } from '@remixicon/react';
 import type { SessionContextUsage } from '@/stores/types/sessionTypes';
-import { PROJECT_ICON_MAP, PROJECT_COLOR_MAP } from '@/lib/projectMeta';
+import { PROJECT_ICON_MAP, PROJECT_COLOR_MAP, getProjectIconImageUrl } from '@/lib/projectMeta';
 import { useDirectoryStore } from '@/stores/useDirectoryStore';
 import { toast } from '@/components/ui';
 import { isTauriShell, isDesktopLocalOriginActive } from '@/lib/desktop';
@@ -390,6 +390,8 @@ interface SessionStatusHeaderProps {
   currentSessionTitle: string;
   currentProjectLabel?: string;
   currentProjectIcon?: string | null;
+  currentProjectIconImageUrl?: string | null;
+  currentProjectIconBackground?: string | null;
   currentProjectColor?: string | null;
   onToggle: () => void;
   isExpanded?: boolean;
@@ -400,14 +402,22 @@ function SessionStatusHeader({
   currentSessionTitle,
   currentProjectLabel,
   currentProjectIcon,
+  currentProjectIconImageUrl,
+  currentProjectIconBackground,
   currentProjectColor,
   onToggle,
   isExpanded = false,
   childIndicators = []
 }: SessionStatusHeaderProps) {
+  const [imageFailed, setImageFailed] = React.useState(false);
   const ProjectIcon = currentProjectIcon ? PROJECT_ICON_MAP[currentProjectIcon] : null;
+  const imageUrl = !imageFailed ? currentProjectIconImageUrl : null;
   const projectColorVar = currentProjectColor ? (PROJECT_COLOR_MAP[currentProjectColor] ?? null) : null;
   const extraCount = childIndicators.length > 3 ? childIndicators.length - 3 : 0;
+
+  React.useEffect(() => {
+    setImageFailed(false);
+  }, [currentProjectIconImageUrl]);
 
   return (
     <button
@@ -418,7 +428,20 @@ function SessionStatusHeader({
       {!isExpanded && currentProjectLabel && (
         <div className="flex flex-col items-start">
           <div className="flex items-center gap-1 leading-none">
-            {ProjectIcon && (
+            {imageUrl ? (
+              <span
+                className="inline-flex h-2.5 w-2.5 items-center justify-center overflow-hidden rounded-[1px]"
+                style={currentProjectIconBackground ? { backgroundColor: currentProjectIconBackground } : undefined}
+              >
+                <img
+                  src={imageUrl}
+                  alt=""
+                  className="h-full w-full object-contain"
+                  draggable={false}
+                  onError={() => setImageFailed(true)}
+                />
+              </span>
+            ) : ProjectIcon && (
               <ProjectIcon
                 className="h-2.5 w-2.5"
                 style={projectColorVar ? { color: projectColorVar } : undefined}
@@ -534,7 +557,13 @@ function ProjectButton({
   onRemoveProject,
   formatProjectLabel,
 }: ProjectButtonProps) {
+  const [imageFailed, setImageFailed] = React.useState(false);
   const ProjectIcon = project.icon ? PROJECT_ICON_MAP[project.icon] : null;
+  const projectIconImageUrl = !imageFailed ? getProjectIconImageUrl(project) : null;
+
+  React.useEffect(() => {
+    setImageFailed(false);
+  }, [project.id, project.iconImage?.updatedAt]);
 
   const longPressHandlers = useLongPress(
     () => {
@@ -569,7 +598,20 @@ function ProjectButton({
       </div>
 
       {/* Icon */}
-      {ProjectIcon && (
+      {projectIconImageUrl ? (
+        <span
+          className="inline-flex h-3.5 w-3.5 items-center justify-center overflow-hidden rounded-[2px]"
+          style={project.iconBackground ? { backgroundColor: project.iconBackground } : undefined}
+        >
+          <img
+            src={projectIconImageUrl}
+            alt=""
+            className="h-full w-full object-contain"
+            draggable={false}
+            onError={() => setImageFailed(true)}
+          />
+        </span>
+      ) : ProjectIcon && (
         <ProjectIcon
           className="h-3.5 w-3.5"
           style={projectColorVar ? { color: projectColorVar } : undefined}
@@ -752,6 +794,8 @@ function CollapsedView({
   currentSessionTitle,
   currentProjectLabel,
   currentProjectIcon,
+  currentProjectIconImageUrl,
+  currentProjectIconBackground,
   currentProjectColor,
   onToggle,
   onNewSession,
@@ -764,6 +808,8 @@ function CollapsedView({
   currentSessionTitle: string;
   currentProjectLabel?: string;
   currentProjectIcon?: string | null;
+  currentProjectIconImageUrl?: string | null;
+  currentProjectIconBackground?: string | null;
   currentProjectColor?: string | null;
   onToggle: () => void;
   onNewSession: () => void;
@@ -789,6 +835,8 @@ function CollapsedView({
           currentSessionTitle={currentSessionTitle}
           currentProjectLabel={currentProjectLabel}
           currentProjectIcon={currentProjectIcon}
+          currentProjectIconImageUrl={currentProjectIconImageUrl}
+          currentProjectIconBackground={currentProjectIconBackground}
           currentProjectColor={currentProjectColor}
           onToggle={onToggle}
           childIndicators={childIndicators}
@@ -827,6 +875,8 @@ function ExpandedView({
   currentSessionTitle,
   currentProjectLabel,
   currentProjectIcon,
+  currentProjectIconImageUrl,
+  currentProjectIconBackground,
   currentProjectColor,
   isExpanded,
   onToggleCollapse,
@@ -854,6 +904,8 @@ function ExpandedView({
   currentSessionTitle: string;
   currentProjectLabel?: string;
   currentProjectIcon?: string | null;
+  currentProjectIconImageUrl?: string | null;
+  currentProjectIconBackground?: string | null;
   currentProjectColor?: string | null;
   isExpanded: boolean;
   onToggleCollapse: () => void;
@@ -936,6 +988,8 @@ function ExpandedView({
             currentSessionTitle={currentSessionTitle}
             currentProjectLabel={currentProjectLabel}
             currentProjectIcon={currentProjectIcon}
+            currentProjectIconImageUrl={currentProjectIconImageUrl}
+            currentProjectIconBackground={currentProjectIconBackground}
             currentProjectColor={currentProjectColor}
             onToggle={onToggleCollapse}
             isExpanded={true}
@@ -1053,6 +1107,8 @@ export const MobileSessionStatusBar: React.FC<MobileSessionStatusBarProps> = ({
   const activeProject = getActiveProject();
   const currentProjectLabel = activeProject?.label || formatDirectoryName(activeProject?.path || '', homeDirectory);
   const currentProjectIcon = activeProject?.icon;
+  const currentProjectIconImageUrl = activeProject ? getProjectIconImageUrl(activeProject) : null;
+  const currentProjectIconBackground = activeProject?.iconBackground ?? null;
   const currentProjectColor = activeProject?.color;
 
   // Calculate token usage for current session
@@ -1127,6 +1183,8 @@ export const MobileSessionStatusBar: React.FC<MobileSessionStatusBarProps> = ({
         currentSessionTitle={currentSessionTitle}
         currentProjectLabel={currentProjectLabel}
         currentProjectIcon={currentProjectIcon}
+        currentProjectIconImageUrl={currentProjectIconImageUrl}
+        currentProjectIconBackground={currentProjectIconBackground}
         currentProjectColor={currentProjectColor}
         onToggle={() => setIsMobileSessionStatusBarCollapsed(false)}
         onNewSession={handleCreateSession}
@@ -1146,6 +1204,8 @@ export const MobileSessionStatusBar: React.FC<MobileSessionStatusBarProps> = ({
       currentSessionTitle={currentSessionTitle}
       currentProjectLabel={currentProjectLabel}
       currentProjectIcon={currentProjectIcon}
+      currentProjectIconImageUrl={currentProjectIconImageUrl}
+      currentProjectIconBackground={currentProjectIconBackground}
       currentProjectColor={currentProjectColor}
       isExpanded={isExpanded}
       onToggleCollapse={() => {

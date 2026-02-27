@@ -15,6 +15,7 @@ import { useSessionAutoCleanup } from '@/hooks/useSessionAutoCleanup';
 import { useQueuedMessageAutoSend } from '@/hooks/useQueuedMessageAutoSend';
 import { useRouter } from '@/hooks/useRouter';
 import { usePushVisibilityBeacon } from '@/hooks/usePushVisibilityBeacon';
+import { useWindowTitle } from '@/hooks/useWindowTitle';
 import { GitPollingProvider } from '@/hooks/useGitPolling';
 import { useConfigStore } from '@/stores/useConfigStore';
 import { hasModifier } from '@/lib/utils';
@@ -176,6 +177,8 @@ function App({ apis }: AppProps) {
   useServerSessionStatus();
 
   usePushVisibilityBeacon();
+
+  useWindowTitle();
 
   useRouter();
 

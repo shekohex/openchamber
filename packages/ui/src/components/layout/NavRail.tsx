@@ -43,7 +43,7 @@ import { useSessionStore } from '@/stores/useSessionStore';
 import { useDirectoryStore } from '@/stores/useDirectoryStore';
 import { useUpdateStore } from '@/stores/useUpdateStore';
 import { cn, formatDirectoryName, hasModifier } from '@/lib/utils';
-import { PROJECT_ICON_MAP, PROJECT_COLOR_MAP } from '@/lib/projectMeta';
+import { PROJECT_ICON_MAP, PROJECT_COLOR_MAP, getProjectIconImageUrl } from '@/lib/projectMeta';
 import { isDesktopLocalOriginActive, isDesktopShell, isTauriShell } from '@/lib/desktop';
 import { useLongPress } from '@/hooks/useLongPress';
 import { formatShortcutForDisplay, getEffectiveShortcutCombo } from '@/lib/shortcuts';
@@ -143,10 +143,16 @@ const ProjectTile: React.FC<{
   onClose: () => void;
 }> = ({ project, isActive, hasStreaming, hasUnread, label, expanded, projectTextVisible, onClick, onEdit, onClose }) => {
   const [menuOpen, setMenuOpen] = React.useState(false);
+  const [iconImageFailed, setIconImageFailed] = React.useState(false);
   const ProjectIcon = project.icon ? PROJECT_ICON_MAP[project.icon] : null;
+  const projectIconImageUrl = !iconImageFailed ? getProjectIconImageUrl(project) : null;
   const projectColorVar = project.color ? (PROJECT_COLOR_MAP[project.color] ?? null) : null;
   const showStreamingDots = hasStreaming;
   const showAttentionDots = !hasStreaming && hasUnread;
+
+  React.useEffect(() => {
+    setIconImageFailed(false);
+  }, [project.id, project.iconImage?.updatedAt]);
 
   const longPressHandlers = useLongPress({
     onLongPress: () => setMenuOpen(true),
@@ -157,7 +163,20 @@ const ProjectTile: React.FC<{
     <TileBackground colorVar={projectColorVar}>
       <span className="relative h-full w-full leading-none">
         <span className="pointer-events-none absolute inset-0 flex items-center justify-center">
-          {ProjectIcon ? (
+          {projectIconImageUrl ? (
+            <span
+              className="inline-flex h-4 w-4 shrink-0 items-center justify-center overflow-hidden rounded-[2px]"
+              style={project.iconBackground ? { backgroundColor: project.iconBackground } : undefined}
+            >
+              <img
+                src={projectIconImageUrl}
+                alt=""
+                className="h-full w-full object-contain"
+                draggable={false}
+                onError={() => setIconImageFailed(true)}
+              />
+            </span>
+          ) : ProjectIcon ? (
             <ProjectIcon
               className="h-4 w-4 shrink-0"
               style={projectColorVar ? { color: projectColorVar } : { color: 'var(--surface-foreground)' }}
@@ -392,6 +411,7 @@ export const NavRail: React.FC<NavRailProps> = ({ className, mobile }) => {
     path: string;
     icon?: string | null;
     color?: string | null;
+    iconBackground?: string | null;
   } | null>(null);
 
   const isDesktopApp = React.useMemo(() => isDesktopShell(), []);
@@ -504,19 +524,20 @@ export const NavRail: React.FC<NavRailProps> = ({ className, mobile }) => {
     (projectId: string) => {
       const project = projects.find((p) => p.id === projectId);
       if (!project) return;
-      setEditingProject({
-        id: project.id,
-        name: formatLabel(project),
-        path: project.path,
-        icon: project.icon,
-        color: project.color,
-      });
+        setEditingProject({
+          id: project.id,
+          name: formatLabel(project),
+          path: project.path,
+          icon: project.icon,
+          color: project.color,
+          iconBackground: project.iconBackground,
+        });
     },
     [projects, formatLabel],
   );
 
   const handleSaveProjectEdit = React.useCallback(
-    (data: { label: string; icon: string | null; color: string | null }) => {
+    (data: { label: string; icon: string | null; color: string | null; iconBackground: string | null }) => {
       if (!editingProject) return;
       updateProjectMeta(editingProject.id, data);
       setEditingProject(null);
@@ -763,10 +784,12 @@ export const NavRail: React.FC<NavRailProps> = ({ className, mobile }) => {
           onOpenChange={(open) => {
             if (!open) setEditingProject(null);
           }}
+          projectId={editingProject.id}
           projectName={editingProject.name}
           projectPath={editingProject.path}
           initialIcon={editingProject.icon}
           initialColor={editingProject.color}
+          initialIconBackground={editingProject.iconBackground}
           onSave={handleSaveProjectEdit}
         />
       )}

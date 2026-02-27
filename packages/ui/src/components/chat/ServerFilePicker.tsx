@@ -8,7 +8,7 @@ import {
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { ScrollArea } from '@/components/ui/scroll-area';
-import { RiCloseLine, RiCodeLine, RiFileImageLine, RiFileTextLine, RiFolder6Line, RiSearchLine } from '@remixicon/react';
+import { RiCloseLine, RiFolder6Line, RiSearchLine } from '@remixicon/react';
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
 import { cn, truncatePathMiddle } from '@/lib/utils';
 import { useDirectoryStore } from '@/stores/useDirectoryStore';
@@ -19,6 +19,7 @@ import { useFileSearchStore } from '@/stores/useFileSearchStore';
 import { useDebouncedValue } from '@/hooks/useDebouncedValue';
 import { useDirectoryShowHidden } from '@/lib/directoryShowHidden';
 import { useFilesViewShowGitignored } from '@/lib/filesViewShowGitignored';
+import { FileTypeIcon } from '@/components/icons/FileTypeIcon';
 interface FileInfo {
   name: string;
   path: string;
@@ -259,31 +260,7 @@ export const ServerFilePicker: React.FC<ServerFilePickerProps> = ({
       );
     }
 
-    const ext = file.extension?.toLowerCase();
-    switch (ext) {
-      case 'ts':
-      case 'tsx':
-      case 'js':
-      case 'jsx':
-      case 'html':
-      case 'css':
-      case 'scss':
-      case 'less':
-        return <RiCodeLine className="h-3.5 w-3.5 text-[var(--status-info)]" />;
-      case 'json':
-        return <RiCodeLine className="h-3.5 w-3.5 text-[var(--status-warning)]" />;
-      case 'md':
-      case 'mdx':
-        return <RiFileTextLine className="h-3.5 w-3.5 text-muted-foreground" />;
-      case 'png':
-      case 'jpg':
-      case 'jpeg':
-      case 'gif':
-      case 'svg':
-        return <RiFileImageLine className="h-3.5 w-3.5 text-[var(--status-success)]" />;
-      default:
-        return <RiFileTextLine className="h-3.5 w-3.5 text-muted-foreground" />;
-    }
+    return <FileTypeIcon filePath={file.path} extension={file.extension} className="h-3.5 w-3.5" />;
   };
 
   const toggleDirectory = async (dirPath: string) => {
