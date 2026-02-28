@@ -12783,12 +12783,20 @@ async function main(options = {}) {
         },
       }));
 
-      let recentPwaSessionsCache = { at: 0, data: [] };
+      const recentPwaSessionsCache = new Map();
 
-      const getRecentPwaSessionShortcuts = async () => {
+      const getRecentPwaSessionShortcuts = async (req) => {
         const now = Date.now();
-        if (now - recentPwaSessionsCache.at < 5000) {
-          return recentPwaSessionsCache.data;
+
+        const resolvedDirectoryResult = await resolveProjectDirectory(req).catch(() => ({ directory: null }));
+        const preferredDirectory = typeof resolvedDirectoryResult?.directory === 'string'
+          ? resolvedDirectoryResult.directory
+          : null;
+
+        const cacheKey = preferredDirectory ? `dir:${preferredDirectory}` : 'global';
+        const cached = recentPwaSessionsCache.get(cacheKey);
+        if (cached && now - cached.at < 5000) {
+          return cached.data;
         }
 
         const normalizeShortcutTitle = (value, fallback) => {
@@ -12796,8 +12804,67 @@ async function main(options = {}) {
           return normalized.length > 48 ? normalized.slice(0, 48) : normalized;
         };
 
-        try {
-          const response = await fetch(buildOpenCodeUrl('/session', ''), {
+        const toFiniteNumber = (value) => {
+          if (typeof value === 'number' && Number.isFinite(value)) {
+            return value;
+          }
+          if (typeof value === 'string' && value.trim().length > 0) {
+            const parsed = Number(value);
+            if (Number.isFinite(parsed)) {
+              return parsed;
+            }
+          }
+          return null;
+        };
+
+        const normalizeDirectory = (value) => {
+          if (typeof value !== 'string') {
+            return '';
+          }
+          const trimmed = value.trim();
+          if (!trimmed) {
+            return '';
+          }
+          const normalized = trimmed.replace(/\\/g, '/');
+          if (normalized === '/') {
+            return '/';
+          }
+          return normalized.length > 1 ? normalized.replace(/\/+$/, '') : normalized;
+        };
+
+        const sessionUpdatedAt = (session) => {
+          const time = session && typeof session.time === 'object' ? session.time : null;
+          return toFiniteNumber(time?.updated) ?? toFiniteNumber(time?.created) ?? 0;
+        };
+
+        const filterSessionsByDirectory = (sessions, directory) => {
+          const normalizedDirectory = normalizeDirectory(directory);
+          if (!normalizedDirectory) {
+            return sessions;
+          }
+
+          const prefix = normalizedDirectory === '/' ? '/' : `${normalizedDirectory}/`;
+          return sessions.filter((session) => {
+            const sessionDirectory = normalizeDirectory(session?.directory);
+            if (!sessionDirectory) {
+              return false;
+            }
+            return sessionDirectory === normalizedDirectory || (prefix !== '/' && sessionDirectory.startsWith(prefix));
+          });
+        };
+
+        const listSessions = async (directory) => {
+          const query = (() => {
+            if (typeof directory !== 'string' || directory.length === 0) {
+              return '';
+            }
+            const preparedDirectory = process.platform === 'win32'
+              ? directory.replace(/\//g, '\\')
+              : directory;
+            return `?directory=${encodeURIComponent(preparedDirectory)}`;
+          })();
+
+          const response = await fetch(buildOpenCodeUrl(`/session${query}`, ''), {
             method: 'GET',
             headers: {
               Accept: 'application/json',
@@ -12807,14 +12874,29 @@ async function main(options = {}) {
           });
 
           if (!response.ok) {
-            recentPwaSessionsCache = { at: now, data: [] };
             return [];
           }
 
           const payload = await response.json().catch(() => null);
-          if (!Array.isArray(payload)) {
-            recentPwaSessionsCache = { at: now, data: [] };
-            return [];
+          return Array.isArray(payload) ? payload : [];
+        };
+
+        try {
+          let payload = [];
+
+          if (preferredDirectory) {
+            const scopedPayload = await listSessions(preferredDirectory);
+            const filteredScopedPayload = filterSessionsByDirectory(scopedPayload, preferredDirectory);
+
+            if (filteredScopedPayload.length > 0) {
+              payload = filteredScopedPayload;
+            } else {
+              const globalPayload = await listSessions(null);
+              const filteredGlobalPayload = filterSessionsByDirectory(globalPayload, preferredDirectory);
+              payload = filteredGlobalPayload.length > 0 ? filteredGlobalPayload : globalPayload;
+            }
+          } else {
+            payload = await listSessions(null);
           }
 
           const seen = new Set();
@@ -12832,12 +12914,7 @@ async function main(options = {}) {
 
             seen.add(id);
             const title = normalizeShortcutTitle(item.title, `Session ${rows.length + 1}`);
-            let updatedAt = 0;
-            if (typeof item.time_updated === 'number') {
-              updatedAt = item.time_updated;
-            } else if (typeof item.time_created === 'number') {
-              updatedAt = item.time_created;
-            }
+            const updatedAt = sessionUpdatedAt(item);
 
             rows.push({ id, title, updatedAt });
           }
@@ -12852,10 +12929,10 @@ async function main(options = {}) {
             icons: [{ src: '/pwa-192.png', sizes: '192x192', type: 'image/png' }],
           }));
 
-          recentPwaSessionsCache = { at: now, data: shortcuts };
+          recentPwaSessionsCache.set(cacheKey, { at: now, data: shortcuts });
           return shortcuts;
         } catch {
-          recentPwaSessionsCache = { at: now, data: [] };
+          recentPwaSessionsCache.set(cacheKey, { at: now, data: [] });
           return [];
         }
       };
@@ -12890,7 +12967,7 @@ async function main(options = {}) {
           : (storedName || DEFAULT_PWA_APP_NAME);
 
         const shortName = appName.length > 30 ? appName.slice(0, 30) : appName;
-        const recentSessionShortcuts = await getRecentPwaSessionShortcuts();
+        const recentSessionShortcuts = await getRecentPwaSessionShortcuts(req);
 
         const manifest = {
           name: appName,
