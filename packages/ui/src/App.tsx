@@ -15,6 +15,8 @@ import { useSessionAutoCleanup } from '@/hooks/useSessionAutoCleanup';
 import { useQueuedMessageAutoSend } from '@/hooks/useQueuedMessageAutoSend';
 import { useRouter } from '@/hooks/useRouter';
 import { usePushVisibilityBeacon } from '@/hooks/usePushVisibilityBeacon';
+import { usePwaManifestSync } from '@/hooks/usePwaManifestSync';
+import { usePwaInstallPrompt } from '@/hooks/usePwaInstallPrompt';
 import { useWindowTitle } from '@/hooks/useWindowTitle';
 import { GitPollingProvider } from '@/hooks/useGitPolling';
 import { useConfigStore } from '@/stores/useConfigStore';
@@ -178,6 +180,8 @@ function App({ apis }: AppProps) {
   useServerSessionStatus();
 
   usePushVisibilityBeacon();
+  usePwaManifestSync();
+  usePwaInstallPrompt();
 
   useWindowTitle();
 
