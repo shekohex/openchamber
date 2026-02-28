@@ -143,6 +143,7 @@ export interface GitFileDiffResponse {
   original: string;
   modified: string;
   path: string;
+  isBinary?: boolean;
 }
 
 export interface GetGitFileDiffOptions {
@@ -389,10 +390,10 @@ export interface GitAPI {
   getGitBranches(directory: string): Promise<GitBranch>;
   deleteGitBranch(directory: string, payload: GitDeleteBranchPayload): Promise<{ success: boolean }>;
   deleteRemoteBranch(directory: string, payload: GitDeleteRemoteBranchPayload): Promise<{ success: boolean }>;
-  generateCommitMessage(directory: string, files: string[], options?: { zenModel?: string }): Promise<{ message: GeneratedCommitMessage }>;
+  generateCommitMessage(directory: string, files: string[], options?: { zenModel?: string; providerId?: string; modelId?: string }): Promise<{ message: GeneratedCommitMessage }>;
   generatePullRequestDescription(
     directory: string,
-    payload: { base: string; head: string; context?: string; zenModel?: string }
+    payload: { base: string; head: string; context?: string; zenModel?: string; providerId?: string; modelId?: string }
   ): Promise<GeneratedPullRequestDescription>;
   listGitWorktrees(directory: string): Promise<GitWorktreeInfo[]>;
   validateGitWorktree?(directory: string, payload: CreateGitWorktreePayload): Promise<GitWorktreeValidationResult>;
@@ -479,6 +480,7 @@ export interface FilesAPI {
   writeFile?(path: string, content: string): Promise<{ success: boolean; path: string }>;
   delete?(path: string): Promise<{ success: boolean }>;
   rename?(oldPath: string, newPath: string): Promise<{ success: boolean; path: string }>;
+  revealPath?(path: string): Promise<{ success: boolean }>;
   execCommands?(commands: string[], cwd: string): Promise<{ success: boolean; results: CommandExecResult[] }>;
 }
 
@@ -486,6 +488,14 @@ export interface ProjectEntry {
   id: string;
   path: string;
   label?: string;
+  icon?: string | null;
+  iconImage?: {
+    mime: string;
+    updatedAt: number;
+    source: 'custom' | 'auto';
+  } | null;
+  iconBackground?: string | null;
+  color?: string | null;
   addedAt?: number;
   lastOpenedAt?: number;
   sidebarCollapsed?: boolean;
@@ -507,6 +517,7 @@ export interface SettingsPayload {
   pinnedDirectories?: string[];
   showReasoningTraces?: boolean;
   showTextJustificationActivity?: boolean;
+  showDeletionDialog?: boolean;
   nativeNotificationsEnabled?: boolean;
   notificationMode?: 'always' | 'hidden-only';
   mobileHapticsEnabled?: boolean;
@@ -526,6 +537,8 @@ export interface SettingsPayload {
   directoryShowHidden?: boolean;
   filesViewShowGitignored?: boolean;
   openInAppId?: string;
+  gitProviderId?: string;
+  gitModelId?: string;
 
   [key: string]: unknown;
 }
@@ -939,6 +952,7 @@ export interface SkillsCatalogSource {
 export interface SkillsCatalogItemInstalledBadge {
   isInstalled: boolean;
   scope?: 'user' | 'project';
+  source?: 'opencode' | 'agents' | 'claude';
 }
 
 export interface ClawdHubSkillMetadata {
@@ -1017,6 +1031,7 @@ export interface SkillsInstallRequest {
   subpath?: string;
   gitIdentityId?: string;
   scope: 'user' | 'project';
+  targetSource?: 'opencode' | 'agents';
   selections: SkillsInstallSelection[];
   conflictPolicy?: 'prompt' | 'skipAll' | 'overwriteAll';
   conflictDecisions?: Record<string, 'skip' | 'overwrite'>;
@@ -1025,12 +1040,15 @@ export interface SkillsInstallRequest {
 export type SkillsInstallError = SkillsRepoScanError | {
   kind: 'conflicts';
   message: string;
-  conflicts: Array<{ skillName: string; scope: 'user' | 'project' }>;
+  conflicts: Array<{ skillName: string; scope: 'user' | 'project'; source?: 'opencode' | 'agents' }>;
 };
 
 export interface SkillsInstallResponse {
   ok: boolean;
-  installed?: Array<{ skillName: string; scope: 'user' | 'project' }>;
+  installed?: Array<{ skillName: string; scope: 'user' | 'project'; source?: 'opencode' | 'agents' }>;
   skipped?: Array<{ skillName: string; reason: string }>;
   error?: SkillsInstallError;
+  requiresReload?: boolean;
+  message?: string;
+  reloadDelayMs?: number;
 }

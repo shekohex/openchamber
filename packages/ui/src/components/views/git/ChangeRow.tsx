@@ -6,6 +6,7 @@ import {
   RiLoader4Line,
 } from '@remixicon/react';
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
+import { FileTypeIcon } from '@/components/icons/FileTypeIcon';
 import type { GitStatus } from '@/lib/api/types';
 
 type ChangeDescriptor = {
@@ -96,14 +97,13 @@ export const ChangeRow = React.memo<ChangeRowProps>(function ChangeRow({
   );
 
   return (
-    <li>
-      <div
-        className="group flex items-center gap-2 px-3 py-1.5 hover:bg-sidebar/40 cursor-pointer"
-        role="button"
-        tabIndex={0}
-        onClick={onViewDiff}
-        onKeyDown={handleKeyDown}
-      >
+    <div
+      className="group flex items-center gap-2 px-3 py-1.5 hover:bg-sidebar/40 cursor-pointer"
+      role="button"
+      tabIndex={0}
+      onClick={onViewDiff}
+      onKeyDown={handleKeyDown}
+    >
         <button
           type="button"
           onClick={handleToggleClick}
@@ -125,13 +125,34 @@ export const ChangeRow = React.memo<ChangeRowProps>(function ChangeRow({
         >
           {descriptor.code}
         </span>
-        <span
-          className="flex-1 min-w-0 truncate typography-ui-label text-foreground"
-          style={{ direction: 'rtl', textAlign: 'left' }}
-          title={file.path}
-        >
-          {file.path}
-        </span>
+        <FileTypeIcon filePath={file.path} className="h-3.5 w-3.5 shrink-0" />
+        {(() => {
+          const lastSlash = file.path.lastIndexOf('/');
+          if (lastSlash === -1) {
+            return (
+              <span
+                className="flex-1 min-w-0 truncate typography-ui-label text-foreground"
+                style={{ direction: 'rtl', textAlign: 'left' }}
+                title={file.path}
+              >
+                {file.path}
+              </span>
+            );
+          }
+          const dir = file.path.slice(0, lastSlash);
+          const name = file.path.slice(lastSlash);
+          return (
+            <span className="flex-1 min-w-0 flex items-baseline overflow-hidden" title={file.path}>
+              <span
+                className="min-w-0 truncate typography-ui-label text-muted-foreground"
+                style={{ direction: 'rtl', textAlign: 'left' }}
+              >
+                {dir}
+              </span>
+              <span className="flex-shrink-0 typography-ui-label"><span className="text-muted-foreground">/</span><span className="text-foreground">{name.slice(1)}</span></span>
+            </span>
+          );
+        })()}
         <span className="shrink-0 typography-micro">
           <span style={{ color: 'var(--status-success)' }}>+{insertions}</span>
           <span className="text-muted-foreground mx-0.5">/</span>
@@ -155,7 +176,6 @@ export const ChangeRow = React.memo<ChangeRowProps>(function ChangeRow({
           </TooltipTrigger>
           <TooltipContent sideOffset={8}>Revert changes</TooltipContent>
         </Tooltip>
-      </div>
-    </li>
+    </div>
   );
 });

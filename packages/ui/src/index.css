@@ -300,6 +300,8 @@ textarea[data-chat-input="true"]:focus-visible {
 .file-mention-marquee-container {
   --file-mention-marquee-width: 360px;
   --file-mention-marquee-duration: 4s;
+  mask-image: linear-gradient(to right, black calc(100% - 24px), transparent 100%);
+  -webkit-mask-image: linear-gradient(to right, black calc(100% - 24px), transparent 100%);
 }
 
 .file-mention-marquee {
@@ -564,33 +566,25 @@ html:not(.dark) .chat-scroll {
 /* Pierre diff viewer styling */
 .pierre-diff-wrapper {
   --diffs-font-family: var(--font-mono, 'IBM Plex Mono', monospace);
-  --diffs-font-size: var(--text-code, 13px);
-  --diffs-line-height: 1.5;
+  --diffs-font-size: var(--text-code);
+  --diffs-line-height: 24px;
   --diffs-tab-size: 2;
   --diffs-header-font-family: var(--font-sans, 'IBM Plex Sans', sans-serif);
   --diffs-min-number-column-width: 4ch;
   --diffs-gap-inline: 0;
   --diffs-gap-block: 0;
+
+  /* Prevent browser scroll anchoring jumps during async highlight/virtualization */
+  overflow-anchor: none;
+}
+
+/* Prevent scroll anchoring in stacked diff scroll container */
+[data-diff-virtual-root] {
+  overflow-anchor: none;
 }
 
 /* Desktop: slightly smaller diff code text */
-:root:not(.mobile-pointer) .pierre-diff-wrapper {
-  --diffs-font-size: 0.8125rem;
-}
 
-/* WebKit scroll rendering optimizations */
-/* Note: avoid will-change and contain as they break resize behavior */
-.pierre-diff-wrapper,
-.pierre-diff-wrapper diffs-container {
-  /* Force GPU compositing layer */
-  transform: translateZ(0);
-  -webkit-transform: translateZ(0);
-  -webkit-backface-visibility: hidden;
-  backface-visibility: hidden;
-
-  /* WebKit touch scroll optimization */
-  -webkit-overflow-scrolling: touch;
-}
 
 .pierre-diff-wrapper diffs-container {
   display: block;
@@ -670,13 +664,13 @@ html:not(.dark) .chat-scroll {
 }
 
 /* Commit actions: collapse labels when narrow. */
-@container commit-actions (max-width: 28rem) {
+@container commit-actions (max-width: 21rem) {
   .commit-actions__label--long {
     display: none;
   }
 }
 
-@container commit-actions (max-width: 22rem) {
+@container commit-actions (max-width: 19rem) {
   .commit-actions__label {
     display: none;
   }
@@ -684,6 +678,17 @@ html:not(.dark) .chat-scroll {
   .commit-actions__btn {
     padding-inline: 0.5rem;
   }
+}
+
+/* Utility: hide scrollbars without affecting layout */
+.scrollbar-none {
+  -ms-overflow-style: none;
+  scrollbar-width: none;
+}
+.scrollbar-none::-webkit-scrollbar {
+  width: 0;
+  height: 0;
+  display: none;
 }
 
 /* Git right-sidebar header/actions collapse to icon-only when narrow. */
@@ -861,6 +866,102 @@ html:not(.dark) .chat-scroll {
   contain-intrinsic-size: none !important;
 }
 
+/* Mermaid block: position context for controls wrapper. */
+[data-streamdown="mermaid-block"] {
+  position: relative;
+  border-radius: 0.75rem;
+  border: 1px solid var(--interactive-border);
+  background: var(--surface-elevated);
+  padding: 0.5rem;
+}
+
+[data-streamdown="mermaid-block"] [data-streamdown="mermaid-scroll"] {
+  overflow: auto;
+}
+
+[data-streamdown="mermaid-block"] [data-streamdown="mermaid"] {
+  width: max-content;
+  min-width: 100%;
+  display: block;
+}
+
+[data-streamdown="mermaid-block"] [data-streamdown="mermaid-ascii"] {
+  margin: 0;
+  white-space: pre;
+  width: max-content;
+  min-width: 100%;
+  font-family: "IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+  color: var(--surface-foreground);
+  background: transparent;
+}
+
+[data-streamdown="mermaid-block"] [data-streamdown="mermaid"] svg {
+  width: auto !important;
+  min-width: 100%;
+  max-width: none !important;
+  height: auto !important;
+}
+
+[data-streamdown="mermaid-block"] svg {
+  display: block;
+  background: var(--surface-elevated);
+}
+
+/* Fullscreen Mermaid popup: scale diagrams to fill available viewport panel area. */
+.streamdown-mermaid-fullscreen {
+  height: 100%;
+  width: 100%;
+}
+
+.streamdown-mermaid-fullscreen .streamdown-content {
+  height: 100%;
+  width: 100%;
+}
+
+.streamdown-mermaid-fullscreen [data-streamdown="mermaid-block"] {
+  width: 100%;
+  height: 100%;
+  min-height: 100%;
+  padding: 0.75rem;
+  border: 0;
+  border-radius: 0;
+  background: var(--surface-elevated);
+}
+
+.streamdown-mermaid-fullscreen [data-streamdown="mermaid-block"] [data-streamdown="mermaid-scroll"] {
+  width: 100%;
+  height: 100%;
+  overflow: auto;
+}
+
+.streamdown-mermaid-fullscreen [data-streamdown="mermaid-block"] [data-streamdown="mermaid"] {
+  width: max-content;
+  min-width: 100%;
+  min-height: 100%;
+  display: block;
+}
+
+.streamdown-mermaid-fullscreen [data-streamdown="mermaid-block"] [data-streamdown="mermaid-ascii"] {
+  margin: 0;
+  white-space: pre;
+  width: max-content;
+  min-width: 100%;
+  min-height: 100%;
+  font-family: "IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+  color: var(--surface-foreground);
+  background: transparent;
+}
+
+.streamdown-mermaid-fullscreen [data-streamdown="mermaid-block"] svg {
+  width: auto !important;
+  height: auto !important;
+  max-width: none !important;
+  max-height: none !important;
+  min-width: 100%;
+  display: block;
+  background: transparent;
+}
+
 /* Hide system caret in terminal - targets both Ghostty internal input and our custom touch input */
 .terminal-viewport-container textarea,
 .terminal-viewport-container input {
@@ -880,11 +981,8 @@ html:not(.dark) .chat-scroll {
 /* Keep Ghostty's internal focus textarea fully non-painting on desktop. */
 .terminal-viewport-container textarea:not([data-terminal-hidden-input="true"]) {
   opacity: 0 !important;
-  width: 0 !important;
-  height: 0 !important;
   font-size: 0 !important;
   line-height: 0 !important;
-  clip-path: inset(100%) !important;
   color: transparent !important;
   -webkit-text-fill-color: transparent !important;
   background: transparent !important;
@@ -900,9 +998,6 @@ input[aria-label="Terminal input"] {
   color: transparent !important;
   -webkit-text-fill-color: transparent !important;
   opacity: 0 !important;
-  width: 0 !important;
-  height: 0 !important;
-  clip-path: inset(100%) !important;
   outline: none !important;
 }
 
@@ -952,11 +1047,9 @@ textarea[data-terminal-hidden-input="true"]::placeholder {
 @keyframes grid-pulse {
   0%, 100% {
     opacity: 0.2;
-    transform: scale(0.8);
   }
   50% {
     opacity: 1;
-    transform: scale(1);
   }
 }
 
@@ -975,6 +1068,63 @@ textarea[data-terminal-hidden-input="true"]::placeholder {
 
 .animate-attention-diamond-pulse {
   animation: attention-diamond-pulse 2.3s ease-in-out infinite;
+}
+
+@keyframes navrail-dot-wave {
+  0%, 100% {
+    transform: scale(0.72);
+    opacity: 0.52;
+  }
+  50% {
+    transform: scale(1);
+    opacity: 1;
+  }
+}
+
+.animate-navrail-dot-wave {
+  animation: navrail-dot-wave 1.2s ease-in-out infinite;
+}
+
+@keyframes border-glow-pulse {
+  0%, 100% {
+    border-color: var(--interactive-border);
+    outline-color: transparent;
+  }
+  12.5% {
+    border-color: color-mix(in srgb, var(--primary) 22%, var(--interactive-border));
+    outline-color: color-mix(in srgb, var(--primary) 8%, transparent);
+  }
+  25% {
+    border-color: color-mix(in srgb, var(--primary) 40%, var(--interactive-border));
+    outline-color: color-mix(in srgb, var(--primary) 16%, transparent);
+  }
+  37.5% {
+    border-color: color-mix(in srgb, var(--primary) 62%, var(--interactive-border));
+    outline-color: color-mix(in srgb, var(--primary) 26%, transparent);
+  }
+  50% {
+    border-color: color-mix(in srgb, var(--primary) 78%, var(--interactive-border));
+    outline-color: color-mix(in srgb, var(--primary) 34%, transparent);
+  }
+  62.5% {
+    border-color: color-mix(in srgb, var(--primary) 62%, var(--interactive-border));
+    outline-color: color-mix(in srgb, var(--primary) 26%, transparent);
+  }
+  75% {
+    border-color: color-mix(in srgb, var(--primary) 40%, var(--interactive-border));
+    outline-color: color-mix(in srgb, var(--primary) 16%, transparent);
+  }
+  87.5% {
+    border-color: color-mix(in srgb, var(--primary) 22%, var(--interactive-border));
+    outline-color: color-mix(in srgb, var(--primary) 8%, transparent);
+  }
+}
+
+.animate-border-glow-pulse {
+  outline: 1px solid transparent;
+  outline-offset: 1px;
+  will-change: border-color, outline-color;
+  animation: border-glow-pulse 3.8s linear infinite;
 }
 
 @keyframes marquee-scroll {
@@ -1007,5 +1157,7 @@ textarea[data-terminal-hidden-input="true"]::placeholder {
   .animate-grid-pulse,
   .animate-attention-diamond-pulse {
     animation: none;
-  }
+}
+
+
 }

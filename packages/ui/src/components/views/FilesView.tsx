@@ -2,17 +2,14 @@ import React from 'react';
 
 import {
   RiArrowLeftSLine,
-  RiArrowRightSLine,
   RiArrowDownSLine,
   RiClipboardLine,
   RiCloseLine,
-  RiCodeLine,
-  RiFileImageLine,
-  RiFileTextLine,
   RiFileCopy2Line,
   RiCheckLine,
   RiFolder3Fill,
   RiFolderOpenFill,
+  RiFolderReceivedLine,
   RiFullscreenExitLine,
   RiFullscreenLine,
   RiLoader4Line,
@@ -25,9 +22,11 @@ import {
   RiFolderAddLine,
   RiDeleteBinLine,
   RiEditLine,
+  RiEyeLine,
   RiFileCopyLine,
 } from '@remixicon/react';
 import { toast } from '@/components/ui';
+import { copyTextToClipboard } from '@/lib/clipboard';
 
 import {
   DropdownMenu,
@@ -39,12 +38,12 @@ import {
 import { ScrollableOverlay } from '@/components/ui/ScrollableOverlay';
 import { Input } from '@/components/ui/input';
 import { Button } from '@/components/ui/button';
-import { CodeMirrorEditor, type BlockWidgetDef } from '@/components/ui/CodeMirrorEditor';
+import { CodeMirrorEditor } from '@/components/ui/CodeMirrorEditor';
 import { PreviewToggleButton } from './PreviewToggleButton';
 import { SimpleMarkdownRenderer } from '@/components/chat/MarkdownRenderer';
-import { languageByExtension } from '@/lib/codemirror/languageByExtension';
+import { languageByExtension, loadLanguageByExtension } from '@/lib/codemirror/languageByExtension';
 import { createFlexokiCodeMirrorTheme } from '@/lib/codemirror/flexokiTheme';
-import { generateSyntaxTheme } from '@/lib/theme/syntaxThemeGenerator';
+import { File as PierreFile } from '@pierre/diffs/react';
 import {
   Dialog,
   DialogContent,
@@ -56,23 +55,25 @@ import {
 import { useDebouncedValue } from '@/hooks/useDebouncedValue';
 import { useFileSearchStore } from '@/stores/useFileSearchStore';
 import { useDeviceInfo } from '@/lib/device';
-import { writeTextToClipboard } from '@/lib/desktop';
 import { cn, getModifierLabel, hasModifier } from '@/lib/utils';
 import { getLanguageFromExtension, getImageMimeType, isImageFile } from '@/lib/toolHelpers';
 import { useRuntimeAPIs } from '@/hooks/useRuntimeAPIs';
 import { EditorView } from '@codemirror/view';
+import type { Extension } from '@codemirror/state';
+import { convertFileSrc } from '@tauri-apps/api/core';
 import { useThemeSystem } from '@/contexts/useThemeSystem';
-import { useSessionStore } from '@/stores/useSessionStore';
 import { useUIStore } from '@/stores/useUIStore';
 import { useFilesViewTabsStore } from '@/stores/useFilesViewTabsStore';
 import { useGitStatus } from '@/stores/useGitStore';
-import { useInlineCommentDraftStore } from '@/stores/useInlineCommentDraftStore';
-import { InlineCommentCard, InlineCommentInput } from '@/components/comments';
+import { buildCodeMirrorCommentWidgets, normalizeLineRange, useInlineCommentController } from '@/components/comments';
 import { opencodeClient } from '@/lib/opencode/client';
 import { useDirectoryShowHidden } from '@/lib/directoryShowHidden';
 import { useFilesViewShowGitignored } from '@/lib/filesViewShowGitignored';
 import { ErrorBoundary } from '@/components/ui/ErrorBoundary';
 import { useEffectiveDirectory } from '@/hooks/useEffectiveDirectory';
+import { FileTypeIcon } from '@/components/icons/FileTypeIcon';
+import { ensurePierreThemeRegistered } from '@/lib/shiki/appThemeRegistry';
+import { getDefaultTheme } from '@/lib/theme/themes';
 
 type FileNode = {
   name: string;
@@ -155,50 +156,18 @@ const getAncestorPaths = (filePath: string, root: string): string[] => {
   return ancestors;
 };
 
-type BreadcrumbSegment = { label: string; path: string };
-
-const parseBreadcrumbs = (relativePath: string, root: string): BreadcrumbSegment[] => {
-  const parts = relativePath.split('/');
-  const segments: BreadcrumbSegment[] = [];
-  let currentPath = root;
-
-  for (const part of parts) {
-    if (!part) continue;
-    currentPath = currentPath ? `${currentPath}/${part}` : part;
-    segments.push({ label: part, path: currentPath });
+const getDisplayPath = (root: string | null, path: string): string => {
+  if (!path) {
+    return '';
   }
-  return segments;
-};
 
-const FileBreadcrumbs: React.FC<{
-  path: string;
-  root: string;
-  onNavigate: (dirPath: string) => void;
-}> = ({ path, root, onNavigate }) => {
-  const segments = React.useMemo(() => parseBreadcrumbs(path, root), [path, root]);
-  
-  return (
-    <div className="flex items-center gap-1 overflow-x-auto whitespace-nowrap min-w-0 flex-1 hide-scrollbar">
-      {segments.map((seg, i) => (
-        <React.Fragment key={seg.path}>
-          {i > 0 && <RiArrowRightSLine className="h-3 w-3 flex-shrink-0 text-muted-foreground" />}
-          <button
-            type="button"
-            onClick={() => i < segments.length - 1 && onNavigate(seg.path)}
-            className={cn(
-              "typography-meta transition-colors",
-              i === segments.length - 1 
-                ? "text-foreground font-medium cursor-default" 
-                : "text-muted-foreground hover:text-foreground hover:underline cursor-pointer"
-            )}
-            disabled={i === segments.length - 1}
-          >
-            {seg.label}
-          </button>
-        </React.Fragment>
-      ))}
-    </div>
-  );
+  const normalizedFilePath = normalizePath(path);
+  if (!root || !isPathWithinRoot(normalizedFilePath, root)) {
+    return normalizedFilePath;
+  }
+
+  const relative = normalizedFilePath.slice(root.length);
+  return relative.startsWith('/') ? relative.slice(1) : relative;
 };
 
 const DEFAULT_IGNORED_DIR_NAMES = new Set(['node_modules']);
@@ -232,138 +201,8 @@ const isDirectoryReadError = (error: unknown): boolean => {
 
 const MAX_VIEW_CHARS = 200_000;
 
-const CODE_EXTENSIONS = new Set([
-  // JavaScript/TypeScript
-  'js', 'jsx', 'ts', 'tsx', 'mjs', 'cjs', 'mts', 'cts',
-  // Web
-  'html', 'htm', 'xhtml', 'css', 'scss', 'sass', 'less', 'styl', 'stylus',
-  'vue', 'svelte', 'astro',
-  // Shell/Scripts
-  'sh', 'bash', 'zsh', 'fish', 'ps1', 'psm1', 'bat', 'cmd',
-  // Python
-  'py', 'pyw', 'pyx', 'pxd', 'pxi',
-  // Ruby
-  'rb', 'erb', 'rake', 'gemspec',
-  // PHP
-  'php', 'phtml', 'php3', 'php4', 'php5', 'phps',
-  // Java/JVM
-  'java', 'kt', 'kts', 'scala', 'sc', 'groovy', 'gradle',
-  // C/C++/Objective-C
-  'c', 'h', 'cpp', 'cc', 'cxx', 'hpp', 'hxx', 'hh', 'm', 'mm',
-  // C#/F#/.NET
-  'cs', 'fs', 'fsx', 'fsi',
-  // Go
-  'go',
-  // Rust
-  'rs',
-  // Swift
-  'swift',
-  // Dart
-  'dart',
-  // Lua
-  'lua',
-  // Perl
-  'pl', 'pm', 'pod',
-  // R
-  'r', 'R', 'rmd',
-  // Julia
-  'jl',
-  // Haskell
-  'hs', 'lhs',
-  // Elixir/Erlang
-  'ex', 'exs', 'erl', 'hrl',
-  // Clojure
-  'clj', 'cljs', 'cljc', 'edn',
-  // Lisp/Scheme
-  'lisp', 'cl', 'el', 'scm', 'ss', 'rkt',
-  // OCaml/ReasonML
-  'ml', 'mli', 're', 'rei',
-  // Nim
-  'nim',
-  // Zig
-  'zig',
-  // V
-  'v',
-  // Crystal
-  'cr',
-  // Kotlin Script
-  'main.kts',
-  // SQL
-  'sql', 'psql', 'plsql',
-  // GraphQL
-  'graphql', 'gql',
-  // Solidity
-  'sol',
-  // Assembly
-  'asm', 's', 'S',
-  // Makefile variants
-  'mk',
-  // Nix
-  'nix',
-  // Terraform
-  'tf', 'tfvars',
-  // Puppet
-  'pp',
-  // Ansible
-  'ansible',
-]);
-
-const DATA_EXTENSIONS = new Set([
-  // JSON variants
-  'json', 'jsonc', 'json5', 'jsonl', 'ndjson', 'geojson',
-  // YAML
-  'yaml', 'yml',
-  // TOML
-  'toml',
-  // XML variants
-  'xml', 'xsl', 'xslt', 'xsd', 'dtd', 'plist',
-  // Config files
-  'ini', 'cfg', 'conf', 'config', 'env', 'properties',
-  // CSV/TSV
-  'csv', 'tsv',
-  // Lock files
-  'lock',
-]);
-
-const IMAGE_EXTENSIONS = new Set([
-  'png', 'jpg', 'jpeg', 'gif', 'svg', 'webp', 'ico', 'icns',
-  'bmp', 'tiff', 'tif', 'psd', 'ai', 'eps', 'raw', 'cr2', 'nef',
-  'heic', 'heif', 'avif', 'jxl',
-]);
-
-const DOCUMENT_EXTENSIONS = new Set([
-  // Markdown
-  'md', 'mdx', 'markdown', 'mdown', 'mkd',
-  // Text
-  'txt', 'text', 'rtf',
-  // Docs
-  'doc', 'docx', 'odt', 'pdf',
-  // ReStructuredText
-  'rst',
-  // AsciiDoc
-  'adoc', 'asciidoc',
-  // Org
-  'org',
-  // LaTeX
-  'tex', 'latex', 'bib',
-]);
-
-const getFileIcon = (extension?: string): React.ReactNode => {
-  const ext = extension?.toLowerCase();
-
-  if (ext && CODE_EXTENSIONS.has(ext)) {
-    return <RiCodeLine className="h-4 w-4 flex-shrink-0 text-[var(--status-info)]" />;
-  }
-  if (ext && DATA_EXTENSIONS.has(ext)) {
-    return <RiCodeLine className="h-4 w-4 flex-shrink-0 text-[var(--status-warning)]" />;
-  }
-  if (ext && IMAGE_EXTENSIONS.has(ext)) {
-    return <RiFileImageLine className="h-4 w-4 flex-shrink-0 text-[var(--status-success)]" />;
-  }
-  if (ext && DOCUMENT_EXTENSIONS.has(ext)) {
-    return <RiFileTextLine className="h-4 w-4 flex-shrink-0 text-muted-foreground" />;
-  }
-  return <RiFileTextLine className="h-4 w-4 flex-shrink-0 text-muted-foreground" />;
+const getFileIcon = (filePath: string, extension?: string): React.ReactNode => {
+  return <FileTypeIcon filePath={filePath} extension={extension} />;
 };
 
 const isMarkdownFile = (path: string): boolean => {
@@ -376,7 +215,6 @@ interface FileRowProps {
   node: FileNode;
   isExpanded: boolean;
   isActive: boolean;
-  isLoading: boolean;
   isMobile: boolean;
   status?: FileStatus | null;
   badge?: { modified: number; added: number } | null;
@@ -385,11 +223,13 @@ interface FileRowProps {
     canCreateFile: boolean;
     canCreateFolder: boolean;
     canDelete: boolean;
+    canReveal: boolean;
   };
   contextMenuPath: string | null;
   setContextMenuPath: (path: string | null) => void;
   onSelect: (node: FileNode) => void;
   onToggle: (path: string) => void;
+  onRevealPath: (path: string) => void;
   onOpenDialog: (type: 'createFile' | 'createFolder' | 'rename' | 'delete', data: { path: string; name?: string; type?: 'file' | 'directory' }) => void;
 }
 
@@ -397,7 +237,6 @@ const FileRow: React.FC<FileRowProps> = ({
   node,
   isExpanded,
   isActive,
-  isLoading,
   isMobile,
   status,
   badge,
@@ -406,18 +245,19 @@ const FileRow: React.FC<FileRowProps> = ({
   setContextMenuPath,
   onSelect,
   onToggle,
+  onRevealPath,
   onOpenDialog,
 }) => {
   const isDir = node.type === 'directory';
-  const { canRename, canCreateFile, canCreateFolder, canDelete } = permissions;
+  const { canRename, canCreateFile, canCreateFolder, canDelete, canReveal } = permissions;
 
   const handleContextMenu = React.useCallback((event?: React.MouseEvent) => {
-    if (!canRename && !canCreateFile && !canCreateFolder && !canDelete) {
+    if (!canRename && !canCreateFile && !canCreateFolder && !canDelete && !canReveal) {
       return;
     }
     event?.preventDefault();
     setContextMenuPath(node.path);
-  }, [canRename, canCreateFile, canCreateFolder, canDelete, node.path, setContextMenuPath]);
+  }, [canRename, canCreateFile, canCreateFolder, canDelete, canReveal, node.path, setContextMenuPath]);
 
   const handleInteraction = React.useCallback(() => {
     if (isDir) {
@@ -447,15 +287,13 @@ const FileRow: React.FC<FileRowProps> = ({
         )}
       >
         {isDir ? (
-          isLoading ? (
-            <RiLoader4Line className="h-4 w-4 flex-shrink-0 animate-spin" />
-          ) : isExpanded ? (
+          isExpanded ? (
             <RiFolderOpenFill className="h-4 w-4 flex-shrink-0 text-primary/60" />
           ) : (
             <RiFolder3Fill className="h-4 w-4 flex-shrink-0 text-primary/60" />
           )
         ) : (
-          getFileIcon(node.extension)
+          getFileIcon(node.path, node.extension)
         )}
         <span
           className="min-w-0 flex-1 truncate typography-meta"
@@ -471,7 +309,7 @@ const FileRow: React.FC<FileRowProps> = ({
           </span>
         )}
       </button>
-      {(canRename || canCreateFile || canCreateFolder || canDelete) && (
+      {(canRename || canCreateFile || canCreateFolder || canDelete || canReveal) && (
         <div className={cn(
           "absolute right-1 top-1/2 -translate-y-1/2",
           !isMobile && "opacity-0 focus-within:opacity-100 group-hover:opacity-100",
@@ -499,16 +337,21 @@ const FileRow: React.FC<FileRowProps> = ({
               )}
               <DropdownMenuItem onClick={(e) => {
                 e.stopPropagation();
-                void writeTextToClipboard(node.path).then((copied) => {
-                  if (copied) {
+                void copyTextToClipboard(node.path).then((result) => {
+                  if (result.ok) {
                     toast.success('Path copied');
-                  } else {
-                    toast.error('Copy failed');
+                    return;
                   }
+                  toast.error('Copy failed');
                 });
               }}>
                 <RiFileCopyLine className="mr-2 h-4 w-4" /> Copy Path
               </DropdownMenuItem>
+              {canReveal && (
+                <DropdownMenuItem onClick={(e) => { e.stopPropagation(); onRevealPath(node.path); }}>
+                  <RiFolderReceivedLine className="mr-2 h-4 w-4" /> Reveal in Finder
+                </DropdownMenuItem>
+              )}
               {isDir && (canCreateFile || canCreateFolder) && (
                 <>
                   <DropdownMenuSeparator />
@@ -543,10 +386,13 @@ const FileRow: React.FC<FileRowProps> = ({
   );
 };
 
-export const FilesView: React.FC = () => {
+interface FilesViewProps {
+  mode?: 'full' | 'editor-only';
+}
+
+export const FilesView: React.FC<FilesViewProps> = ({ mode = 'full' }) => {
   const { files, runtime } = useRuntimeAPIs();
-  const { currentTheme } = useThemeSystem();
-  React.useMemo(() => generateSyntaxTheme(currentTheme), [currentTheme]);
+  const { currentTheme, availableThemes, lightThemeId, darkThemeId } = useThemeSystem();
   const { isMobile, screenWidth } = useDeviceInfo();
   const showHidden = useDirectoryShowHidden();
   const showGitignored = useFilesViewShowGitignored();
@@ -564,6 +410,21 @@ export const FilesView: React.FC = () => {
   const [wrapLines, setWrapLines] = React.useState(isMobile);
   const [isFullscreen, setIsFullscreen] = React.useState(false);
   const [isSearchOpen, setIsSearchOpen] = React.useState(false);
+  const [textViewMode, setTextViewMode] = React.useState<'view' | 'edit'>('view');
+
+  const lightTheme = React.useMemo(
+    () => availableThemes.find((theme) => theme.metadata.id === lightThemeId) ?? getDefaultTheme(false),
+    [availableThemes, lightThemeId],
+  );
+  const darkTheme = React.useMemo(
+    () => availableThemes.find((theme) => theme.metadata.id === darkThemeId) ?? getDefaultTheme(true),
+    [availableThemes, darkThemeId],
+  );
+
+  React.useEffect(() => {
+    ensurePierreThemeRegistered(lightTheme);
+    ensurePierreThemeRegistered(darkTheme);
+  }, [lightTheme, darkTheme]);
 
   const EMPTY_PATHS: string[] = React.useMemo(() => [], []);
   const openPaths = useFilesViewTabsStore((state) => (root ? (state.byRoot[root]?.openPaths ?? EMPTY_PATHS) : EMPTY_PATHS));
@@ -593,6 +454,30 @@ export const FilesView: React.FC = () => {
   const effectiveSelectedPath = React.useMemo(() => selectedPath ?? openPaths[0] ?? null, [openPaths, selectedPath]);
   const selectedFile = React.useMemo(() => (effectiveSelectedPath ? toFileNode(effectiveSelectedPath) : null), [effectiveSelectedPath, toFileNode]);
 
+  // Editor tabs horizontal scroll fades
+  const editorTabsScrollRef = React.useRef<HTMLDivElement>(null);
+  const [editorTabsOverflow, setEditorTabsOverflow] = React.useState<{ left: boolean; right: boolean }>({ left: false, right: false });
+  const updateEditorTabsOverflow = React.useCallback(() => {
+    const el = editorTabsScrollRef.current;
+    if (!el) return;
+    setEditorTabsOverflow({
+      left: el.scrollLeft > 2,
+      right: el.scrollLeft + el.clientWidth < el.scrollWidth - 2,
+    });
+  }, []);
+  React.useEffect(() => {
+    const el = editorTabsScrollRef.current;
+    if (!el) return;
+    updateEditorTabsOverflow();
+    el.addEventListener('scroll', updateEditorTabsOverflow, { passive: true });
+    const ro = new ResizeObserver(updateEditorTabsOverflow);
+    ro.observe(el);
+    return () => {
+      el.removeEventListener('scroll', updateEditorTabsOverflow);
+      ro.disconnect();
+    };
+  }, [updateEditorTabsOverflow, openFiles.length]);
+
   const [childrenByDir, setChildrenByDir] = React.useState<Record<string, FileNode[]>>({});
   const loadedDirsRef = React.useRef<Set<string>>(new Set());
   const inFlightDirsRef = React.useRef<Set<string>>(new Set());
@@ -618,6 +503,7 @@ export const FilesView: React.FC = () => {
   const copiedContentTimeoutRef = React.useRef<number | null>(null);
   const copiedPathTimeoutRef = React.useRef<number | null>(null);
   const editorViewRef = React.useRef<EditorView | null>(null);
+  const editorWrapperRef = React.useRef<HTMLDivElement | null>(null);
 
   const [activeDialog, setActiveDialog] = React.useState<'createFile' | 'createFolder' | 'rename' | 'delete' | null>(null);
   const [dialogData, setDialogData] = React.useState<{ path: string; name?: string; type?: 'file' | 'directory' } | null>(null);
@@ -634,6 +520,14 @@ export const FilesView: React.FC = () => {
   const canCreateFolder = Boolean(files.createDirectory);
   const canRename = Boolean(files.rename);
   const canDelete = Boolean(files.delete);
+  const canReveal = Boolean(files.revealPath);
+
+  const handleRevealPath = React.useCallback((targetPath: string) => {
+    if (!files.revealPath) return;
+    void files.revealPath(targetPath).catch(() => {
+      toast.error('Failed to reveal path');
+    });
+  }, [files]);
 
   const handleOpenDialog = React.useCallback((type: 'createFile' | 'createFolder' | 'rename' | 'delete', data: { path: string; name?: string; type?: 'file' | 'directory' }) => {
     setActiveDialog(type);
@@ -649,14 +543,7 @@ export const FilesView: React.FC = () => {
   const [isDragging, setIsDragging] = React.useState(false);
 
   // Session/config for sending comments
-  const currentSessionId = useSessionStore((state) => state.currentSessionId);
   const setMainTabGuard = useUIStore((state) => state.setMainTabGuard);
-
-  const addDraft = useInlineCommentDraftStore((s) => s.addDraft);
-  const updateDraft = useInlineCommentDraftStore((s) => s.updateDraft);
-  const removeDraft = useInlineCommentDraftStore((s) => s.removeDraft);
-  const allDrafts = useInlineCommentDraftStore((s) => s.drafts);
-  const [editingDraftId, setEditingDraftId] = React.useState<string | null>(null);
 
   // Global mouseup to end drag selection
   React.useEffect(() => {
@@ -669,14 +556,6 @@ export const FilesView: React.FC = () => {
     return () => document.removeEventListener('mouseup', handleGlobalMouseUp);
   }, []);
 
-  // Clear selection when file changes
-  React.useEffect(() => {
-    setLineSelection(null);
-    setMainTabGuard(null);
-    setDraftContent('');
-    setIsSaving(false);
-  }, [selectedFile?.path, setMainTabGuard]);
-
   React.useEffect(() => {
     return () => {
       if (copiedContentTimeoutRef.current !== null) {
@@ -688,25 +567,60 @@ export const FilesView: React.FC = () => {
     };
   }, []);
 
-  // Click outside to dismiss selection
+  // Extract selected code
+  const extractSelectedCode = React.useCallback((content: string, range: SelectedLineRange): string => {
+    const lines = content.split('\n');
+    const startLine = Math.max(1, range.start);
+    const endLine = Math.min(lines.length, range.end);
+    if (startLine > endLine) return '';
+    return lines.slice(startLine - 1, endLine).join('\n');
+  }, []);
+
+  const fileCommentController = useInlineCommentController<SelectedLineRange>({
+    source: 'file',
+    fileLabel: selectedFile?.path ?? null,
+    language: selectedFile?.path ? getLanguageFromExtension(selectedFile.path) || 'text' : 'text',
+    getCodeForRange: (range) => extractSelectedCode(fileContent, normalizeLineRange(range)),
+    toStoreRange: (range) => ({ startLine: range.start, endLine: range.end }),
+    fromDraftRange: (draft) => ({ start: draft.startLine, end: draft.endLine }),
+  });
+
+  const {
+    drafts: filesFileDrafts,
+    commentText,
+    editingDraftId,
+    setSelection: setCommentSelection,
+    saveComment,
+    cancel,
+    reset,
+    startEdit,
+    deleteDraft,
+  } = fileCommentController;
+
+  React.useEffect(() => {
+    setLineSelection(null);
+    reset();
+    setMainTabGuard(null);
+    setDraftContent('');
+    setIsSaving(false);
+  }, [selectedFile?.path, reset, setMainTabGuard]);
+
+  React.useEffect(() => {
+    setCommentSelection(lineSelection);
+  }, [lineSelection, setCommentSelection]);
+
   React.useEffect(() => {
     if (!lineSelection && !editingDraftId) return;
 
     const handleClickOutside = (e: MouseEvent) => {
       const target = e.target as HTMLElement;
 
-      // Check if click is inside comment UI
       if (target.closest('[data-comment-input="true"]') || target.closest('[data-comment-card="true"]')) return;
-
-      // Check if click is on CM gutter (only gutter should not dismiss)
       if (target.closest('.cm-gutterElement')) return;
-
-      // Check if click is inside toast (sonner)
       if (target.closest('[data-sonner-toast]') || target.closest('[data-sonner-toaster]')) return;
 
-      // Clicking anywhere else (including code content) dismisses selection
       setLineSelection(null);
-      setEditingDraftId(null);
+      cancel();
     };
 
     const timeoutId = setTimeout(() => {
@@ -717,49 +631,16 @@ export const FilesView: React.FC = () => {
       clearTimeout(timeoutId);
       document.removeEventListener('click', handleClickOutside);
     };
-  }, [lineSelection, editingDraftId]);
-
-  // Extract selected code
-  const extractSelectedCode = React.useCallback((content: string, range: SelectedLineRange): string => {
-    const lines = content.split('\n');
-    const startLine = Math.max(1, range.start);
-    const endLine = Math.min(lines.length, range.end);
-    if (startLine > endLine) return '';
-    return lines.slice(startLine - 1, endLine).join('\n');
-  }, []);
+  }, [cancel, editingDraftId, lineSelection]);
 
   const handleSaveComment = React.useCallback((text: string, range?: { start: number; end: number }) => {
-    if (!selectedFile) return;
-
-    const sessionKey = currentSessionId ?? 'draft';
-    const finalRange = range || lineSelection;
-    if (!finalRange) return;
-
-    const code = extractSelectedCode(fileContent, { start: finalRange.start, end: finalRange.end });
-
-    if (editingDraftId) {
-      updateDraft(sessionKey, editingDraftId, {
-        text: text.trim(),
-        code,
-        startLine: finalRange.start,
-        endLine: finalRange.end,
-      });
-    } else {
-      addDraft({
-        sessionKey,
-        source: 'file',
-        fileLabel: selectedFile.path,
-        startLine: finalRange.start,
-        endLine: finalRange.end,
-        code,
-        language: getLanguageFromExtension(selectedFile.path) || 'text',
-        text: text.trim(),
-      });
+    const finalRange = range ?? lineSelection ?? undefined;
+    if (range) {
+      setLineSelection(range);
     }
-
+    saveComment(text, finalRange);
     setLineSelection(null);
-    setEditingDraftId(null);
-  }, [selectedFile, currentSessionId, lineSelection, fileContent, extractSelectedCode, editingDraftId, updateDraft, addDraft]);
+  }, [lineSelection, saveComment]);
 
   const mapDirectoryEntries = React.useCallback((dirPath: string, entries: Array<{ name: string; path: string; isDirectory: boolean }>): FileNode[] => {
     const nodes = entries
@@ -800,39 +681,37 @@ export const FilesView: React.FC = () => {
     inFlightDirsRef.current = new Set(inFlightDirsRef.current);
     inFlightDirsRef.current.add(normalizedDir);
 
-    try {
-      const respectGitignore = !showGitignored;
-      let entries: Array<{ name: string; path: string; isDirectory: boolean }>;
-      if (runtime.isDesktop) {
-        const result = await files.listDirectory(normalizedDir, { respectGitignore });
-        entries = result.entries.map((entry) => ({
-          name: entry.name,
-          path: entry.path,
-          isDirectory: entry.isDirectory,
-        }));
-      } else {
-        const result = await opencodeClient.listLocalDirectory(normalizedDir, { respectGitignore });
-        entries = result.map((entry) => ({
-          name: entry.name,
-          path: entry.path,
-          isDirectory: entry.isDirectory,
-        }));
-      }
-      
-      const mapped = mapDirectoryEntries(normalizedDir, entries);
+    const respectGitignore = !showGitignored;
+    const listPromise = runtime.isDesktop
+      ? files.listDirectory(normalizedDir, { respectGitignore }).then((result) => result.entries.map((entry) => ({
+        name: entry.name,
+        path: entry.path,
+        isDirectory: entry.isDirectory,
+      })))
+      : opencodeClient.listLocalDirectory(normalizedDir, { respectGitignore }).then((result) => result.map((entry) => ({
+        name: entry.name,
+        path: entry.path,
+        isDirectory: entry.isDirectory,
+      })));
 
-      loadedDirsRef.current = new Set(loadedDirsRef.current);
-      loadedDirsRef.current.add(normalizedDir);
-      setChildrenByDir((prev) => ({ ...prev, [normalizedDir]: mapped }));
-    } catch {
-      setChildrenByDir((prev) => ({
-        ...prev,
-        [normalizedDir]: prev[normalizedDir] ?? [],
-      }));
-    } finally {
-      inFlightDirsRef.current = new Set(inFlightDirsRef.current);
-      inFlightDirsRef.current.delete(normalizedDir);
-    }
+    await listPromise
+      .then((entries) => {
+        const mapped = mapDirectoryEntries(normalizedDir, entries);
+
+        loadedDirsRef.current = new Set(loadedDirsRef.current);
+        loadedDirsRef.current.add(normalizedDir);
+        setChildrenByDir((prev) => ({ ...prev, [normalizedDir]: mapped }));
+      })
+      .catch(() => {
+        setChildrenByDir((prev) => ({
+          ...prev,
+          [normalizedDir]: prev[normalizedDir] ?? [],
+        }));
+      })
+      .finally(() => {
+        inFlightDirsRef.current = new Set(inFlightDirsRef.current);
+        inFlightDirsRef.current.delete(normalizedDir);
+      });
   }, [files, mapDirectoryEntries, runtime.isDesktop, showGitignored]);
 
   const refreshRoot = React.useCallback(async () => {
@@ -887,11 +766,10 @@ export const FilesView: React.FC = () => {
   React.useEffect(() => {
     try {
       const stored = localStorage.getItem(MD_VIEWER_MODE_KEY);
-      if (stored) {
-        const parsed = JSON.parse(stored);
-        if (parsed === 'preview' || parsed === 'edit') {
-          setMdViewMode(parsed);
-        }
+      if (stored === 'preview') {
+        setMdViewMode('preview');
+      } else if (stored === 'edit') {
+        setMdViewMode('edit');
       }
     } catch {
       // Ignore localStorage errors
@@ -899,14 +777,14 @@ export const FilesView: React.FC = () => {
   }, []);
 
   // Save markdown view mode preference to localStorage
-  const saveMdViewMode = React.useCallback((mode: 'preview' | 'edit') => {
-    setMdViewMode(mode);
-    try {
-      localStorage.setItem(MD_VIEWER_MODE_KEY, JSON.stringify(mode));
-    } catch {
-      // Ignore localStorage errors
-    }
-  }, []);
+const saveMdViewMode = React.useCallback((mode: 'preview' | 'edit') => {
+  setMdViewMode(mode);
+  try {
+    localStorage.setItem(MD_VIEWER_MODE_KEY, mode);
+  } catch {
+    // Ignore localStorage errors
+  }
+}, []);
 
   // Get the view mode for a markdown file (from state, default to 'edit')
   const getMdViewMode = React.useCallback((): 'preview' | 'edit' => {
@@ -918,94 +796,151 @@ export const FilesView: React.FC = () => {
     if (!dialogData || !activeDialog) return;
 
     setIsDialogSubmitting(true);
-    try {
-      if (activeDialog === 'createFile') {
-        if (!dialogInputValue.trim()) throw new Error('Filename is required');
-        const parentPath = dialogData.path;
-        // Handle root path or empty path
-        const prefix = parentPath ? `${parentPath}/` : '';
-        const newPath = normalizePath(`${prefix}${dialogInputValue.trim()}`);
-
-        if (!files.writeFile) throw new Error('Write not supported');
-        const result = await files.writeFile(newPath, '');
-        if (result.success) {
-          toast.success('File created');
-          await refreshRoot();
-        }
-      } else if (activeDialog === 'createFolder') {
-        if (!dialogInputValue.trim()) throw new Error('Folder name is required');
-        const parentPath = dialogData.path;
-        const prefix = parentPath ? `${parentPath}/` : '';
-        const newPath = normalizePath(`${prefix}${dialogInputValue.trim()}`);
-
-        const result = await files.createDirectory(newPath);
-        if (result.success) {
-          toast.success('Folder created');
-          await refreshRoot();
-        }
-      } else if (activeDialog === 'rename') {
-        if (!dialogInputValue.trim()) throw new Error('Name is required');
-        const oldPath = dialogData.path;
-        const parentDir = oldPath.split('/').slice(0, -1).join('/');
-        const prefix = parentDir ? `${parentDir}/` : '';
-        const newPath = normalizePath(`${prefix}${dialogInputValue.trim()}`);
-
-        if (files.rename) {
-             const result = await files.rename(oldPath, newPath);
-             if (result.success) {
-                 toast.success('Renamed successfully');
-                 await refreshRoot();
-                 if (root) {
-                   removeOpenPathsByPrefix(root, oldPath);
-                 }
-                 if (selectedFile?.path === oldPath || selectedFile?.path.startsWith(`${oldPath}/`)) {
-                     if (root) {
-                       setSelectedPath(root, null);
-                     }
-                     setFileContent('');
-                     setFileError(null);
-                     setDesktopImageSrc('');
-                     setLoadedFilePath(null);
-                     if (isMobile) {
-                       setShowMobilePageContent(false);
-                     }
-                 }
-             }
-        } else {
-            toast.error("Rename not supported");
-        }
-      } else if (activeDialog === 'delete') {
-        if (files.delete) {
-             const result = await files.delete(dialogData.path);
-             if (result.success) {
-                 toast.success('Deleted successfully');
-                 await refreshRoot();
-                 if (root) {
-                   removeOpenPathsByPrefix(root, dialogData.path);
-                 }
-                 if (selectedFile?.path === dialogData.path || selectedFile?.path.startsWith(dialogData.path + '/')) {
-                     if (root) {
-                       setSelectedPath(root, null);
-                     }
-                     setFileContent('');
-                     setFileError(null);
-                     setDesktopImageSrc('');
-                     setLoadedFilePath(null);
-                     if (isMobile) {
-                       setShowMobilePageContent(false);
-                     }
-                 }
-             }
-        } else {
-             toast.error("Delete not supported");
-        }
-      }
+    const finishDialogOperation = () => {
       setActiveDialog(null);
-    } catch (error) {
-      toast.error(error instanceof Error ? error.message : 'Operation failed');
-    } finally {
+    };
+
+    const failDialogOperation = (message: string) => {
+      toast.error(message);
+    };
+
+    const done = () => {
       setIsDialogSubmitting(false);
+    };
+
+    if (activeDialog === 'createFile') {
+      if (!dialogInputValue.trim()) {
+        failDialogOperation('Filename is required');
+        done();
+        return;
+      }
+      if (!files.writeFile) {
+        failDialogOperation('Write not supported');
+        done();
+        return;
+      }
+
+      const parentPath = dialogData.path;
+      const prefix = parentPath ? `${parentPath}/` : '';
+      const newPath = normalizePath(`${prefix}${dialogInputValue.trim()}`);
+      await files.writeFile(newPath, '')
+        .then(async (result) => {
+          if (result.success) {
+            toast.success('File created');
+            await refreshRoot();
+          }
+          finishDialogOperation();
+        })
+        .catch(() => failDialogOperation('Operation failed'))
+        .finally(done);
+      return;
     }
+
+    if (activeDialog === 'createFolder') {
+      if (!dialogInputValue.trim()) {
+        failDialogOperation('Folder name is required');
+        done();
+        return;
+      }
+
+      const parentPath = dialogData.path;
+      const prefix = parentPath ? `${parentPath}/` : '';
+      const newPath = normalizePath(`${prefix}${dialogInputValue.trim()}`);
+      await files.createDirectory(newPath)
+        .then(async (result) => {
+          if (result.success) {
+            toast.success('Folder created');
+            await refreshRoot();
+          }
+          finishDialogOperation();
+        })
+        .catch(() => failDialogOperation('Operation failed'))
+        .finally(done);
+      return;
+    }
+
+    if (activeDialog === 'rename') {
+      if (!dialogInputValue.trim()) {
+        failDialogOperation('Name is required');
+        done();
+        return;
+      }
+
+      if (!files.rename) {
+        failDialogOperation('Rename not supported');
+        done();
+        return;
+      }
+
+      const oldPath = dialogData.path;
+      const parentDir = oldPath.split('/').slice(0, -1).join('/');
+      const prefix = parentDir ? `${parentDir}/` : '';
+      const newPath = normalizePath(`${prefix}${dialogInputValue.trim()}`);
+
+      await files.rename(oldPath, newPath)
+        .then(async (result) => {
+          if (result.success) {
+            toast.success('Renamed successfully');
+            await refreshRoot();
+            if (root) {
+              removeOpenPathsByPrefix(root, oldPath);
+            }
+            if (selectedFile?.path === oldPath || selectedFile?.path.startsWith(`${oldPath}/`)) {
+              if (root) {
+                setSelectedPath(root, null);
+              }
+              setFileContent('');
+              setFileError(null);
+              setDesktopImageSrc('');
+              setLoadedFilePath(null);
+              if (isMobile) {
+                setShowMobilePageContent(false);
+              }
+            }
+          }
+          finishDialogOperation();
+        })
+        .catch(() => failDialogOperation('Operation failed'))
+        .finally(done);
+      return;
+    }
+
+    if (activeDialog === 'delete') {
+      if (!files.delete) {
+        failDialogOperation('Delete not supported');
+        done();
+        return;
+      }
+
+      await files.delete(dialogData.path)
+        .then(async (result) => {
+          if (result.success) {
+            toast.success('Deleted successfully');
+            await refreshRoot();
+            if (root) {
+              removeOpenPathsByPrefix(root, dialogData.path);
+            }
+            if (selectedFile?.path === dialogData.path || selectedFile?.path.startsWith(`${dialogData.path}/`)) {
+              if (root) {
+                setSelectedPath(root, null);
+              }
+              setFileContent('');
+              setFileError(null);
+              setDesktopImageSrc('');
+              setLoadedFilePath(null);
+              if (isMobile) {
+                setShowMobilePageContent(false);
+              }
+            }
+          }
+          finishDialogOperation();
+        })
+        .catch(() => failDialogOperation('Operation failed'))
+        .finally(done);
+      return;
+    }
+
+    done();
   }, [activeDialog, dialogData, dialogInputValue, files, refreshRoot, isMobile, removeOpenPathsByPrefix, root, selectedFile?.path, setSelectedPath]);
 
   const fuzzyScore = React.useCallback((query: string, candidate: string): number | null => {
@@ -1162,17 +1097,20 @@ export const FilesView: React.FC = () => {
 
     setIsSaving(true);
 
-    try {
-      const result = await files.writeFile(selectedFile.path, draftContent);
-      if (!result?.success) {
-        throw new Error('Failed to write file');
-      }
-      setFileContent(draftContent);
-    } catch (error) {
-      toast.error(error instanceof Error ? error.message : 'Save failed');
-    } finally {
-      setIsSaving(false);
-    }
+    await files.writeFile(selectedFile.path, draftContent)
+      .then((result) => {
+        if (!result?.success) {
+          toast.error('Failed to write file');
+          return;
+        }
+        setFileContent(draftContent);
+      })
+      .catch((error) => {
+        toast.error(error instanceof Error ? error.message : 'Save failed');
+      })
+      .finally(() => {
+        setIsSaving(false);
+      });
   }, [draftContent, files, isDirty, selectedFile]);
 
   React.useEffect(() => {
@@ -1252,47 +1190,49 @@ export const FilesView: React.FC = () => {
 
     setFileLoading(true);
 
-    try {
-      const content = await readFile(node.path);
-      setFileContent(content);
-      setDraftContent(content.length > MAX_VIEW_CHARS
-        ? `${content.slice(0, MAX_VIEW_CHARS)}\n\n… truncated …`
-        : content);
-    } catch (error) {
-      if (isDirectoryReadError(error)) {
-        if (root) {
-          setSelectedPath(root, null);
-        }
-        setFileError(null);
-        setFileContent('');
-        setDraftContent('');
-        setLoadedFilePath(null);
-        if (searchQuery.trim().length > 0) {
-          setSearchQuery('');
-        }
-        if (isMobile) {
-          setShowMobilePageContent(false);
-        }
-        if (root) {
-          const ancestors = getAncestorPaths(node.path, root);
-          const pathsToExpand = [...ancestors, node.path];
-          if (pathsToExpand.length > 0) {
-            expandPaths(root, pathsToExpand);
+    await readFile(node.path)
+      .then((content) => {
+        setFileContent(content);
+        setDraftContent(content.length > MAX_VIEW_CHARS
+          ? `${content.slice(0, MAX_VIEW_CHARS)}\n\n… truncated …`
+          : content);
+      })
+      .catch((error) => {
+        if (isDirectoryReadError(error)) {
+          if (root) {
+            setSelectedPath(root, null);
           }
-          for (const path of pathsToExpand) {
-            if (!loadedDirsRef.current.has(path)) {
-              void loadDirectory(path);
+          setFileError(null);
+          setFileContent('');
+          setDraftContent('');
+          setLoadedFilePath(null);
+          if (searchQuery.trim().length > 0) {
+            setSearchQuery('');
+          }
+          if (isMobile) {
+            setShowMobilePageContent(false);
+          }
+          if (root) {
+            const ancestors = getAncestorPaths(node.path, root);
+            const pathsToExpand = [...ancestors, node.path];
+            if (pathsToExpand.length > 0) {
+              expandPaths(root, pathsToExpand);
+            }
+            for (const path of pathsToExpand) {
+              if (!loadedDirsRef.current.has(path)) {
+                void loadDirectory(path);
+              }
             }
           }
+          return;
         }
-        return;
-      }
-      setFileContent('');
-      setDraftContent('');
-      setFileError(error instanceof Error ? error.message : 'Failed to read file');
-    } finally {
-      setFileLoading(false);
-    }
+        setFileContent('');
+        setDraftContent('');
+        setFileError(error instanceof Error ? error.message : 'Failed to read file');
+      })
+      .finally(() => {
+        setFileLoading(false);
+      });
   }, [expandPaths, isMobile, loadDirectory, readFile, root, runtime.isDesktop, searchQuery, setSelectedPath]);
 
   const ensurePathVisible = React.useCallback(async (targetPath: string, includeTarget: boolean) => {
@@ -1548,25 +1488,13 @@ export const FilesView: React.FC = () => {
     }
   }, [loadDirectory, root, toggleExpandedPath]);
 
-  const handleBreadcrumbNavigate = React.useCallback((dirPath: string) => {
-    if (!root) return;
-    if (searchQuery.trim().length > 0) {
-      setSearchQuery('');
-    }
-    if (isMobile) {
-      setShowMobilePageContent(false);
-    }
-    void ensurePathVisible(dirPath, true);
-  }, [ensurePathVisible, isMobile, root, searchQuery]);
-
-  const renderTree = React.useCallback((dirPath: string, depth: number): React.ReactNode => {
+  function renderTree(dirPath: string, depth: number): React.ReactNode {
     const nodes = childrenByDir[dirPath] ?? [];
 
     return nodes.map((node, index) => {
       const isDir = node.type === 'directory';
       const isExpanded = isDir && expandedPaths.includes(node.path);
       const isActive = selectedFile?.path === node.path;
-      const isLoading = isDir && inFlightDirsRef.current.has(node.path);
       const isLast = index === nodes.length - 1;
 
       return (
@@ -1583,15 +1511,15 @@ export const FilesView: React.FC = () => {
             node={node}
             isExpanded={isExpanded}
             isActive={isActive}
-            isLoading={isLoading}
             isMobile={isMobile}
             status={!isDir ? getFileStatus(node.path) : undefined}
             badge={isDir ? getFolderBadge(node.path) : undefined}
-            permissions={{ canRename, canCreateFile, canCreateFolder, canDelete }}
+            permissions={{ canRename, canCreateFile, canCreateFolder, canDelete, canReveal }}
             contextMenuPath={contextMenuPath}
             setContextMenuPath={setContextMenuPath}
             onSelect={handleSelectFile}
             onToggle={toggleDirectory}
+            onRevealPath={handleRevealPath}
             onOpenDialog={handleOpenDialog}
           />
           {isDir && isExpanded && (
@@ -1602,28 +1530,58 @@ export const FilesView: React.FC = () => {
         </li>
       );
     });
-  }, [childrenByDir, expandedPaths, handleSelectFile, selectedFile?.path, toggleDirectory, handleOpenDialog, canCreateFile, canCreateFolder, canRename, canDelete, contextMenuPath, setContextMenuPath, isMobile, getFileStatus, getFolderBadge]);
+  }
 
   const isSelectedImage = Boolean(selectedFile?.path && isImageFile(selectedFile.path));
   const isSelectedSvg = Boolean(selectedFile?.path && selectedFile.path.toLowerCase().endsWith('.svg'));
-  const getDisplayPath = React.useCallback((path: string): string => {
-    if (!path) return '';
-    const normalizedFilePath = normalizePath(path);
-    if (root && isPathWithinRoot(normalizedFilePath, root)) {
-      const relative = normalizedFilePath.slice(root.length);
-      return relative.startsWith('/') ? relative.slice(1) : relative;
-    }
-    return normalizedFilePath;
-  }, [root]);
+  const selectedFilePath = selectedFile?.path ?? '';
 
   const displaySelectedPath = React.useMemo(() => {
-    if (!selectedFile?.path) return '';
-    return getDisplayPath(selectedFile.path);
-  }, [getDisplayPath, selectedFile?.path]);
+    return getDisplayPath(root, selectedFilePath);
+  }, [selectedFilePath, root]);
 
   const canCopy = Boolean(selectedFile && (!isSelectedImage || isSelectedSvg) && fileContent.length > 0);
   const canCopyPath = Boolean(selectedFile && displaySelectedPath.length > 0);
   const canEdit = Boolean(selectedFile && !isSelectedImage && files.writeFile && fileContent.length <= MAX_VIEW_CHARS);
+  const isMarkdown = Boolean(selectedFile?.path && isMarkdownFile(selectedFile.path));
+  const isTextFile = Boolean(selectedFile && !isSelectedImage);
+  const canUseShikiFileView = isTextFile && !isMarkdown;
+  const staticLanguageExtension = React.useMemo(
+    () => (selectedFilePath ? languageByExtension(selectedFilePath) : null),
+    [selectedFilePath],
+  );
+  const [dynamicLanguageExtension, setDynamicLanguageExtension] = React.useState<Extension | null>(null);
+
+  React.useEffect(() => {
+    let cancelled = false;
+    const selectedPath = selectedFile?.path;
+
+    if (!selectedPath || staticLanguageExtension) {
+      setDynamicLanguageExtension(null);
+      return;
+    }
+
+    setDynamicLanguageExtension(null);
+    void loadLanguageByExtension(selectedPath).then((extension) => {
+      if (!cancelled) {
+        setDynamicLanguageExtension(extension);
+      }
+    });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [selectedFile?.path, staticLanguageExtension]);
+
+  React.useEffect(() => {
+    if (!canEdit && textViewMode === 'edit') {
+      setTextViewMode('view');
+    }
+  }, [canEdit, textViewMode]);
+
+  React.useEffect(() => {
+    setTextViewMode('view');
+  }, [selectedFile?.path]);
 
   const nudgeEditorSelectionAboveKeyboard = React.useCallback((view: EditorView | null) => {
     if (!isMobile || !view || !view.hasFocus || typeof window === 'undefined') {
@@ -1688,7 +1646,7 @@ export const FilesView: React.FC = () => {
     }
 
     const extensions = [createFlexokiCodeMirrorTheme(currentTheme)];
-    const language = languageByExtension(selectedFile.path);
+    const language = staticLanguageExtension ?? dynamicLanguageExtension;
     if (language) {
       extensions.push(language);
     }
@@ -1710,7 +1668,12 @@ export const FilesView: React.FC = () => {
       }));
     }
     return extensions;
-  }, [currentTheme, selectedFile?.path, wrapLines, isMobile, nudgeEditorSelectionAboveKeyboard]);
+  }, [currentTheme, selectedFile?.path, staticLanguageExtension, dynamicLanguageExtension, wrapLines, isMobile, nudgeEditorSelectionAboveKeyboard]);
+
+  const pierreTheme = React.useMemo(
+    () => ({ light: lightTheme.metadata.id, dark: darkTheme.metadata.id }),
+    [lightTheme.metadata.id, darkTheme.metadata.id],
+  );
 
   const imageSrc = selectedFile?.path && isSelectedImage
     ? (runtime.isDesktop
@@ -1736,35 +1699,27 @@ export const FilesView: React.FC = () => {
 
       setFileError(null);
 
-      try {
-        if (files.readFileBinary) {
-          const result = await files.readFileBinary(selectedFile.path);
+      const srcPromise = files.readFileBinary
+        ? files.readFileBinary(selectedFile.path).then((result) => result.dataUrl)
+        : Promise.resolve(convertFileSrc(selectedFile.path, 'asset'));
+
+      await srcPromise
+        .then((src) => {
           if (!cancelled) {
-            setDesktopImageSrc(result.dataUrl);
+            setDesktopImageSrc(src);
           }
-          return;
-        }
-
-        const core = await import('@tauri-apps/api/core');
-        const convertFileSrc = (core as { convertFileSrc?: (path: string, protocol?: string) => string }).convertFileSrc;
-        if (!convertFileSrc) {
-          return;
-        }
-
-        const src = convertFileSrc(selectedFile.path, 'asset');
-        if (!cancelled) {
-          setDesktopImageSrc(src);
-        }
-      } catch (error) {
-        if (!cancelled) {
-          setDesktopImageSrc('');
-          setFileError(error instanceof Error ? error.message : 'Failed to read file');
-        }
-      } finally {
-        if (!cancelled) {
-          setFileLoading(false);
-        }
-      }
+        })
+        .catch((error) => {
+          if (!cancelled) {
+            setDesktopImageSrc('');
+            setFileError(error instanceof Error ? error.message : 'Failed to read file');
+          }
+        })
+        .finally(() => {
+          if (!cancelled) {
+            setFileLoading(false);
+          }
+        });
     };
 
     void resolveDesktopImage();
@@ -1804,9 +1759,9 @@ export const FilesView: React.FC = () => {
                 }
               }}
               autoFocus
-            />
-          </div>
-        )}
+              />
+            </div>
+          )}
 
         <DialogFooter>
           <Button variant="outline" onClick={() => setActiveDialog(null)} disabled={isDialogSubmitting}>
@@ -1827,70 +1782,49 @@ export const FilesView: React.FC = () => {
     );
 
   const blockWidgets = React.useMemo(() => {
-    if (!selectedFile) return [];
-
-    const sessionKey = currentSessionId ?? 'draft';
-    const sessionDrafts = allDrafts[sessionKey] ?? [];
-    // Filter drafts for current file
-    const fileDrafts = sessionDrafts.filter(
-      (d) => d.source === 'file' && d.fileLabel === selectedFile.path
-    );
-
-    const widgets: BlockWidgetDef[] = [];
-
-    // Add cards for existing drafts
-    fileDrafts.forEach((draft) => {
-      const isEditing = editingDraftId === draft.id;
-
-      if (isEditing) {
-        widgets.push({
-          afterLine: draft.endLine,
-          id: `edit-${draft.id}`,
-          content: (
-            <InlineCommentInput
-              initialText={draft.text}
-              lineRange={{ start: draft.startLine, end: draft.endLine }}
-              onSave={(text) => handleSaveComment(text, { start: draft.startLine, end: draft.endLine })}
-              onCancel={() => setEditingDraftId(null)}
-              isEditing={true}
-            />
-          ),
-        });
-      } else {
-        widgets.push({
-          afterLine: draft.endLine,
-          id: `card-${draft.id}`,
-          content: (
-            <InlineCommentCard
-              draft={draft}
-              onEdit={() => {
-                setEditingDraftId(draft.id);
-                setLineSelection(null);
-              }}
-              onDelete={() => removeDraft(sessionKey, draft.id)}
-            />
-          ),
-        });
-      }
+    return buildCodeMirrorCommentWidgets({
+      drafts: filesFileDrafts,
+      editingDraftId,
+      commentText,
+      selection: lineSelection,
+      isDragging,
+      fileLabel: selectedFile?.path ?? '',
+      newWidgetId: 'files-new-comment-input',
+      mapDraftToRange: (draft) => ({ start: draft.startLine, end: draft.endLine }),
+      onSave: handleSaveComment,
+      onCancel: () => {
+        setLineSelection(null);
+        cancel();
+      },
+      onEdit: (draft) => {
+        startEdit(draft);
+        setLineSelection({ start: draft.startLine, end: draft.endLine });
+      },
+      onDelete: deleteDraft,
     });
+  }, [cancel, commentText, deleteDraft, editingDraftId, filesFileDrafts, handleSaveComment, isDragging, lineSelection, selectedFile?.path, startEdit]);
 
-    // Add input for new comment
-    if (lineSelection && !editingDraftId && !isDragging) {
-      widgets.push({
-        afterLine: lineSelection.end,
-        id: 'files-new-comment-input',
-        content: (
-          <InlineCommentInput
-            lineRange={lineSelection}
-            onSave={(text) => handleSaveComment(text)}
-            onCancel={() => setLineSelection(null)}
-          />
-        ),
-      });
-    }
-
-    return widgets;
-  }, [selectedFile, currentSessionId, allDrafts, editingDraftId, lineSelection, handleSaveComment, removeDraft, isDragging]);
+  const renderShikiFileView = React.useCallback((file: FileNode, content: string) => {
+    return (
+      <div className="h-full">
+        <PierreFile
+          file={{
+            name: file.name,
+            contents: content,
+            lang: getLanguageFromExtension(file.path) || undefined,
+          }}
+          options={{
+            disableFileHeader: true,
+            overflow: wrapLines ? 'wrap' : 'scroll',
+            theme: pierreTheme,
+            themeType: currentTheme.metadata.variant === 'dark' ? 'dark' : 'light',
+          }}
+          className="block h-full w-full"
+          style={{ height: '100%' }}
+        />
+      </div>
+    );
+  }, [currentTheme.metadata.variant, pierreTheme, wrapLines]);
 
   const fileViewer = (
     <div
@@ -1922,19 +1856,20 @@ export const FilesView: React.FC = () => {
           </DialogFooter>
         </DialogContent>
       </Dialog>
-      <div className="flex min-w-0 items-center gap-2 border-b border-border/40 px-3 py-1.5 flex-shrink-0">
-        {isMobile && showMobilePageContent && (
-          <button
-            type="button"
-            onClick={() => setShowMobilePageContent(false)}
-            aria-label="Back"
-            className="inline-flex h-9 w-9 flex-shrink-0 items-center justify-center p-2 text-muted-foreground hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary"
-          >
-            <RiArrowLeftSLine className="h-5 w-5" />
-          </button>
-        )}
+      <div className="flex flex-col border-b border-border/40 flex-shrink-0">
+        {/* Row 1: Tabs */}
+        <div className="flex min-w-0 items-center px-3 py-1.5">
+          {isMobile && showMobilePageContent && (
+            <button
+              type="button"
+              onClick={() => setShowMobilePageContent(false)}
+              aria-label="Back"
+              className="inline-flex h-7 w-7 flex-shrink-0 items-center justify-center mr-1 text-muted-foreground hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary"
+            >
+              <RiArrowLeftSLine className="h-5 w-5" />
+            </button>
+          )}
 
-        <div className="min-w-0 flex-1">
           {isMobile ? (
             selectedFile ? (
               <DropdownMenu>
@@ -1944,6 +1879,7 @@ export const FilesView: React.FC = () => {
                     className="inline-flex min-w-0 max-w-full items-center gap-1 text-left typography-ui-label font-medium"
                     aria-label="Open files"
                   >
+                    <FileTypeIcon filePath={selectedFile.path} extension={selectedFile.extension} className="h-3.5 w-3.5 flex-shrink-0" />
                     <span className="min-w-0 flex-1 truncate">{selectedFile.name}</span>
                     <RiArrowDownSLine className="h-4 w-4 flex-shrink-0 text-muted-foreground" />
                   </button>
@@ -1969,8 +1905,9 @@ export const FilesView: React.FC = () => {
                           isActive && 'bg-[var(--interactive-selection)] text-[var(--interactive-selection-foreground)]'
                         )}
                       >
-                        <span className="min-w-0 flex-1 truncate">
-                          {file.name}
+                        <span className="flex min-w-0 flex-1 items-center gap-2 truncate">
+                          <FileTypeIcon filePath={file.path} extension={file.extension} className="h-3.5 w-3.5 flex-shrink-0" />
+                          <span className="min-w-0 flex-1 truncate">{file.name}</span>
                         </span>
                         <button
                           type="button"
@@ -1999,14 +1936,24 @@ export const FilesView: React.FC = () => {
             )
           ) : (
             openFiles.length > 0 ? (
-              <div className="flex min-w-0 flex-col gap-1">
-                <div className="flex min-w-0 items-center gap-1 overflow-x-auto">
+              <div className="relative min-w-0 flex-1">
+                {editorTabsOverflow.left && (
+                  <div className="pointer-events-none absolute left-0 top-0 bottom-0 w-6 z-10 bg-gradient-to-r from-background to-transparent" />
+                )}
+                {editorTabsOverflow.right && (
+                  <div className="pointer-events-none absolute right-0 top-0 bottom-0 w-6 z-10 bg-gradient-to-l from-background to-transparent" />
+                )}
+                <div
+                  ref={editorTabsScrollRef}
+                  className="flex min-w-0 items-center gap-1 overflow-x-auto scrollbar-none"
+                  style={{ scrollbarWidth: 'none', msOverflowStyle: 'none' }}
+                >
                   {openFiles.map((file) => {
                     const isActive = selectedFile?.path === file.path;
                     return (
                       <div
                         key={file.path}
-                        title={getDisplayPath(file.path)}
+                        title={getDisplayPath(root, file.path)}
                         className={cn(
                           'group inline-flex items-center gap-1 rounded-md border px-2 py-1 typography-ui-label transition-colors whitespace-nowrap',
                           isActive
@@ -2014,6 +1961,7 @@ export const FilesView: React.FC = () => {
                             : 'bg-transparent border-[var(--interactive-border)] text-[var(--surface-muted-foreground)] hover:bg-[var(--interactive-hover)] hover:text-[var(--surface-foreground)]'
                         )}
                       >
+                        <FileTypeIcon filePath={file.path} extension={file.extension} className="h-3.5 w-3.5 flex-shrink-0" />
                         <button
                           type="button"
                           onClick={() => {
@@ -2043,13 +1991,6 @@ export const FilesView: React.FC = () => {
                     );
                   })}
                 </div>
-                {selectedFile && (
-                  <FileBreadcrumbs
-                    path={displaySelectedPath}
-                    root={root}
-                    onNavigate={handleBreadcrumbNavigate}
-                  />
-                )}
               </div>
             ) : (
               <div className="typography-ui-label font-medium truncate">Select a file</div>
@@ -2057,153 +1998,169 @@ export const FilesView: React.FC = () => {
           )}
         </div>
 
-        <div className="flex items-center gap-1">
-          {canEdit && (
-            <Button
-              variant="ghost"
-              size="sm"
-              onClick={() => void saveDraft()}
-              disabled={!isDirty || isSaving}
-              className="h-5 w-5 p-0 text-[color:var(--status-success)] opacity-70 hover:opacity-100"
-              title={`Save (${getModifierLabel()}+S)`}
-              aria-label={`Save (${getModifierLabel()}+S)`}
-            >
-              {isSaving ? (
-                <RiLoader4Line className="h-4 w-4 animate-spin" />
-              ) : (
-                <RiSave3Line className="h-4 w-4" />
-              )}
-            </Button>
-          )}
-
-          {canEdit && selectedFile && !isSelectedImage && (
-            <span aria-hidden="true" className="mx-1 h-4 w-px bg-border/60" />
-          )}
-
-          {selectedFile && !isSelectedImage && (
-            <>
+        {/* Row 2: Actions (right-aligned) */}
+        {selectedFile && (
+          <div className="flex items-center justify-end gap-1 px-3 pb-1.5">
+            {canEdit && textViewMode === 'edit' && (
               <Button
                 variant="ghost"
                 size="sm"
-                onClick={() => setWrapLines(!wrapLines)}
-                className={cn(
-                  'h-5 w-5 p-0 transition-opacity',
-                  wrapLines ? 'text-foreground opacity-100' : 'text-muted-foreground opacity-60 hover:opacity-100'
-                )}
-                title={wrapLines ? 'Disable line wrap' : 'Enable line wrap'}
+                onClick={() => void saveDraft()}
+                disabled={!isDirty || isSaving}
+                className="h-5 w-5 p-0 text-[color:var(--status-success)] opacity-70 hover:opacity-100"
+                title={`Save (${getModifierLabel()}+S)`}
+                aria-label={`Save (${getModifierLabel()}+S)`}
               >
-                <RiTextWrap className="size-4" />
-              </Button>
-              <Button
-                variant="ghost"
-                size="sm"
-                onClick={() => setIsSearchOpen(!isSearchOpen)}
-                className={cn(
-                  'h-5 w-5 p-0 transition-opacity',
-                  isSearchOpen ? 'text-foreground opacity-100' : 'text-muted-foreground opacity-60 hover:opacity-100'
-                )}
-                title="Find in file"
-              >
-                <RiSearchLine className="size-4" />
-              </Button>
-            </>
-          )}
-
-          {(canCopy || canCopyPath || (selectedFile && isMarkdownFile(selectedFile.path))) && (canEdit || (selectedFile && !isSelectedImage)) && (
-            <span aria-hidden="true" className="mx-1 h-4 w-px bg-border/60" />
-          )}
-
-          {selectedFile && isMarkdownFile(selectedFile.path) && (
-            <PreviewToggleButton
-              currentMode={getMdViewMode()}
-              onToggle={() => saveMdViewMode(getMdViewMode() === 'preview' ? 'edit' : 'preview')}
-            />
-          )}
-
-          {canCopy && (
-            <Button
-              variant="ghost"
-              size="sm"
-              onClick={async () => {
-                try {
-                  if (!(await writeTextToClipboard(fileContent))) {
-                    throw new Error('copy failed');
-                  }
-                  setCopiedContent(true);
-                  if (copiedContentTimeoutRef.current !== null) {
-                    window.clearTimeout(copiedContentTimeoutRef.current);
-                  }
-                  copiedContentTimeoutRef.current = window.setTimeout(() => {
-                    setCopiedContent(false);
-                  }, 1200);
-                } catch {
-                  toast.error('Copy failed');
-                }
-              }}
-              className="h-5 w-5 p-0"
-              title="Copy file contents"
-              aria-label="Copy file contents"
-            >
-              {copiedContent ? (
-                <RiCheckLine className="h-4 w-4 text-[color:var(--status-success)]" />
-              ) : (
-                <RiClipboardLine className="h-4 w-4" />
-              )}
-            </Button>
-          )}
-
-          {canCopyPath && (
-            <Button
-              variant="ghost"
-              size="sm"
-              onClick={async () => {
-                try {
-                  if (!(await writeTextToClipboard(displaySelectedPath))) {
-                    throw new Error('copy failed');
-                  }
-                  setCopiedPath(true);
-                  if (copiedPathTimeoutRef.current !== null) {
-                    window.clearTimeout(copiedPathTimeoutRef.current);
-                  }
-                  copiedPathTimeoutRef.current = window.setTimeout(() => {
-                    setCopiedPath(false);
-                  }, 1200);
-                } catch {
-                  toast.error('Copy failed');
-                }
-              }}
-              className="h-5 w-5 p-0"
-              title={`Copy file path (${displaySelectedPath})`}
-              aria-label={`Copy file path (${displaySelectedPath})`}
-            >
-              {copiedPath ? (
-                <RiCheckLine className="h-4 w-4 text-[color:var(--status-success)]" />
-              ) : (
-                <RiFileCopy2Line className="h-4 w-4" />
-              )}
-            </Button>
-          )}
-
-          {selectedFile && !isMobile && (
-            <>
-              <span aria-hidden="true" className="mx-1 h-4 w-px bg-border/60" />
-              <Button
-                variant="ghost"
-                size="sm"
-                onClick={() => setIsFullscreen(!isFullscreen)}
-                className="h-5 w-5 p-0"
-                title={isFullscreen ? 'Exit fullscreen' : 'Fullscreen'}
-                aria-label={isFullscreen ? 'Exit fullscreen' : 'Fullscreen'}
-              >
-                {isFullscreen ? (
-                  <RiFullscreenExitLine className="h-4 w-4" />
+                {isSaving ? (
+                  <RiLoader4Line className="h-4 w-4 animate-spin" />
                 ) : (
-                  <RiFullscreenLine className="h-4 w-4" />
+                  <RiSave3Line className="h-4 w-4" />
                 )}
               </Button>
-            </>
-          )}
-        </div>
+            )}
+
+            {canEdit && !isSelectedImage && (
+              <span aria-hidden="true" className="mx-1 h-4 w-px bg-border/60" />
+            )}
+
+            {canUseShikiFileView && canEdit && (
+              <Button
+                variant="ghost"
+                size="sm"
+                onClick={() => setTextViewMode((prev) => (prev === 'view' ? 'edit' : 'view'))}
+                className={cn(
+                  'h-5 w-5 p-0 transition-opacity',
+                  textViewMode === 'edit' ? 'text-foreground opacity-100' : 'text-muted-foreground opacity-70 hover:opacity-100'
+                )}
+                title={textViewMode === 'view' ? 'Switch to edit mode' : 'Switch to highlighted view'}
+              >
+                {textViewMode === 'view' ? <RiEditLine className="size-4" /> : <RiEyeLine className="size-4" />}
+              </Button>
+            )}
+
+            {!isSelectedImage && (
+              <>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  onClick={() => setWrapLines(!wrapLines)}
+                  className={cn(
+                    'h-5 w-5 p-0 transition-opacity',
+                    wrapLines ? 'text-foreground opacity-100' : 'text-muted-foreground opacity-60 hover:opacity-100'
+                  )}
+                  title={wrapLines ? 'Disable line wrap' : 'Enable line wrap'}
+                >
+                  <RiTextWrap className="size-4" />
+                </Button>
+                {textViewMode === 'edit' && (
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    onClick={() => setIsSearchOpen(!isSearchOpen)}
+                    className={cn(
+                      'h-5 w-5 p-0 transition-opacity',
+                      isSearchOpen ? 'text-foreground opacity-100' : 'text-muted-foreground opacity-60 hover:opacity-100'
+                    )}
+                    title="Find in file"
+                  >
+                    <RiSearchLine className="size-4" />
+                  </Button>
+                )}
+              </>
+            )}
+
+            {(canCopy || canCopyPath || isMarkdown) && (canEdit || !isSelectedImage) && (
+              <span aria-hidden="true" className="mx-1 h-4 w-px bg-border/60" />
+            )}
+
+            {isMarkdown && (
+              <PreviewToggleButton
+                currentMode={getMdViewMode()}
+                onToggle={() => saveMdViewMode(getMdViewMode() === 'preview' ? 'edit' : 'preview')}
+              />
+            )}
+
+            {canCopy && (
+              <Button
+                variant="ghost"
+                size="sm"
+                onClick={async () => {
+                  const result = await copyTextToClipboard(fileContent);
+                  if (result.ok) {
+                    setCopiedContent(true);
+                    if (copiedContentTimeoutRef.current !== null) {
+                      window.clearTimeout(copiedContentTimeoutRef.current);
+                    }
+                    copiedContentTimeoutRef.current = window.setTimeout(() => {
+                      setCopiedContent(false);
+                    }, 1200);
+                  } else {
+                    toast.error('Copy failed');
+                  }
+                }}
+                className="h-5 w-5 p-0"
+                title="Copy file contents"
+                aria-label="Copy file contents"
+              >
+                {copiedContent ? (
+                  <RiCheckLine className="h-4 w-4 text-[color:var(--status-success)]" />
+                ) : (
+                  <RiClipboardLine className="h-4 w-4" />
+                )}
+              </Button>
+            )}
+
+            {canCopyPath && (
+              <Button
+                variant="ghost"
+                size="sm"
+                onClick={async () => {
+                  const result = await copyTextToClipboard(displaySelectedPath);
+                  if (result.ok) {
+                    setCopiedPath(true);
+                    if (copiedPathTimeoutRef.current !== null) {
+                      window.clearTimeout(copiedPathTimeoutRef.current);
+                    }
+                    copiedPathTimeoutRef.current = window.setTimeout(() => {
+                      setCopiedPath(false);
+                    }, 1200);
+                  } else {
+                    toast.error('Copy failed');
+                  }
+                }}
+                className="h-5 w-5 p-0"
+                title={`Copy file path (${displaySelectedPath})`}
+                aria-label={`Copy file path (${displaySelectedPath})`}
+              >
+                {copiedPath ? (
+                  <RiCheckLine className="h-4 w-4 text-[color:var(--status-success)]" />
+                ) : (
+                  <RiFileCopy2Line className="h-4 w-4" />
+                )}
+              </Button>
+            )}
+
+            {!isMobile && mode === 'full' && (
+              <>
+                <span aria-hidden="true" className="mx-1 h-4 w-px bg-border/60" />
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  onClick={() => setIsFullscreen(!isFullscreen)}
+                  className="h-5 w-5 p-0"
+                  title={isFullscreen ? 'Exit fullscreen' : 'Fullscreen'}
+                  aria-label={isFullscreen ? 'Exit fullscreen' : 'Fullscreen'}
+                >
+                  {isFullscreen ? (
+                    <RiFullscreenExitLine className="h-4 w-4" />
+                  ) : (
+                    <RiFullscreenLine className="h-4 w-4" />
+                  )}
+                </Button>
+              </>
+            )}
+          </div>
+        )}
       </div>
 
       <div className="flex-1 min-h-0 min-w-0 relative">
@@ -2225,7 +2182,7 @@ export const FilesView: React.FC = () => {
                 className="max-w-full max-h-[70vh] object-contain rounded-md border border-border/30 bg-primary/10"
               />
             </div>
-          ) : selectedFile && isMarkdownFile(selectedFile.path) && getMdViewMode() === 'preview' ? (
+          ) : selectedFile && isMarkdown && getMdViewMode() === 'preview' ? (
             <div className="h-full overflow-auto p-3">
               {fileContent.length > 500 * 1024 && (
                 <div className="mb-3 rounded-md border border-status-warning/20 bg-status-warning/10 px-3 py-2 text-sm text-status-warning">
@@ -2242,12 +2199,19 @@ export const FilesView: React.FC = () => {
                   </div>
                 }
               >
-                <SimpleMarkdownRenderer content={fileContent} className="typography-markdown-body" />
+                <SimpleMarkdownRenderer
+                  content={fileContent}
+                  className="typography-markdown-body"
+                  stripFrontmatter
+                />
               </ErrorBoundary>
             </div>
+          ) : selectedFile && canUseShikiFileView && textViewMode === 'view' ? (
+            renderShikiFileView(selectedFile, draftContent)
           ) : (
             <div
-              className="h-full"
+              className="relative h-full"
+              ref={editorWrapperRef}
               data-keyboard-avoid="none"
               style={isMobile ? { height: 'calc(100% - var(--oc-keyboard-inset, 0px))' } : undefined}
             >
@@ -2256,6 +2220,7 @@ export const FilesView: React.FC = () => {
                 onChange={setDraftContent}
                 extensions={editorExtensions}
                 className="h-full"
+                blockWidgets={blockWidgets}
                 onViewReady={(view) => {
                   editorViewRef.current = view;
                   window.requestAnimationFrame(() => {
@@ -2270,7 +2235,6 @@ export const FilesView: React.FC = () => {
                 enableSearch
                 searchOpen={isSearchOpen}
                 onSearchOpenChange={setIsSearchOpen}
-                blockWidgets={blockWidgets}
                 highlightLines={lineSelection
                   ? {
                     start: Math.min(lineSelection.start, lineSelection.end),
@@ -2425,7 +2389,7 @@ export const FilesView: React.FC = () => {
                       isActive ? 'bg-interactive-selection/70' : 'hover:bg-interactive-hover/40'
                     )}
                   >
-                    {getFileIcon(node.extension)}
+                    {getFileIcon(node.path, node.extension)}
                     <span
                       className="min-w-0 flex-1 truncate typography-meta"
                       style={{ direction: 'rtl', textAlign: 'left' }}
@@ -2448,7 +2412,7 @@ export const FilesView: React.FC = () => {
   );
 
   // Fullscreen file viewer overlay
-  const fullscreenViewer = isFullscreen && selectedFile && (
+  const fullscreenViewer = mode === 'full' && isFullscreen && selectedFile && (
     <div className="absolute inset-0 z-50 flex flex-col bg-background">
       {/* Fullscreen header */}
       <div className="flex min-w-0 items-center gap-2 border-b border-border/40 px-4 py-2 flex-shrink-0">
@@ -2462,7 +2426,7 @@ export const FilesView: React.FC = () => {
         </div>
 
         <div className="flex items-center gap-1">
-          {canEdit && (
+          {canEdit && textViewMode === 'edit' && (
             <Button
               variant="ghost"
               size="sm"
@@ -2484,6 +2448,21 @@ export const FilesView: React.FC = () => {
             <span aria-hidden="true" className="mx-1 h-4 w-px bg-border/60" />
           )}
 
+          {canUseShikiFileView && canEdit && (
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={() => setTextViewMode((prev) => (prev === 'view' ? 'edit' : 'view'))}
+              className={cn(
+                'h-6 w-6 p-0 transition-opacity',
+                textViewMode === 'edit' ? 'text-foreground opacity-100' : 'text-muted-foreground opacity-70 hover:opacity-100'
+              )}
+              title={textViewMode === 'view' ? 'Switch to edit mode' : 'Switch to highlighted view'}
+            >
+              {textViewMode === 'view' ? <RiEditLine className="size-4" /> : <RiEyeLine className="size-4" />}
+            </Button>
+          )}
+
           {!isSelectedImage && (
             <Button
               variant="ghost"
@@ -2499,11 +2478,11 @@ export const FilesView: React.FC = () => {
             </Button>
           )}
 
-          {(canCopy || canCopyPath || isMarkdownFile(selectedFile.path)) && (canEdit || !isSelectedImage) && (
+          {(canCopy || canCopyPath || isMarkdown) && (canEdit || !isSelectedImage) && (
             <span aria-hidden="true" className="mx-1 h-4 w-px bg-border/60" />
           )}
 
-          {isMarkdownFile(selectedFile.path) && (
+          {isMarkdown && (
             <PreviewToggleButton
               currentMode={getMdViewMode()}
               onToggle={() => saveMdViewMode(getMdViewMode() === 'preview' ? 'edit' : 'preview')}
@@ -2515,10 +2494,8 @@ export const FilesView: React.FC = () => {
               variant="ghost"
               size="sm"
               onClick={async () => {
-                try {
-                  if (!(await writeTextToClipboard(fileContent))) {
-                    throw new Error('copy failed');
-                  }
+                const result = await copyTextToClipboard(fileContent);
+                if (result.ok) {
                   setCopiedContent(true);
                   if (copiedContentTimeoutRef.current !== null) {
                     window.clearTimeout(copiedContentTimeoutRef.current);
@@ -2526,7 +2503,7 @@ export const FilesView: React.FC = () => {
                   copiedContentTimeoutRef.current = window.setTimeout(() => {
                     setCopiedContent(false);
                   }, 1200);
-                } catch {
+                } else {
                   toast.error('Copy failed');
                 }
               }}
@@ -2547,10 +2524,8 @@ export const FilesView: React.FC = () => {
               variant="ghost"
               size="sm"
               onClick={async () => {
-                try {
-                  if (!(await writeTextToClipboard(displaySelectedPath))) {
-                    throw new Error('copy failed');
-                  }
+                const result = await copyTextToClipboard(displaySelectedPath);
+                if (result.ok) {
                   setCopiedPath(true);
                   if (copiedPathTimeoutRef.current !== null) {
                     window.clearTimeout(copiedPathTimeoutRef.current);
@@ -2558,7 +2533,7 @@ export const FilesView: React.FC = () => {
                   copiedPathTimeoutRef.current = window.setTimeout(() => {
                     setCopiedPath(false);
                   }, 1200);
-                } catch {
+                } else {
                   toast.error('Copy failed');
                 }
               }}
@@ -2606,7 +2581,7 @@ export const FilesView: React.FC = () => {
                 className="max-w-full max-h-full object-contain rounded-md border border-border/30 bg-primary/10"
               />
             </div>
-          ) : isMarkdownFile(selectedFile.path) && getMdViewMode() === 'preview' ? (
+          ) : isMarkdown && getMdViewMode() === 'preview' ? (
             <div className="h-full overflow-auto p-4">
               {fileContent.length > 500 * 1024 && (
                 <div className="mb-3 rounded-md border border-status-warning/20 bg-status-warning/10 px-3 py-2 text-sm text-status-warning">
@@ -2623,9 +2598,15 @@ export const FilesView: React.FC = () => {
                   </div>
                 }
               >
-                <SimpleMarkdownRenderer content={fileContent} className="typography-markdown-body" />
+                <SimpleMarkdownRenderer
+                  content={fileContent}
+                  className="typography-markdown-body"
+                  stripFrontmatter
+                />
               </ErrorBoundary>
             </div>
+          ) : canUseShikiFileView && textViewMode === 'view' ? (
+            renderShikiFileView(selectedFile, draftContent)
           ) : (
             <div className="h-full">
               <CodeMirrorEditor
@@ -2662,10 +2643,16 @@ export const FilesView: React.FC = () => {
         ) : (
           treePanel
         )
+       ) : mode === 'editor-only' ? (
+         <div className="flex flex-1 min-h-0 min-w-0 overflow-hidden">
+            <div className="flex-1 min-h-0 min-w-0 overflow-hidden bg-background">
+             {fileViewer}
+            </div>
+          </div>
        ) : (
          <div className="flex flex-1 min-h-0 min-w-0 gap-3 px-3 pb-3 pt-2">
-           {screenWidth >= 700 && (
-             <div className="w-72 flex-shrink-0 min-h-0 overflow-hidden">
+            {screenWidth >= 700 && (
+              <div className="w-72 flex-shrink-0 min-h-0 overflow-hidden">
                {treePanel}
              </div>
            )}

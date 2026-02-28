@@ -102,21 +102,25 @@ export const detectTurns = (messages: ChatMessageEntry[]): Turn[] => {
 };
 
 const extractFinalAssistantText = (turn: Turn): string | undefined => {
+    for (let messageIndex = turn.assistantMessages.length - 1; messageIndex >= 0; messageIndex -= 1) {
+        const assistantMsg = turn.assistantMessages[messageIndex];
+        if (!assistantMsg) continue;
 
-    for (const assistantMsg of turn.assistantMessages) {
         const infoFinish = (assistantMsg.info as { finish?: string | null | undefined }).finish;
+        if (infoFinish !== 'stop') continue;
 
-        if (infoFinish === 'stop') {
-            const textPart = assistantMsg.parts.find(p => p.type === 'text');
-            if (textPart) {
-                const textContent = (textPart as { text?: string | null | undefined }).text ??
-                                  (textPart as { content?: string | null | undefined }).content;
-                if (typeof textContent === 'string' && textContent.trim().length > 0) {
-                    return textContent;
-                }
+        for (let partIndex = assistantMsg.parts.length - 1; partIndex >= 0; partIndex -= 1) {
+            const part = assistantMsg.parts[partIndex];
+            if (!part || part.type !== 'text') continue;
+
+            const textContent = (part as { text?: string | null | undefined }).text ??
+                (part as { content?: string | null | undefined }).content;
+            if (typeof textContent === 'string' && textContent.trim().length > 0) {
+                return textContent;
             }
         }
     }
+
     return undefined;
 };
 
@@ -197,7 +201,6 @@ const getTurnActivityInfo = (turn: Turn, showTextJustificationActivity: boolean)
     }
 
     const activityParts: TurnActivityPart[] = [];
-    let syntheticIdCounter = 0;
 
     turn.assistantMessages.forEach((msg) => {
         const messageId = msg.info.id;
@@ -206,11 +209,8 @@ const getTurnActivityInfo = (turn: Turn, showTextJustificationActivity: boolean)
         // All earlier text messages are justification
         const isFinalSummaryMessage = messageId === lastTextMessageId;
 
-        msg.parts.forEach((part) => {
-            const baseId =
-                (typeof part.id === 'string' && part.id.trim().length > 0)
-                    ? part.id
-                    : `${messageId}-activity-${syntheticIdCounter++}`;
+        msg.parts.forEach((part, partIndex) => {
+            const baseId = `${messageId}-part-${partIndex}-${part.type}`;
 
             if (part.type === 'tool') {
                 const state = (part as { state?: { time?: { end?: number | null | undefined } | null | undefined } | null | undefined }).state;
@@ -291,13 +291,11 @@ const getTurnActivityInfo = (turn: Turn, showTextJustificationActivity: boolean)
     turn.assistantMessages.forEach((msg) => {
         const messageId = msg.info.id;
 
-        msg.parts.forEach((part) => {
+        msg.parts.forEach((part, partIndex) => {
             if (part.type === 'tool') {
                 const toolName = (part as { tool?: unknown }).tool;
                 if (isActivityStandaloneTool(toolName)) {
-                    const toolPartId = typeof part.id === 'string' && part.id.trim().length > 0
-                        ? part.id
-                        : `${messageId}-task-${taskOrder.length + 1}`;
+                    const toolPartId = `${messageId}-part-${partIndex}-${part.type}`;
 
                     if (!taskMessageById.has(toolPartId)) {
                         taskMessageById.set(toolPartId, messageId);

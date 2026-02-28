@@ -29,6 +29,12 @@ export type SkillCatalogConfig = {
   gitIdentityId?: string;
 };
 
+export type NamedTunnelPreset = {
+  id: string;
+  name: string;
+  hostname: string;
+};
+
 export type DesktopSettings = {
   themeId?: string;
   useSystemTheme?: boolean;
@@ -46,6 +52,7 @@ export type DesktopSettings = {
   pinnedDirectories?: string[];
   showReasoningTraces?: boolean;
   showTextJustificationActivity?: boolean;
+  showDeletionDialog?: boolean;
   nativeNotificationsEnabled?: boolean;
   notificationMode?: 'always' | 'hidden-only';
   mobileHapticsEnabled?: boolean;
@@ -85,6 +92,15 @@ export type DesktopSettings = {
   }>;  // Per-provider custom model groups configuration
   autoDeleteEnabled?: boolean;
   autoDeleteAfterDays?: number;
+  tunnelMode?: 'quick' | 'named';
+  tunnelBootstrapTtlMs?: number | null;
+  tunnelSessionTtlMs?: number;
+  namedTunnelHostname?: string;
+  namedTunnelToken?: string | null;
+  hasNamedTunnelToken?: boolean;
+  namedTunnelPresets?: NamedTunnelPreset[];
+  namedTunnelSelectedPresetId?: string;
+  namedTunnelPresetTokens?: Record<string, string>;
   defaultModel?: string; // format: "provider/model"
   defaultVariant?: string;
   defaultAgent?: string;
@@ -94,6 +110,8 @@ export type DesktopSettings = {
   queueModeEnabled?: boolean;
   gitmojiEnabled?: boolean;
   zenModel?: string;
+  gitProviderId?: string;
+  gitModelId?: string;
   toolCallExpansion?: 'collapsed' | 'activity' | 'detailed';
   fontSize?: number;
   terminalFontSize?: number;
@@ -183,6 +201,25 @@ const getRuntimeDescriptor = (): RuntimeDescriptor | null => {
   return apis?.runtime ?? null;
 };
 
+const getInjectedRuntimePlatform = (): RuntimeDescriptor['platform'] | null => {
+  if (typeof window === 'undefined') {
+    return null;
+  }
+  const value = (window as unknown as { __OPENCHAMBER_RUNTIME_PLATFORM__?: unknown }).__OPENCHAMBER_RUNTIME_PLATFORM__;
+  if (value === 'desktop' || value === 'mobile' || value === 'vscode' || value === 'web') {
+    return value;
+  }
+  return null;
+};
+
+const hasDesktopLocalOriginHint = (): boolean => {
+  if (typeof window === 'undefined') {
+    return false;
+  }
+  const localOrigin = (window as unknown as { __OPENCHAMBER_LOCAL_ORIGIN__?: unknown }).__OPENCHAMBER_LOCAL_ORIGIN__;
+  return typeof localOrigin === 'string' && localOrigin.trim().length > 0;
+};
+
 export const isTauriShell = (): boolean => {
   if (typeof window === 'undefined') return false;
   const tauri = getTauriGlobal();
@@ -196,10 +233,34 @@ const isLikelyMobileUserAgent = (): boolean => {
     return false;
   }
   const ua = navigator.userAgent.toLowerCase();
-  return /iphone|ipad|ipod|android|mobile/.test(ua);
+  return /iphone|ipad|ipod|android/.test(ua);
+};
+
+const isDesktopShellRuntime = (): boolean => {
+  const injected = getInjectedRuntimePlatform();
+  if (injected === 'desktop') {
+    return true;
+  }
+  if (injected === 'mobile' || injected === 'vscode') {
+    return false;
+  }
+  if (hasDesktopLocalOriginHint()) {
+    return true;
+  }
+  return isTauriShell() && !isLikelyMobileUserAgent();
 };
 
 export const isTauriMobileShell = (): boolean => {
+  const injected = getInjectedRuntimePlatform();
+  if (injected === 'mobile') {
+    return true;
+  }
+  if (injected === 'desktop' || injected === 'vscode') {
+    return false;
+  }
+  if (isDesktopShellRuntime()) {
+    return false;
+  }
   const runtime = getRuntimeDescriptor();
   if (runtime?.platform === 'mobile') {
     return true;
@@ -224,9 +285,49 @@ const normalizeOrigin = (raw: string): string | null => {
   }
 };
 
+const parseUrl = (raw: string): URL | null => {
+  const trimmed = raw.trim();
+  if (!trimmed) return null;
+  try {
+    return new URL(trimmed);
+  } catch {
+    try {
+      return new URL(trimmed.endsWith('/') ? trimmed : `${trimmed}/`);
+    } catch {
+      return null;
+    }
+  }
+};
+
+const normalizeHost = (rawHost: string): string => rawHost.replace(/^\[|\]$/g, '').toLowerCase();
+
+const isLoopbackHost = (host: string): boolean => {
+  const normalized = normalizeHost(host);
+  return normalized === 'localhost' || normalized === '127.0.0.1' || normalized === '::1';
+};
+
 export const isDesktopLocalOriginActive = (): boolean => {
   if (typeof window === 'undefined') return false;
   const local = typeof window.__OPENCHAMBER_LOCAL_ORIGIN__ === 'string' ? window.__OPENCHAMBER_LOCAL_ORIGIN__ : '';
+  const localUrl = parseUrl(local);
+  const currentUrl = parseUrl(window.location.origin);
+
+  if (localUrl && currentUrl) {
+    if (localUrl.origin === currentUrl.origin) {
+      return true;
+    }
+
+    const localPort = localUrl.port || (localUrl.protocol === 'https:' ? '443' : '80');
+    const currentPort = currentUrl.port || (currentUrl.protocol === 'https:' ? '443' : '80');
+
+    return (
+      localUrl.protocol === currentUrl.protocol &&
+      localPort === currentPort &&
+      isLoopbackHost(localUrl.hostname) &&
+      isLoopbackHost(currentUrl.hostname)
+    );
+  }
+
   const localOrigin = normalizeOrigin(local);
   const currentOrigin = normalizeOrigin(window.location.origin) || window.location.origin;
   return Boolean(localOrigin && currentOrigin && localOrigin === currentOrigin);
@@ -247,14 +348,14 @@ export const isDesktopShell = (): boolean => {
     if (runtime.platform === 'desktop' || runtime.isDesktop) {
       return true;
     }
-    if (runtime.platform === 'web' || runtime.platform === 'vscode') {
+    if (runtime.platform === 'web') {
+      return isDesktopShellRuntime();
+    }
+    if (runtime.platform === 'vscode') {
       return false;
     }
   }
-  if (typeof window.__OPENCHAMBER_LOCAL_ORIGIN__ === 'string' && window.__OPENCHAMBER_LOCAL_ORIGIN__.length > 0) {
-    return true;
-  }
-  return isTauriShell();
+  return isDesktopShellRuntime();
 };
 
 export const isVSCodeRuntime = (): boolean => {
@@ -270,6 +371,9 @@ export const isMobileRuntime = (): boolean => {
 export const isWebRuntime = (): boolean => {
   if (typeof window === "undefined") return false;
   if (isTauriMobileShell()) {
+    return false;
+  }
+  if (isDesktopShellRuntime()) {
     return false;
   }
   const platform = getRuntimeDescriptor()?.platform;
@@ -856,6 +960,21 @@ export const authenticateWithBiometrics = async (
     await tauri.biometric.authenticate(reason, options);
     return true;
   } catch {
+    return false;
+  }
+};
+
+export const clearDesktopCache = async (): Promise<boolean> => {
+  if (!isTauriShell() || !isDesktopLocalOriginActive()) {
+    return false;
+  }
+
+  try {
+    const tauri = (window as unknown as { __TAURI__?: TauriGlobal }).__TAURI__;
+    await tauri?.core?.invoke?.('desktop_clear_cache');
+    return true;
+  } catch (error) {
+    console.warn('Failed to clear cache', error);
     return false;
   }
 };

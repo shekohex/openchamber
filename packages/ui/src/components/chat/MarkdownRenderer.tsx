@@ -1,14 +1,22 @@
 import React from 'react';
 import { Streamdown } from 'streamdown';
+import { code } from '@streamdown/code';
+import { renderMermaidASCII, renderMermaidSVG } from 'beautiful-mermaid';
+import 'streamdown/styles.css';
 import { FadeInOnReveal } from './message/FadeInOnReveal';
 import type { Part } from '@opencode-ai/sdk/v2';
 import { cn } from '@/lib/utils';
 import { RiFileCopyLine, RiCheckLine, RiDownloadLine } from '@remixicon/react';
+import { toast } from '@/components/ui';
+import { copyTextToClipboard } from '@/lib/clipboard';
 
-import { isVSCodeRuntime, writeTextToClipboard } from '@/lib/desktop';
+import { isVSCodeRuntime } from '@/lib/desktop';
 import { useOptionalThemeSystem } from '@/contexts/useThemeSystem';
 import { getStreamdownThemePair } from '@/lib/shiki/appThemeRegistry';
 import { getDefaultTheme } from '@/lib/theme/themes';
+import type { ToolPopupContent } from './message/types';
+import { useUIStore } from '@/stores/useUIStore';
+import { useDeviceInfo } from '@/lib/device';
 
 const withStableStringId = <T extends object>(value: T, id: string): T => {
   const existingPrimitive = (value as Record<symbol, unknown>)[Symbol.toPrimitive];
@@ -116,6 +124,17 @@ const useMarkdownShikiThemes = (): readonly [string | object, string | object] =
   return isVSCode ? themes : fallbackThemes;
 };
 
+const useCurrentMermaidTheme = () => {
+  const themeSystem = useOptionalThemeSystem();
+  const fallbackLight = getDefaultTheme(false);
+  const fallbackDark = getDefaultTheme(true);
+
+  return themeSystem?.currentTheme
+    ?? (typeof window !== 'undefined' && window.matchMedia('(prefers-color-scheme: dark)').matches
+      ? fallbackDark
+      : fallbackLight);
+};
+
 // Table utility functions
 const extractTableData = (tableEl: HTMLTableElement): { headers: string[]; rows: string[][] } => {
   const headers: string[] = [];
@@ -219,9 +238,10 @@ const TableCopyButton: React.FC<{ tableRef: React.RefObject<HTMLDivElement | nul
     const tableEl = tableRef.current?.querySelector('table');
     if (!tableEl) return;
     
+    const data = extractTableData(tableEl);
+    const content = format === 'csv' ? tableToCSV(data) : tableToTSV(data);
+
     try {
-      const data = extractTableData(tableEl);
-      const content = format === 'csv' ? tableToCSV(data) : tableToTSV(data);
       await navigator.clipboard.write([
         new ClipboardItem({
           'text/plain': new Blob([content], { type: 'text/plain' }),
@@ -232,6 +252,13 @@ const TableCopyButton: React.FC<{ tableRef: React.RefObject<HTMLDivElement | nul
       setShowMenu(false);
       setTimeout(() => setCopied(false), 2000);
     } catch (err) {
+      const fallbackResult = await copyTextToClipboard(content);
+      if (fallbackResult.ok) {
+        setCopied(true);
+        setShowMenu(false);
+        setTimeout(() => setCopied(false), 2000);
+        return;
+      }
       console.error('Failed to copy table:', err);
     }
   };
@@ -246,7 +273,7 @@ const TableCopyButton: React.FC<{ tableRef: React.RefObject<HTMLDivElement | nul
         {copied ? <RiCheckLine className="size-3.5" /> : <RiFileCopyLine className="size-3.5" />}
       </button>
       {showMenu && (
-        <div className="absolute top-full right-0 z-10 mt-1 min-w-[100px] overflow-hidden rounded-md border border-border bg-background shadow-lg">
+        <div className="absolute top-full right-0 z-10 mt-1 min-w-[100px] overflow-hidden rounded-md border border-border bg-background shadow-none">
           <button
             className="w-full px-3 py-1.5 text-left text-sm transition-colors hover:bg-interactive-hover/40"
             onClick={() => handleCopy('csv')}
@@ -280,21 +307,18 @@ const TableDownloadButton: React.FC<{ tableRef: React.RefObject<HTMLDivElement |
     return () => document.removeEventListener('mousedown', handleClickOutside);
   }, []);
 
-  const handleDownload = (format: 'csv' | 'markdown') => {
-    const tableEl = tableRef.current?.querySelector('table');
-    if (!tableEl) return;
-    
-    try {
+   const handleDownload = (format: 'csv' | 'markdown') => {
+      const tableEl = tableRef.current?.querySelector('table');
+      if (!tableEl) return;
+
       const data = extractTableData(tableEl);
       const content = format === 'csv' ? tableToCSV(data) : tableToMarkdown(data);
       const filename = format === 'csv' ? 'table.csv' : 'table.md';
       const mimeType = format === 'csv' ? 'text/csv' : 'text/markdown';
       downloadFile(filename, content, mimeType);
       setShowMenu(false);
-    } catch (err) {
-      console.error('Failed to download table:', err);
-    }
-  };
+      toast.success(`Table downloaded as ${format.toUpperCase()}`);
+    };
 
   return (
     <div className="relative" ref={menuRef}>
@@ -306,7 +330,7 @@ const TableDownloadButton: React.FC<{ tableRef: React.RefObject<HTMLDivElement |
         <RiDownloadLine className="size-3.5" />
       </button>
       {showMenu && (
-        <div className="absolute top-full right-0 z-10 mt-1 min-w-[100px] overflow-hidden rounded-md border border-border bg-background shadow-lg">
+        <div className="absolute top-full right-0 z-10 mt-1 min-w-[100px] overflow-hidden rounded-md border border-border bg-background shadow-none">
           <button
             className="w-full px-3 py-1.5 text-left text-sm transition-colors hover:bg-interactive-hover/40"
             onClick={() => handleDownload('csv')}
@@ -348,9 +372,190 @@ type CodeBlockWrapperProps = React.HTMLAttributes<HTMLPreElement> & {
   children?: React.ReactNode;
 };
 
+const getMermaidInfo = (children: React.ReactNode): { isMermaid: boolean; source: string } => {
+  if (!React.isValidElement(children)) return { isMermaid: false, source: '' };
+  const props = children.props as Record<string, unknown> | undefined;
+  const className = typeof props?.className === 'string' ? props.className : '';
+  if (!className.includes('language-mermaid')) return { isMermaid: false, source: '' };
+  // Extract raw mermaid source from the code element's children
+  const codeChildren = props?.children;
+  let source = '';
+  if (typeof codeChildren === 'string') {
+    source = codeChildren;
+  } else if (React.isValidElement(codeChildren)) {
+    const innerProps = codeChildren.props as Record<string, unknown> | undefined;
+    if (typeof innerProps?.children === 'string') source = innerProps.children;
+  }
+  return { isMermaid: true, source };
+};
+
+const MermaidBlock: React.FC<{ source: string; mode: 'svg' | 'ascii' }> = ({ source, mode }) => {
+  const currentTheme = useCurrentMermaidTheme();
+  const { isMobile } = useDeviceInfo();
+  const [copied, setCopied] = React.useState(false);
+  const [downloaded, setDownloaded] = React.useState(false);
+
+  const svg = React.useMemo(() => {
+    if (mode !== 'svg') return '';
+    try {
+      return renderMermaidSVG(source, {
+        bg: currentTheme.colors.surface.elevated,
+        fg: currentTheme.colors.surface.foreground,
+        line: currentTheme.colors.interactive.border,
+        accent: currentTheme.colors.primary.base,
+        muted: currentTheme.colors.surface.mutedForeground,
+        surface: currentTheme.colors.surface.muted,
+        border: currentTheme.colors.interactive.border,
+        transparent: true,
+        font: 'IBM Plex Sans, sans-serif',
+      });
+    } catch {
+      return '';
+    }
+  }, [currentTheme, mode, source]);
+
+  const ascii = React.useMemo(() => {
+    if (mode !== 'ascii') return '';
+    try {
+      return renderMermaidASCII(source);
+    } catch {
+      return '';
+    }
+  }, [mode, source]);
+
+  const copyVisibilityClass = isMobile ? 'opacity-100' : 'opacity-0 group-hover:opacity-100';
+
+  const handleCopyAscii = async (asciiText: string) => {
+    if (!asciiText) return;
+    const result = await copyTextToClipboard(asciiText);
+    if (result.ok) {
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    }
+  };
+
+  const handleCopyMermaidSource = async () => {
+    if (!source) return;
+    const result = await copyTextToClipboard(source);
+    if (result.ok) {
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    }
+  };
+
+  const handleDownloadSvg = () => {
+    if (!svg) return;
+    try {
+      const blob = new Blob([svg], { type: 'image/svg+xml;charset=utf-8' });
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = `diagram-${Date.now()}.svg`;
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+      URL.revokeObjectURL(url);
+      setDownloaded(true);
+      setTimeout(() => setDownloaded(false), 2000);
+    } catch {
+      toast.error('Failed to download diagram');
+    }
+  };
+
+  if (mode === 'ascii') {
+    const asciiText = ascii || source;
+
+    return (
+      <div data-streamdown="mermaid-block" className="group">
+        <div data-streamdown="mermaid-scroll">
+          <pre data-streamdown="mermaid-ascii">{asciiText}</pre>
+        </div>
+        <div
+          className={cn(
+            'absolute top-1 right-2 transition-opacity',
+            copyVisibilityClass,
+          )}
+        >
+          <button
+            onClick={() => handleCopyAscii(asciiText)}
+            className="p-1 rounded hover:bg-interactive-hover/60 text-muted-foreground hover:text-foreground transition-colors"
+            title="Copy"
+          >
+            {copied ? <RiCheckLine className="size-3.5" /> : <RiFileCopyLine className="size-3.5" />}
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  if (!svg) {
+    return (
+      <div data-streamdown="mermaid-block" className="group">
+        <div data-streamdown="mermaid-scroll">
+          <pre data-streamdown="mermaid-ascii">{source}</pre>
+        </div>
+        <div
+          className={cn(
+            'absolute top-1 right-2 transition-opacity',
+            copyVisibilityClass,
+          )}
+        >
+          <button
+            onClick={() => handleCopyAscii(source)}
+            className="p-1 rounded hover:bg-interactive-hover/60 text-muted-foreground hover:text-foreground transition-colors"
+            title="Copy"
+          >
+            {copied ? <RiCheckLine className="size-3.5" /> : <RiFileCopyLine className="size-3.5" />}
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div data-streamdown="mermaid-block" className="group">
+      <div data-streamdown="mermaid-scroll">
+        <div data-streamdown="mermaid" dangerouslySetInnerHTML={{ __html: svg }} />
+      </div>
+      <div
+        className={cn(
+          'absolute top-1 right-2 flex items-center gap-1 transition-opacity',
+          copyVisibilityClass,
+        )}
+      >
+        <button
+          onClick={handleCopyMermaidSource}
+          className="p-1 rounded hover:bg-interactive-hover/60 text-muted-foreground hover:text-foreground transition-colors"
+          title="Copy source"
+        >
+          {copied ? <RiCheckLine className="size-3.5" /> : <RiFileCopyLine className="size-3.5" />}
+        </button>
+        <button
+          onClick={handleDownloadSvg}
+          className="p-1 rounded hover:bg-interactive-hover/60 text-muted-foreground hover:text-foreground transition-colors"
+          title="Download SVG"
+        >
+          {downloaded ? <RiCheckLine className="size-3.5" /> : <RiDownloadLine className="size-3.5" />}
+        </button>
+      </div>
+    </div>
+  );
+};
+
 const CodeBlockWrapper: React.FC<CodeBlockWrapperProps> = ({ children, className, style, ...props }) => {
   const [copied, setCopied] = React.useState(false);
   const codeRef = React.useRef<HTMLDivElement>(null);
+  const { isMobile } = useDeviceInfo();
+  const mermaidInfo = getMermaidInfo(children);
+  const mermaidRenderingMode = useUIStore((state) => state.mermaidRenderingMode);
+  const codeChild = React.useMemo(
+    () => (
+      React.isValidElement(children)
+        ? React.cloneElement(children as React.ReactElement<Record<string, unknown>>, { 'data-block': true })
+        : children
+    ),
+    [children],
+  );
 
   const normalizedStyle = React.useMemo<React.CSSProperties | undefined>(() => {
     if (!style) return style;
@@ -396,6 +601,10 @@ const CodeBlockWrapper: React.FC<CodeBlockWrapperProps> = ({ children, className
     return next;
   }, [style]);
 
+  if (mermaidInfo.isMermaid) {
+    return <MermaidBlock source={mermaidInfo.source} mode={mermaidRenderingMode} />;
+  }
+
   const getCodeContent = (): string => {
     if (!codeRef.current) return '';
     const codeEl = codeRef.current.querySelector('code');
@@ -406,14 +615,12 @@ const CodeBlockWrapper: React.FC<CodeBlockWrapperProps> = ({ children, className
   const handleCopy = async () => {
     const code = getCodeContent();
     if (!code) return;
-    try {
-      if (!(await writeTextToClipboard(code))) {
-        throw new Error('copy failed');
-      }
+    const result = await copyTextToClipboard(code);
+    if (result.ok) {
       setCopied(true);
       setTimeout(() => setCopied(false), 2000);
-    } catch (err) {
-      console.error('Failed to copy:', err);
+    } else {
+      console.error('Failed to copy:', result.error);
     }
   };
 
@@ -424,9 +631,14 @@ const CodeBlockWrapper: React.FC<CodeBlockWrapperProps> = ({ children, className
         className={cn(className)}
         style={normalizedStyle}
       >
-        {children}
+        {codeChild}
       </pre>
-      <div className="absolute top-1 right-2 opacity-0 group-hover:opacity-100 transition-opacity">
+      <div
+        className={cn(
+          'absolute top-1 right-2 transition-opacity',
+          isMobile ? 'opacity-100' : 'opacity-0 group-hover:opacity-100',
+        )}
+      >
         <button
           onClick={handleCopy}
           className="p-1 rounded hover:bg-interactive-hover/60 text-muted-foreground hover:text-foreground transition-colors"
@@ -444,6 +656,48 @@ const streamdownComponents = {
   table: TableWrapper,
 };
 
+const streamdownPlugins = {
+  code,
+};
+
+const streamdownControls = {
+  code: false,
+  table: false,
+};
+
+type MermaidControlOptions = {
+  download: boolean;
+  copy: boolean;
+  fullscreen: boolean;
+  panZoom: boolean;
+};
+
+const extractMermaidBlocks = (markdown: string): string[] => {
+  const blocks: string[] = [];
+  const regex = /(?:^|\r?\n)(`{3,}|~{3,})mermaid[^\n\r]*\r?\n([\s\S]*?)\r?\n\1(?=\r?\n|$)/gi;
+  let match: RegExpExecArray | null = regex.exec(markdown);
+
+  while (match) {
+    const block = (match[2] ?? '').replace(/\s+$/, '');
+    blocks.push(block);
+    match = regex.exec(markdown);
+  }
+
+  return blocks;
+};
+
+const stripLeadingFrontmatter = (markdown: string): string => {
+  const frontmatterMatch = markdown.match(
+    /^(?:\uFEFF)?(---|\+\+\+)[^\S\r\n]*\r?\n[\s\S]*?\r?\n\1[^\S\r\n]*(?:\r?\n|$)/,
+  );
+
+  if (!frontmatterMatch) {
+    return markdown;
+  }
+
+  return markdown.slice(frontmatterMatch[0].length);
+};
+
 export type MarkdownVariant = 'assistant' | 'tool';
 
 interface MarkdownRendererProps {
@@ -454,7 +708,103 @@ interface MarkdownRendererProps {
   className?: string;
   isStreaming?: boolean;
   variant?: MarkdownVariant;
+  onShowPopup?: (content: ToolPopupContent) => void;
 }
+
+const MERMAID_BLOCK_SELECTOR = '[data-streamdown="mermaid-block"]';
+
+const useMermaidInlineInteractions = ({
+  containerRef,
+  mermaidBlocks,
+  onShowPopup,
+  allowWheelZoom,
+}: {
+  containerRef: React.RefObject<HTMLDivElement | null>;
+  mermaidBlocks: string[];
+  onShowPopup?: (content: ToolPopupContent) => void;
+  allowWheelZoom?: boolean;
+}) => {
+  React.useEffect(() => {
+    const container = containerRef.current;
+    if (!container) {
+      return;
+    }
+
+    const handleMermaidClick = (event: MouseEvent) => {
+      if (!onShowPopup) {
+        return;
+      }
+
+      const target = event.target;
+      if (!(target instanceof Element)) {
+        return;
+      }
+
+      if (target.closest('button, a, [role="button"]')) {
+        return;
+      }
+
+      const block = target.closest(MERMAID_BLOCK_SELECTOR);
+      if (!block) {
+        return;
+      }
+
+      const renderedBlocks = Array.from(container.querySelectorAll(MERMAID_BLOCK_SELECTOR));
+      const blockIndex = renderedBlocks.indexOf(block);
+      if (blockIndex < 0) {
+        return;
+      }
+
+      const source = mermaidBlocks[blockIndex];
+      if (!source || source.trim().length === 0) {
+        return;
+      }
+
+      const filename = `Diagram ${blockIndex + 1}`;
+      onShowPopup({
+        open: true,
+        title: filename,
+        content: '',
+        metadata: {
+          tool: 'mermaid-preview',
+          filename,
+        },
+        mermaid: {
+          url: `data:text/plain;charset=utf-8,${encodeURIComponent(source)}`,
+          source,
+          filename,
+        },
+      });
+    };
+
+    const handleInlineWheel = (event: WheelEvent) => {
+      if (allowWheelZoom) {
+        return;
+      }
+
+      const target = event.target;
+      if (!(target instanceof Element)) {
+        return;
+      }
+
+      const block = target.closest(MERMAID_BLOCK_SELECTOR);
+      if (!block) {
+        return;
+      }
+
+      // Keep regular page scroll while preventing Streamdown inline wheel-zoom handlers.
+      event.stopPropagation();
+    };
+
+    container.addEventListener('click', handleMermaidClick);
+    container.addEventListener('wheel', handleInlineWheel, { capture: true, passive: true });
+
+    return () => {
+      container.removeEventListener('click', handleMermaidClick);
+      container.removeEventListener('wheel', handleInlineWheel, true);
+    };
+  }, [allowWheelZoom, containerRef, mermaidBlocks, onShowPopup]);
+};
 
 export const MarkdownRenderer: React.FC<MarkdownRendererProps> = ({
   content,
@@ -464,26 +814,31 @@ export const MarkdownRenderer: React.FC<MarkdownRendererProps> = ({
   className,
   isStreaming = false,
   variant = 'assistant',
+  onShowPopup,
 }) => {
+  const streamdownContainerRef = React.useRef<HTMLDivElement>(null);
+  const mermaidBlocks = React.useMemo(() => extractMermaidBlocks(content), [content]);
+  useMermaidInlineInteractions({ containerRef: streamdownContainerRef, mermaidBlocks, onShowPopup });
+
   const shikiThemes = useMarkdownShikiThemes();
-  const componentKey = React.useMemo(() => {
-    const signature = part?.id ? `part-${part.id}` : `message-${messageId}`;
-    return `markdown-${signature}`;
-  }, [messageId, part?.id]);
+  const currentMermaidTheme = useCurrentMermaidTheme();
+  const componentKey = `markdown-${part?.id ? `part-${part.id}` : `message-${messageId}`}`;
 
   const streamdownClassName = variant === 'tool'
     ? 'streamdown-content streamdown-tool'
     : 'streamdown-content';
 
   const markdownContent = (
-    <div className={cn('break-words', className)}>
+    <div className={cn('break-words', className)} ref={streamdownContainerRef}>
       <Streamdown
-        mode={isStreaming ? 'streaming' : 'static'}
-        shikiTheme={shikiThemes}
-        className={streamdownClassName}
-        controls={{ code: false, table: false }}
-        components={streamdownComponents}
-      >
+         key={`streamdown-${componentKey}-${currentMermaidTheme.metadata.id}:${currentMermaidTheme.metadata.variant}`}
+         mode={isStreaming ? 'streaming' : 'static'}
+         shikiTheme={shikiThemes}
+         className={streamdownClassName}
+         controls={streamdownControls}
+         plugins={streamdownPlugins}
+         components={streamdownComponents}
+       >
         {content}
       </Streamdown>
     </div>
@@ -504,23 +859,54 @@ export const SimpleMarkdownRenderer: React.FC<{
   content: string;
   className?: string;
   variant?: MarkdownVariant;
-}> = ({ content, className, variant = 'assistant' }) => {
+  disableLinkSafety?: boolean;
+  stripFrontmatter?: boolean;
+  onShowPopup?: (content: ToolPopupContent) => void;
+  mermaidControls?: MermaidControlOptions;
+  allowMermaidWheelZoom?: boolean;
+}> = ({
+  content,
+  className,
+  variant = 'assistant',
+  disableLinkSafety,
+  stripFrontmatter = false,
+  onShowPopup,
+  allowMermaidWheelZoom = false,
+}) => {
+  const renderedContent = React.useMemo(
+    () => (stripFrontmatter ? stripLeadingFrontmatter(content) : content),
+    [content, stripFrontmatter],
+  );
+  const streamdownContainerRef = React.useRef<HTMLDivElement>(null);
+  const mermaidBlocks = React.useMemo(() => extractMermaidBlocks(renderedContent), [renderedContent]);
+  useMermaidInlineInteractions({
+    containerRef: streamdownContainerRef,
+    mermaidBlocks,
+    onShowPopup,
+    allowWheelZoom: allowMermaidWheelZoom,
+  });
+
   const shikiThemes = useMarkdownShikiThemes();
+  const currentMermaidTheme = useCurrentMermaidTheme();
 
   const streamdownClassName = variant === 'tool'
     ? 'streamdown-content streamdown-tool'
     : 'streamdown-content';
 
   return (
-    <div className={cn('break-words', className)}>
+    <div className={cn('break-words', className)} ref={streamdownContainerRef}>
       <Streamdown
+        key={`streamdown-simple-${currentMermaidTheme.metadata.id}:${currentMermaidTheme.metadata.variant}`}
         mode="static"
         shikiTheme={shikiThemes}
         className={streamdownClassName}
-        controls={{ code: false, table: false }}
+        controls={streamdownControls}
+        plugins={streamdownPlugins}
         components={streamdownComponents}
+        // @ts-expect-error Streamdown type missing linkSafety in older minor
+        linkSafety={disableLinkSafety ? { enabled: false } : undefined}
       >
-        {content}
+        {renderedContent}
       </Streamdown>
     </div>
   );

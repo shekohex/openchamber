@@ -1,13 +1,18 @@
 import React from 'react';
 import { RiFileCopyLine, RiCheckLine, RiExternalLinkLine } from '@remixicon/react';
-import { isDesktopShell, isTauriShell, writeTextToClipboard } from '@/lib/desktop';
+import { isDesktopShell, isTauriShell } from '@/lib/desktop';
 import { Input } from '@/components/ui/input';
 import { Button } from '@/components/ui/button';
 import { updateDesktopSettings } from '@/lib/persistence';
 import { buildRuntimeApiHeaders, resolveRuntimeApiEndpoint } from '@/lib/instances/runtimeApiBaseUrl';
+import { copyTextToClipboard } from '@/lib/clipboard';
 
 const INSTALL_COMMAND = 'curl -fsSL https://opencode.ai/install | bash';
 const POLL_INTERVAL_MS = 3000;
+const DOCS_URL = 'https://opencode.ai/docs';
+const WINDOWS_WSL_DOCS_URL = 'https://opencode.ai/docs/windows-wsl';
+
+type OnboardingPlatform = 'macos' | 'linux' | 'windows' | 'unknown';
 
 type OnboardingScreenProps = {
   onCliAvailable?: () => void;
@@ -39,9 +44,10 @@ const HINT_DELAY_MS = 30000;
 export function OnboardingScreen({ onCliAvailable }: OnboardingScreenProps) {
   const [copied, setCopied] = React.useState(false);
   const [showHint, setShowHint] = React.useState(false);
-  const [isDesktopApp, setIsDesktopApp] = React.useState(false);
   const [isRetrying, setIsRetrying] = React.useState(false);
   const [opencodeBinary, setOpencodeBinary] = React.useState('');
+  const [platform, setPlatform] = React.useState<OnboardingPlatform>('unknown');
+  const isDesktopApp = isDesktopShell();
 
   React.useEffect(() => {
     const timer = setTimeout(() => setShowHint(true), HINT_DELAY_MS);
@@ -49,7 +55,25 @@ export function OnboardingScreen({ onCliAvailable }: OnboardingScreenProps) {
   }, []);
 
   React.useEffect(() => {
-    setIsDesktopApp(isDesktopShell());
+    if (typeof navigator === 'undefined') {
+      setPlatform('unknown');
+      return;
+    }
+
+    const ua = navigator.userAgent || '';
+    if (/Windows/i.test(ua)) {
+      setPlatform('windows');
+      return;
+    }
+    if (/Macintosh|Mac OS X/i.test(ua)) {
+      setPlatform('macos');
+      return;
+    }
+    if (/Linux/i.test(ua)) {
+      setPlatform('linux');
+      return;
+    }
+    setPlatform('unknown');
   }, []);
 
   React.useEffect(() => {
@@ -150,14 +174,12 @@ export function OnboardingScreen({ onCliAvailable }: OnboardingScreenProps) {
   }, [opencodeBinary]);
 
   const handleCopy = React.useCallback(async () => {
-    try {
-      if (!(await writeTextToClipboard(INSTALL_COMMAND))) {
-        throw new Error('copy failed');
-      }
+    const result = await copyTextToClipboard(INSTALL_COMMAND);
+    if (result.ok) {
       setCopied(true);
       setTimeout(() => setCopied(false), 2000);
-    } catch (err) {
-      console.error('Failed to copy:', err);
+    } else {
+      console.error('Failed to copy:', result.error);
     }
   }, []);
 
@@ -174,6 +196,14 @@ export function OnboardingScreen({ onCliAvailable }: OnboardingScreenProps) {
 
     return () => clearInterval(interval);
   }, [checkCliAvailability, onCliAvailable]);
+
+  const docsUrl = platform === 'windows' ? WINDOWS_WSL_DOCS_URL : DOCS_URL;
+  const binaryPlaceholder =
+    platform === 'windows'
+      ? 'C:\\Users\\you\\AppData\\Roaming\\npm\\opencode.cmd'
+      : platform === 'linux'
+        ? '/home/you/.bun/bin/opencode'
+        : '/Users/you/.bun/bin/opencode';
 
   return (
     <div
@@ -199,6 +229,17 @@ export function OnboardingScreen({ onCliAvailable }: OnboardingScreenProps) {
           </p>
         </div>
 
+        {platform === 'windows' && (
+          <div className="mx-auto max-w-2xl rounded-lg border border-border bg-background/50 p-4 text-left">
+            <div className="text-sm text-foreground">Windows setup (WSL recommended)</div>
+            <ol className="mt-2 list-decimal space-y-1 pl-5 text-sm text-muted-foreground">
+              <li>Install WSL (if needed) with <code className="text-foreground/80">wsl --install</code> in PowerShell.</li>
+              <li>Run the install command below inside your WSL terminal.</li>
+              <li>If OpenChamber does not detect OpenCode automatically, set the binary path below.</li>
+            </ol>
+          </div>
+        )}
+
         <div className="flex justify-center">
           <div className="bg-background/60 backdrop-blur-sm border border-border rounded-lg px-5 py-3 font-mono text-sm w-fit">
             {copied ? (
@@ -213,12 +254,12 @@ export function OnboardingScreen({ onCliAvailable }: OnboardingScreenProps) {
         </div>
 
         <a
-          href="https://opencode.ai/docs"
+          href={docsUrl}
           target="_blank"
           rel="noopener noreferrer"
           className="text-sm text-muted-foreground hover:text-foreground transition-colors inline-flex items-center gap-1 justify-center"
         >
-          View documentation
+          {platform === 'windows' ? 'View Windows + WSL documentation' : 'View documentation'}
           <RiExternalLinkLine className="h-3 w-3" />
         </a>
 
@@ -244,7 +285,7 @@ export function OnboardingScreen({ onCliAvailable }: OnboardingScreenProps) {
               <Input
                 value={opencodeBinary}
                 onChange={(e) => setOpencodeBinary(e.target.value)}
-                placeholder="/Users/you/.bun/bin/opencode"
+                placeholder={binaryPlaceholder}
                 disabled={isRetrying}
                 className="flex-1 font-mono text-xs"
               />
@@ -264,24 +305,35 @@ export function OnboardingScreen({ onCliAvailable }: OnboardingScreenProps) {
                 Apply
               </Button>
             </div>
-            <div className="text-xs text-muted-foreground/70">
-              Saves to <code className="text-foreground/70">~/.config/openchamber/settings.json</code> and reloads OpenCode configuration.
-            </div>
+            <div className="text-xs text-muted-foreground/70">Saves to OpenChamber settings and reloads OpenCode configuration.</div>
           </div>
         </div>
       </div>
 
       {showHint && (
         <div className="absolute bottom-8 left-0 right-0 text-center space-y-1">
-          <p className="text-sm text-muted-foreground/70">
-            Already installed? Make sure <code className="text-foreground/70">opencode</code> is in your PATH
-          </p>
-          <p className="text-sm text-muted-foreground/70">
-            or set <code className="text-foreground/70">OPENCODE_BINARY</code> environment variable.
-          </p>
-          <p className="text-sm text-muted-foreground/70">
-            If you see <code className="text-foreground/70">env: node: No such file or directory</code> or <code className="text-foreground/70">env: bun: No such file or directory</code>, install that runtime or ensure it is on PATH.
-          </p>
+          {platform === 'windows' ? (
+            <>
+              <p className="text-sm text-muted-foreground/70">
+                On Windows, install and run OpenCode in WSL for best compatibility.
+              </p>
+              <p className="text-sm text-muted-foreground/70">
+                If detection fails, set a native path (<code className="text-foreground/70">opencode.cmd</code>/<code className="text-foreground/70">opencode.exe</code>), <code className="text-foreground/70">wsl.exe</code>, or <code className="text-foreground/70">wsl:/usr/local/bin/opencode</code>.
+              </p>
+            </>
+          ) : (
+            <>
+              <p className="text-sm text-muted-foreground/70">
+                Already installed? Make sure <code className="text-foreground/70">opencode</code> is in your PATH
+              </p>
+              <p className="text-sm text-muted-foreground/70">
+                or set <code className="text-foreground/70">OPENCODE_BINARY</code> environment variable.
+              </p>
+              <p className="text-sm text-muted-foreground/70">
+                If you see <code className="text-foreground/70">env: node: No such file or directory</code> or <code className="text-foreground/70">env: bun: No such file or directory</code>, install that runtime or ensure it is on PATH.
+              </p>
+            </>
+          )}
         </div>
       )}
     </div>

@@ -3,8 +3,21 @@ import { devtools, persist, createJSONStorage } from 'zustand/middleware';
 import type { SidebarSection } from '@/constants/sidebar';
 import { getSafeStorage } from './utils/safeStorage';
 import { SEMANTIC_TYPOGRAPHY, getTypographyVariable, type SemanticTypographyKey } from '@/lib/typography';
+import type { ShortcutCombo } from '@/lib/shortcuts';
 
 export type MainTab = 'chat' | 'plan' | 'git' | 'diff' | 'terminal' | 'files';
+export type RightSidebarTab = 'git' | 'files';
+export type ContextPanelMode = 'diff' | 'file' | 'context' | 'plan';
+export type MermaidRenderingMode = 'svg' | 'ascii';
+
+type ContextPanelDirectoryState = {
+  isOpen: boolean;
+  expanded: boolean;
+  mode: ContextPanelMode | null;
+  targetPath: string | null;
+  width: number;
+  touchedAt: number;
+};
 
 export type MainTabGuard = (nextTab: MainTab) => boolean;
 export type EventStreamStatus =
@@ -51,6 +64,71 @@ const isLegacyDefaultTemplates = (value: unknown): boolean => {
   );
 };
 
+const CONTEXT_PANEL_DEFAULT_WIDTH = 600;
+const CONTEXT_PANEL_MIN_WIDTH = 360;
+const CONTEXT_PANEL_MAX_WIDTH = 1400;
+const LEFT_SIDEBAR_MIN_WIDTH = 300;
+const RIGHT_SIDEBAR_MIN_WIDTH = 400;
+
+const normalizeDirectoryPath = (value: string): string => {
+  if (!value) return '';
+
+  const raw = value.replace(/\\/g, '/');
+  const hadUncPrefix = raw.startsWith('//');
+  let normalized = raw.replace(/\/+$/g, '');
+  normalized = normalized.replace(/\/+/g, '/');
+
+  if (hadUncPrefix && !normalized.startsWith('//')) {
+    normalized = `/${normalized}`;
+  }
+
+  if (normalized === '') {
+    return raw.startsWith('/') ? '/' : '';
+  }
+
+  return normalized;
+};
+
+const clampContextPanelWidth = (width: number): number => {
+  if (!Number.isFinite(width)) {
+    return CONTEXT_PANEL_DEFAULT_WIDTH;
+  }
+
+  return Math.min(CONTEXT_PANEL_MAX_WIDTH, Math.max(CONTEXT_PANEL_MIN_WIDTH, Math.round(width)));
+};
+
+const touchContextPanelState = (prev?: ContextPanelDirectoryState): ContextPanelDirectoryState => {
+  if (prev) {
+    return { ...prev, touchedAt: Date.now() };
+  }
+
+  return {
+    isOpen: false,
+    expanded: false,
+    mode: null,
+    targetPath: null,
+    width: CONTEXT_PANEL_DEFAULT_WIDTH,
+    touchedAt: Date.now(),
+  };
+};
+
+const clampContextPanelRoots = (
+  byDirectory: Record<string, ContextPanelDirectoryState>,
+  maxRoots: number
+): Record<string, ContextPanelDirectoryState> => {
+  const entries = Object.entries(byDirectory);
+  if (entries.length <= maxRoots) {
+    return byDirectory;
+  }
+
+  entries.sort((a, b) => (b[1]?.touchedAt ?? 0) - (a[1]?.touchedAt ?? 0));
+  const next: Record<string, ContextPanelDirectoryState> = {};
+  for (const [directory, state] of entries.slice(0, maxRoots)) {
+    next[directory] = state;
+  }
+  return next;
+};
+
 interface UIStore {
 
   theme: 'light' | 'dark' | 'system';
@@ -62,9 +140,13 @@ interface UIStore {
   isRightSidebarOpen: boolean;
   rightSidebarWidth: number;
   hasManuallyResizedRightSidebar: boolean;
+  rightSidebarTab: RightSidebarTab;
+  contextPanelByDirectory: Record<string, ContextPanelDirectoryState>;
   isBottomTerminalOpen: boolean;
+  isBottomTerminalExpanded: boolean;
   bottomTerminalHeight: number;
   hasManuallyResizedBottomTerminal: boolean;
+  isNavRailExpanded: boolean;
   isSessionSwitcherOpen: boolean;
   activeMainTab: MainTab;
   mainTabGuard: MainTabGuard | null;
@@ -82,10 +164,17 @@ interface UIStore {
   isModelSelectorOpen: boolean;
   isDeviceLoginOpen: boolean;
   sidebarSection: SidebarSection;
+
+  // Settings IA (new shell)
+  settingsPage: string;
+  settingsHasOpenedOnce: boolean;
+  settingsProjectsSelectedId: string | null;
+  settingsRemoteInstancesSelectedId: string | null;
   eventStreamStatus: EventStreamStatus;
   eventStreamHint: string | null;
   showReasoningTraces: boolean;
   showTextJustificationActivity: boolean;
+  showDeletionDialog: boolean;
   autoDeleteEnabled: boolean;
   autoDeleteAfterDays: number;
   autoDeleteLastRunAt: number | null;
@@ -99,6 +188,7 @@ interface UIStore {
   inputBarOffset: number;
 
   favoriteModels: Array<{ providerID: string; modelID: string }>;
+  hiddenModels: Array<{ providerID: string; modelID: string }>;
   recentModels: Array<{ providerID: string; modelID: string }>;
   recentAgents: string[];
   recentEfforts: Record<string, string[]>;
@@ -136,7 +226,14 @@ interface UIStore {
 
   showTerminalQuickKeysOnDesktop: boolean;
   persistChatDraft: boolean;
+  mermaidRenderingMode: MermaidRenderingMode;
+  showMobileSessionStatusBar: boolean;
   isMobileSessionStatusBarCollapsed: boolean;
+  viewPagerPage: 'left' | 'center' | 'right';
+
+  isExpandedInput: boolean;
+
+  shortcutOverrides: Record<string, ShortcutCombo>;
 
   setTheme: (theme: 'light' | 'dark' | 'system') => void;
   toggleSidebar: () => void;
@@ -145,9 +242,20 @@ interface UIStore {
   toggleRightSidebar: () => void;
   setRightSidebarOpen: (open: boolean) => void;
   setRightSidebarWidth: (width: number) => void;
+  setRightSidebarTab: (tab: RightSidebarTab) => void;
+  openContextDiff: (directory: string, filePath: string) => void;
+  openContextFile: (directory: string, filePath: string) => void;
+  openContextOverview: (directory: string) => void;
+  openContextPlan: (directory: string) => void;
+  closeContextPanel: (directory: string) => void;
+  toggleContextPanelExpanded: (directory: string) => void;
+  setContextPanelWidth: (directory: string, width: number) => void;
   toggleBottomTerminal: () => void;
   setBottomTerminalOpen: (open: boolean) => void;
+  setBottomTerminalExpanded: (expanded: boolean) => void;
   setBottomTerminalHeight: (height: number) => void;
+  setNavRailExpanded: (expanded: boolean) => void;
+  toggleNavRail: () => void;
   setSessionSwitcherOpen: (open: boolean) => void;
   setActiveMainTab: (tab: MainTab) => void;
   setMainTabGuard: (guard: MainTabGuard | null) => void;
@@ -168,9 +276,13 @@ interface UIStore {
   setDeviceLoginOpen: (open: boolean) => void;
   applyTheme: () => void;
   setSidebarSection: (section: SidebarSection) => void;
+  setSettingsPage: (slug: string) => void;
+  setSettingsProjectsSelectedId: (projectId: string | null) => void;
+  setSettingsRemoteInstancesSelectedId: (instanceId: string | null) => void;
   setEventStreamStatus: (status: EventStreamStatus, hint?: string | null) => void;
   setShowReasoningTraces: (value: boolean) => void;
   setShowTextJustificationActivity: (value: boolean) => void;
+  setShowDeletionDialog: (value: boolean) => void;
   setAutoDeleteEnabled: (value: boolean) => void;
   setAutoDeleteAfterDays: (days: number) => void;
   setAutoDeleteLastRunAt: (timestamp: number | null) => void;
@@ -186,6 +298,10 @@ interface UIStore {
   applyPadding: () => void;
   updateProportionalSidebarWidths: () => void;
   toggleFavoriteModel: (providerID: string, modelID: string) => void;
+  toggleHiddenModel: (providerID: string, modelID: string) => void;
+  isHiddenModel: (providerID: string, modelID: string) => boolean;
+  hideAllModels: (providerID: string, modelIDs: string[]) => void;
+  showAllModels: (providerID: string) => void;
   isFavoriteModel: (providerID: string, modelID: string) => boolean;
   addRecentModel: (providerID: string, modelID: string) => void;
   addRecentAgent: (agentName: string) => void;
@@ -212,9 +328,17 @@ interface UIStore {
   setSummaryLength: (value: number) => void;
   setMaxLastMessageLength: (value: number) => void;
   setPersistChatDraft: (value: boolean) => void;
+  setMermaidRenderingMode: (value: MermaidRenderingMode) => void;
+  setShowMobileSessionStatusBar: (value: boolean) => void;
   setIsMobileSessionStatusBarCollapsed: (value: boolean) => void;
+  setViewPagerPage: (page: 'left' | 'center' | 'right') => void;
+  toggleExpandedInput: () => void;
+  setExpandedInput: (value: boolean) => void;
   openMultiRunLauncher: () => void;
   openMultiRunLauncherWithPrompt: (prompt: string) => void;
+  setShortcutOverride: (actionId: string, combo: ShortcutCombo) => void;
+  clearShortcutOverride: (actionId: string) => void;
+  resetAllShortcutOverrides: () => void;
 }
 
 
@@ -227,14 +351,18 @@ export const useUIStore = create<UIStore>()(
         isMultiRunLauncherOpen: false,
         multiRunLauncherPrefillPrompt: '',
         isSidebarOpen: true,
-        sidebarWidth: 264,
+        sidebarWidth: LEFT_SIDEBAR_MIN_WIDTH,
         hasManuallyResizedLeftSidebar: false,
         isRightSidebarOpen: false,
-        rightSidebarWidth: 420,
+        rightSidebarWidth: RIGHT_SIDEBAR_MIN_WIDTH,
         hasManuallyResizedRightSidebar: false,
+        rightSidebarTab: 'git',
+        contextPanelByDirectory: {},
         isBottomTerminalOpen: false,
+        isBottomTerminalExpanded: false,
         bottomTerminalHeight: 300,
         hasManuallyResizedBottomTerminal: false,
+        isNavRailExpanded: false,
         isSessionSwitcherOpen: false,
         activeMainTab: 'chat',
         mainTabGuard: null,
@@ -252,10 +380,15 @@ export const useUIStore = create<UIStore>()(
         isModelSelectorOpen: false,
         isDeviceLoginOpen: false,
         sidebarSection: 'sessions',
+        settingsPage: 'home',
+        settingsHasOpenedOnce: false,
+        settingsProjectsSelectedId: null,
+        settingsRemoteInstancesSelectedId: null,
         eventStreamStatus: 'idle',
         eventStreamHint: null,
         showReasoningTraces: true,
         showTextJustificationActivity: false,
+        showDeletionDialog: true,
         autoDeleteEnabled: false,
         autoDeleteAfterDays: 30,
         autoDeleteLastRunAt: null,
@@ -267,6 +400,7 @@ export const useUIStore = create<UIStore>()(
         cornerRadius: 12,
         inputBarOffset: 0,
         favoriteModels: [],
+        hiddenModels: [],
         recentModels: [],
         recentAgents: [],
         recentEfforts: {},
@@ -301,7 +435,11 @@ export const useUIStore = create<UIStore>()(
 
         showTerminalQuickKeysOnDesktop: false,
         persistChatDraft: true,
+        mermaidRenderingMode: 'svg',
+        showMobileSessionStatusBar: true,
         isMobileSessionStatusBarCollapsed: false,
+        isExpandedInput: false,
+        shortcutOverrides: {},
 
         setTheme: (theme) => {
           set({ theme });
@@ -312,12 +450,10 @@ export const useUIStore = create<UIStore>()(
           set((state) => {
             const newOpen = !state.isSidebarOpen;
 
-            if (newOpen && typeof window !== 'undefined') {
-              const proportionalWidth = Math.floor(window.innerWidth * 0.2);
+            if (newOpen && !state.hasManuallyResizedLeftSidebar) {
               return {
                 isSidebarOpen: newOpen,
-                sidebarWidth: proportionalWidth,
-                hasManuallyResizedLeftSidebar: false
+                sidebarWidth: LEFT_SIDEBAR_MIN_WIDTH,
               };
             }
             return { isSidebarOpen: newOpen };
@@ -325,14 +461,23 @@ export const useUIStore = create<UIStore>()(
         },
 
         setSidebarOpen: (open) => {
-          set(() => {
-
-            if (open && typeof window !== 'undefined') {
-              const proportionalWidth = Math.floor(window.innerWidth * 0.2);
+          set((state) => {
+            if (state.isSidebarOpen === open) {
+              if (!open) {
+                return state;
+              }
+              if (!state.hasManuallyResizedLeftSidebar && state.sidebarWidth !== LEFT_SIDEBAR_MIN_WIDTH) {
+                return {
+                  isSidebarOpen: open,
+                  sidebarWidth: LEFT_SIDEBAR_MIN_WIDTH,
+                };
+              }
+              return state;
+            }
+            if (open && !state.hasManuallyResizedLeftSidebar) {
               return {
                 isSidebarOpen: open,
-                sidebarWidth: proportionalWidth,
-                hasManuallyResizedLeftSidebar: false
+                sidebarWidth: LEFT_SIDEBAR_MIN_WIDTH,
               };
             }
             return { isSidebarOpen: open };
@@ -347,12 +492,10 @@ export const useUIStore = create<UIStore>()(
           set((state) => {
             const newOpen = !state.isRightSidebarOpen;
 
-            if (newOpen && typeof window !== 'undefined') {
-              const proportionalWidth = Math.floor(window.innerWidth * 0.28);
+            if (newOpen && !state.hasManuallyResizedRightSidebar) {
               return {
                 isRightSidebarOpen: newOpen,
-                rightSidebarWidth: proportionalWidth,
-                hasManuallyResizedRightSidebar: false,
+                rightSidebarWidth: RIGHT_SIDEBAR_MIN_WIDTH,
               };
             }
             return { isRightSidebarOpen: newOpen };
@@ -360,13 +503,23 @@ export const useUIStore = create<UIStore>()(
         },
 
         setRightSidebarOpen: (open) => {
-          set(() => {
-            if (open && typeof window !== 'undefined') {
-              const proportionalWidth = Math.floor(window.innerWidth * 0.28);
+          set((state) => {
+            if (state.isRightSidebarOpen === open) {
+              if (!open) {
+                return state;
+              }
+              if (!state.hasManuallyResizedRightSidebar && state.rightSidebarWidth !== RIGHT_SIDEBAR_MIN_WIDTH) {
+                return {
+                  isRightSidebarOpen: open,
+                  rightSidebarWidth: RIGHT_SIDEBAR_MIN_WIDTH,
+                };
+              }
+              return state;
+            }
+            if (open && !state.hasManuallyResizedRightSidebar) {
               return {
                 isRightSidebarOpen: open,
-                rightSidebarWidth: proportionalWidth,
-                hasManuallyResizedRightSidebar: false,
+                rightSidebarWidth: RIGHT_SIDEBAR_MIN_WIDTH,
               };
             }
             return { isRightSidebarOpen: open };
@@ -375,6 +528,171 @@ export const useUIStore = create<UIStore>()(
 
         setRightSidebarWidth: (width) => {
           set({ rightSidebarWidth: width, hasManuallyResizedRightSidebar: true });
+        },
+
+        setRightSidebarTab: (tab) => {
+          set({ rightSidebarTab: tab });
+        },
+
+        openContextDiff: (directory, filePath) => {
+          const normalizedDirectory = normalizeDirectoryPath((directory || '').trim());
+          const normalizedFilePath = (filePath || '').trim();
+          if (!normalizedDirectory || !normalizedFilePath) {
+            return;
+          }
+
+          set((state) => {
+            const prev = state.contextPanelByDirectory[normalizedDirectory];
+            const current = touchContextPanelState(prev);
+            const byDirectory = {
+              ...state.contextPanelByDirectory,
+              [normalizedDirectory]: {
+                ...current,
+                isOpen: true,
+                mode: 'diff' as const,
+                targetPath: normalizedFilePath,
+              },
+            };
+
+            return { contextPanelByDirectory: clampContextPanelRoots(byDirectory, 20) };
+          });
+          get().setPendingDiffFile(normalizedFilePath);
+        },
+
+        openContextFile: (directory, filePath) => {
+          const normalizedDirectory = normalizeDirectoryPath((directory || '').trim());
+          const normalizedFilePath = (filePath || '').trim();
+          if (!normalizedDirectory || !normalizedFilePath) {
+            return;
+          }
+
+          set((state) => {
+            const prev = state.contextPanelByDirectory[normalizedDirectory];
+            const current = touchContextPanelState(prev);
+            const byDirectory = {
+              ...state.contextPanelByDirectory,
+              [normalizedDirectory]: {
+                ...current,
+                isOpen: true,
+                mode: 'file' as const,
+                targetPath: normalizedFilePath,
+              },
+            };
+
+            return { contextPanelByDirectory: clampContextPanelRoots(byDirectory, 20) };
+          });
+        },
+
+        openContextOverview: (directory) => {
+          const normalizedDirectory = normalizeDirectoryPath((directory || '').trim());
+          if (!normalizedDirectory) {
+            return;
+          }
+
+          set((state) => {
+            const prev = state.contextPanelByDirectory[normalizedDirectory];
+            const current = touchContextPanelState(prev);
+            const byDirectory = {
+              ...state.contextPanelByDirectory,
+              [normalizedDirectory]: {
+                ...current,
+                isOpen: true,
+                mode: 'context' as const,
+                targetPath: null,
+              },
+            };
+
+            return { contextPanelByDirectory: clampContextPanelRoots(byDirectory, 20) };
+          });
+        },
+
+        openContextPlan: (directory) => {
+          const normalizedDirectory = normalizeDirectoryPath((directory || '').trim());
+          if (!normalizedDirectory) {
+            return;
+          }
+
+          set((state) => {
+            const prev = state.contextPanelByDirectory[normalizedDirectory];
+            const current = touchContextPanelState(prev);
+            const byDirectory = {
+              ...state.contextPanelByDirectory,
+              [normalizedDirectory]: {
+                ...current,
+                isOpen: true,
+                mode: 'plan' as const,
+                targetPath: null,
+              },
+            };
+
+            return { contextPanelByDirectory: clampContextPanelRoots(byDirectory, 20) };
+          });
+        },
+
+        closeContextPanel: (directory) => {
+          const normalizedDirectory = normalizeDirectoryPath((directory || '').trim());
+          if (!normalizedDirectory) {
+            return;
+          }
+
+          set((state) => {
+            const prev = state.contextPanelByDirectory[normalizedDirectory];
+            if (!prev || !prev.isOpen) {
+              return state;
+            }
+
+            const byDirectory = {
+              ...state.contextPanelByDirectory,
+              [normalizedDirectory]: {
+                ...touchContextPanelState(prev),
+                isOpen: false,
+              },
+            };
+
+            return { contextPanelByDirectory: clampContextPanelRoots(byDirectory, 20) };
+          });
+        },
+
+        toggleContextPanelExpanded: (directory) => {
+          const normalizedDirectory = normalizeDirectoryPath((directory || '').trim());
+          if (!normalizedDirectory) {
+            return;
+          }
+
+          set((state) => {
+            const prev = state.contextPanelByDirectory[normalizedDirectory];
+            const current = touchContextPanelState(prev);
+            const byDirectory = {
+              ...state.contextPanelByDirectory,
+              [normalizedDirectory]: {
+                ...current,
+                expanded: !current.expanded,
+              },
+            };
+
+            return { contextPanelByDirectory: clampContextPanelRoots(byDirectory, 20) };
+          });
+        },
+
+        setContextPanelWidth: (directory, width) => {
+          const normalizedDirectory = normalizeDirectoryPath((directory || '').trim());
+          if (!normalizedDirectory) {
+            return;
+          }
+
+          set((state) => {
+            const prev = state.contextPanelByDirectory[normalizedDirectory];
+            const current = touchContextPanelState(prev);
+            const byDirectory = {
+              ...state.contextPanelByDirectory,
+              [normalizedDirectory]: {
+                ...current,
+                width: clampContextPanelWidth(width),
+              },
+            };
+
+            return { contextPanelByDirectory: clampContextPanelRoots(byDirectory, 20) };
+          });
         },
 
         toggleBottomTerminal: () => {
@@ -395,7 +713,25 @@ export const useUIStore = create<UIStore>()(
         },
 
         setBottomTerminalOpen: (open) => {
-          set(() => {
+          set((state) => {
+            if (state.isBottomTerminalOpen === open) {
+              if (!open) {
+                return state;
+              }
+              if (!state.hasManuallyResizedBottomTerminal && typeof window !== 'undefined') {
+                const proportionalHeight = Math.floor(window.innerHeight * 0.32);
+                if (state.bottomTerminalHeight === proportionalHeight && state.hasManuallyResizedBottomTerminal === false) {
+                  return state;
+                }
+                return {
+                  isBottomTerminalOpen: open,
+                  bottomTerminalHeight: proportionalHeight,
+                  hasManuallyResizedBottomTerminal: false,
+                };
+              }
+              return state;
+            }
+
             if (open && typeof window !== 'undefined') {
               const proportionalHeight = Math.floor(window.innerHeight * 0.32);
               return {
@@ -409,8 +745,19 @@ export const useUIStore = create<UIStore>()(
           });
         },
 
+        setBottomTerminalExpanded: (expanded) => {
+          set({ isBottomTerminalExpanded: expanded });
+        },
+
         setBottomTerminalHeight: (height) => {
           set({ bottomTerminalHeight: height, hasManuallyResizedBottomTerminal: true });
+        },
+
+        setNavRailExpanded: (expanded) => {
+          set({ isNavRailExpanded: expanded });
+        },
+        toggleNavRail: () => {
+          set({ isNavRailExpanded: !get().isNavRailExpanded });
         },
 
         setSessionSwitcherOpen: (open) => {
@@ -429,36 +776,7 @@ export const useUIStore = create<UIStore>()(
           if (guard && !guard(tab)) {
             return;
           }
-          const state = get();
-          const currentTab = state.activeMainTab;
-          const fullscreenTabs: MainTab[] = ['files', 'diff'];
-          const isEnteringFullscreen = fullscreenTabs.includes(tab) && !fullscreenTabs.includes(currentTab);
-          const isLeavingFullscreen = !fullscreenTabs.includes(tab) && fullscreenTabs.includes(currentTab);
-
-          if (isEnteringFullscreen) {
-            // Save current sidebar state and close it
-            set({
-              activeMainTab: tab,
-              sidebarOpenBeforeFullscreenTab: state.isSidebarOpen,
-              isSidebarOpen: false,
-            });
-          } else if (isLeavingFullscreen) {
-            // Restore sidebar state if it was open before
-            const shouldRestore = state.sidebarOpenBeforeFullscreenTab === true;
-            set({
-              activeMainTab: tab,
-              sidebarOpenBeforeFullscreenTab: null,
-              ...(shouldRestore && typeof window !== 'undefined'
-                ? {
-                    isSidebarOpen: true,
-                    sidebarWidth: Math.floor(window.innerWidth * 0.2),
-                    hasManuallyResizedLeftSidebar: false,
-                  }
-                : {}),
-            });
-          } else {
-            set({ activeMainTab: tab });
-          }
+          set({ activeMainTab: tab });
         },
 
         setPendingDiffFile: (filePath) => {
@@ -470,21 +788,7 @@ export const useUIStore = create<UIStore>()(
           if (guard && !guard('diff')) {
             return;
           }
-          const state = get();
-          const currentTab = state.activeMainTab;
-          const fullscreenTabs: MainTab[] = ['files', 'diff'];
-          const isEnteringFullscreen = !fullscreenTabs.includes(currentTab);
-
-          if (isEnteringFullscreen) {
-            set({
-              pendingDiffFile: filePath,
-              activeMainTab: 'diff',
-              sidebarOpenBeforeFullscreenTab: state.isSidebarOpen,
-              isSidebarOpen: false,
-            });
-          } else {
-            set({ pendingDiffFile: filePath, activeMainTab: 'diff' });
-          }
+          set({ pendingDiffFile: filePath, activeMainTab: 'diff' });
         },
 
         consumePendingDiffFile: () => {
@@ -532,7 +836,15 @@ export const useUIStore = create<UIStore>()(
         },
 
         setSettingsDialogOpen: (open) => {
-          set({ isSettingsDialogOpen: open });
+          set((state) => {
+            if (!open) {
+              return { isSettingsDialogOpen: false };
+            }
+            if (state.settingsHasOpenedOnce) {
+              return { isSettingsDialogOpen: true };
+            }
+            return { isSettingsDialogOpen: true, settingsHasOpenedOnce: true };
+          });
         },
 
         setModelSelectorOpen: (open) => {
@@ -545,6 +857,18 @@ export const useUIStore = create<UIStore>()(
 
         setSidebarSection: (section) => {
           set({ sidebarSection: section });
+        },
+
+        setSettingsPage: (slug) => {
+          set({ settingsPage: slug });
+        },
+
+        setSettingsProjectsSelectedId: (projectId) => {
+          set({ settingsProjectsSelectedId: projectId });
+        },
+
+        setSettingsRemoteInstancesSelectedId: (instanceId) => {
+          set({ settingsRemoteInstancesSelectedId: instanceId });
         },
 
         setEventStreamStatus: (status, hint) => {
@@ -560,6 +884,10 @@ export const useUIStore = create<UIStore>()(
 
         setShowTextJustificationActivity: (value) => {
           set({ showTextJustificationActivity: value });
+        },
+
+        setShowDeletionDialog: (value) => {
+          set({ showDeletionDialog: value });
         },
 
         setAutoDeleteEnabled: (value) => {
@@ -716,6 +1044,49 @@ export const useUIStore = create<UIStore>()(
           });
         },
 
+        toggleHiddenModel: (providerID, modelID) => {
+          set((state) => {
+            const exists = state.hiddenModels.some(
+              (item) => item.providerID === providerID && item.modelID === modelID
+            );
+
+            if (exists) {
+              return {
+                hiddenModels: state.hiddenModels.filter(
+                  (item) => !(item.providerID === providerID && item.modelID === modelID)
+                ),
+              };
+            }
+
+            return {
+              hiddenModels: [{ providerID, modelID }, ...state.hiddenModels],
+            };
+          });
+        },
+
+        isHiddenModel: (providerID, modelID) => {
+          const { hiddenModels } = get();
+          return hiddenModels.some(
+            (item) => item.providerID === providerID && item.modelID === modelID
+          );
+        },
+
+        hideAllModels: (providerID, modelIDs) => {
+          set((state) => {
+            const current = state.hiddenModels.filter((item) => item.providerID !== providerID);
+            const additions = modelIDs
+              .filter((modelID) => typeof modelID === 'string' && modelID.length > 0)
+              .map((modelID) => ({ providerID, modelID }));
+            return { hiddenModels: [...additions, ...current] };
+          });
+        },
+
+        showAllModels: (providerID) => {
+          set((state) => ({
+            hiddenModels: state.hiddenModels.filter((item) => item.providerID !== providerID),
+          }));
+        },
+
         isFavoriteModel: (providerID, modelID) => {
           const { favoriteModels } = get();
           return favoriteModels.some(
@@ -782,14 +1153,6 @@ export const useUIStore = create<UIStore>()(
 
           set((state) => {
             const updates: Partial<UIStore> = {};
-
-            if (state.isSidebarOpen && !state.hasManuallyResizedLeftSidebar) {
-              updates.sidebarWidth = Math.floor(window.innerWidth * 0.2);
-            }
-
-            if (state.isRightSidebarOpen && !state.hasManuallyResizedRightSidebar) {
-              updates.rightSidebarWidth = Math.floor(window.innerWidth * 0.28);
-            }
 
             if (state.isBottomTerminalOpen && !state.hasManuallyResizedBottomTerminal) {
               updates.bottomTerminalHeight = Math.floor(window.innerHeight * 0.32);
@@ -879,14 +1242,60 @@ export const useUIStore = create<UIStore>()(
         setPersistChatDraft: (value) => {
           set({ persistChatDraft: value });
         },
+        setMermaidRenderingMode: (value) => {
+          set({ mermaidRenderingMode: value });
+        },
+        setShowMobileSessionStatusBar: (value) => {
+          set({ showMobileSessionStatusBar: value });
+        },
         setIsMobileSessionStatusBarCollapsed: (value) => {
           set({ isMobileSessionStatusBarCollapsed: value });
+        },
+        viewPagerPage: 'center',
+        setViewPagerPage: (page: 'left' | 'center' | 'right') => {
+          set({ viewPagerPage: page });
+          if (page === 'left') {
+            set({ isSessionSwitcherOpen: true, isRightSidebarOpen: false });
+          } else if (page === 'right') {
+            set({ isRightSidebarOpen: true, isSessionSwitcherOpen: false });
+          } else {
+            set({ isSessionSwitcherOpen: false, isRightSidebarOpen: false });
+          }
+        },
+
+        setShortcutOverride: (actionId, combo) => {
+          set((state) => ({
+            shortcutOverrides: {
+              ...state.shortcutOverrides,
+              [actionId]: combo,
+            },
+          }));
+        },
+
+        clearShortcutOverride: (actionId) => {
+          set((state) => {
+            const rest = { ...state.shortcutOverrides };
+            delete rest[actionId];
+            return { shortcutOverrides: rest };
+          });
+        },
+
+        resetAllShortcutOverrides: () => {
+          set({ shortcutOverrides: {} });
+        },
+
+        toggleExpandedInput: () => {
+          set((state) => ({ isExpandedInput: !state.isExpandedInput }));
+        },
+
+        setExpandedInput: (value) => {
+          set({ isExpandedInput: value });
         },
       }),
       {
         name: 'ui-store',
         storage: createJSONStorage(() => getSafeStorage()),
-        version: 3,
+        version: 5,
         migrate: (persistedState, version) => {
           if (!persistedState || typeof persistedState !== 'object') {
             return persistedState;
@@ -926,6 +1335,29 @@ export const useUIStore = create<UIStore>()(
             delete state.memoryLimitActiveSession;
           }
 
+          if (typeof state.rightSidebarTab !== 'string' || (state.rightSidebarTab !== 'git' && state.rightSidebarTab !== 'files')) {
+            state.rightSidebarTab = 'git';
+          }
+
+          if (!state.contextPanelByDirectory || typeof state.contextPanelByDirectory !== 'object') {
+            state.contextPanelByDirectory = {};
+          }
+
+          if (version < 5) {
+            if (!state.shortcutOverrides || typeof state.shortcutOverrides !== 'object') {
+              state.shortcutOverrides = {};
+            } else {
+              const overrides = state.shortcutOverrides as Record<string, unknown>;
+              const cleaned: Record<string, string> = {};
+              for (const [key, value] of Object.entries(overrides)) {
+                if (typeof key === 'string' && typeof value === 'string') {
+                  cleaned[key] = value;
+                }
+              }
+              state.shortcutOverrides = cleaned;
+            }
+          }
+
           return state;
         },
         partialize: (state) => ({
@@ -934,15 +1366,24 @@ export const useUIStore = create<UIStore>()(
           sidebarWidth: state.sidebarWidth,
           isRightSidebarOpen: state.isRightSidebarOpen,
           rightSidebarWidth: state.rightSidebarWidth,
+          rightSidebarTab: state.rightSidebarTab,
+          contextPanelByDirectory: state.contextPanelByDirectory,
           isBottomTerminalOpen: state.isBottomTerminalOpen,
+          isBottomTerminalExpanded: state.isBottomTerminalExpanded,
           bottomTerminalHeight: state.bottomTerminalHeight,
+          isNavRailExpanded: state.isNavRailExpanded,
           isSessionSwitcherOpen: state.isSessionSwitcherOpen,
           activeMainTab: state.activeMainTab,
           sidebarSection: state.sidebarSection,
+          settingsPage: state.settingsPage,
+          settingsHasOpenedOnce: state.settingsHasOpenedOnce,
+          settingsProjectsSelectedId: state.settingsProjectsSelectedId,
+          settingsRemoteInstancesSelectedId: state.settingsRemoteInstancesSelectedId,
           isSessionCreateDialogOpen: state.isSessionCreateDialogOpen,
           // Note: isSettingsDialogOpen intentionally NOT persisted
           showReasoningTraces: state.showReasoningTraces,
           showTextJustificationActivity: state.showTextJustificationActivity,
+          showDeletionDialog: state.showDeletionDialog,
           autoDeleteEnabled: state.autoDeleteEnabled,
           autoDeleteAfterDays: state.autoDeleteAfterDays,
           autoDeleteLastRunAt: state.autoDeleteLastRunAt,
@@ -953,6 +1394,7 @@ export const useUIStore = create<UIStore>()(
           padding: state.padding,
           cornerRadius: state.cornerRadius,
           favoriteModels: state.favoriteModels,
+          hiddenModels: state.hiddenModels,
           recentModels: state.recentModels,
           recentAgents: state.recentAgents,
           recentEfforts: state.recentEfforts,
@@ -974,7 +1416,10 @@ export const useUIStore = create<UIStore>()(
           summaryLength: state.summaryLength,
           maxLastMessageLength: state.maxLastMessageLength,
           persistChatDraft: state.persistChatDraft,
+          mermaidRenderingMode: state.mermaidRenderingMode,
+          showMobileSessionStatusBar: state.showMobileSessionStatusBar,
           isMobileSessionStatusBarCollapsed: state.isMobileSessionStatusBarCollapsed,
+          shortcutOverrides: state.shortcutOverrides,
         })
       }
     ),

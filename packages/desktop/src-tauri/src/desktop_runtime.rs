@@ -1,15 +1,14 @@
 use anyhow::{anyhow, Result};
 use base64::{engine::general_purpose, Engine as _};
 use serde::{Deserialize, Serialize};
-use std::{
-    net::TcpListener,
-    process::Command,
-    sync::Mutex,
-    time::Duration,
-};
-use std::{collections::{HashMap, HashSet}, fs, path::{Path, PathBuf}};
 use std::env;
 use std::time::{SystemTime, UNIX_EPOCH};
+use std::{
+    collections::{HashMap, HashSet},
+    fs,
+    path::{Path, PathBuf},
+};
+use std::{net::TcpListener, process::Command, sync::Mutex, time::Duration};
 use tauri::{Emitter, Manager, WebviewUrl, WebviewWindowBuilder};
 
 fn eval_in_main_window<R: tauri::Runtime>(app: &tauri::AppHandle<R>, script: &str) {
@@ -107,8 +106,16 @@ fn build_macos_menu<R: tauri::Runtime>(
         .map(|state| *state.auto_worktree.lock().expect("menu state mutex"))
         .unwrap_or(false);
 
-    let new_session_shortcut = if auto_worktree { "Cmd+Shift+N" } else { "Cmd+N" };
-    let new_worktree_shortcut = if auto_worktree { "Cmd+N" } else { "Cmd+Shift+N" };
+    let new_session_shortcut = if auto_worktree {
+        "Cmd+Shift+N"
+    } else {
+        "Cmd+N"
+    };
+    let new_worktree_shortcut = if auto_worktree {
+        "Cmd+N"
+    } else {
+        "Cmd+Shift+N"
+    };
 
     let about = MenuItem::with_id(
         app,
@@ -164,8 +171,13 @@ fn build_macos_menu<R: tauri::Runtime>(
         MenuItem::with_id(app, MENU_ITEM_OPEN_GIT_TAB_ID, "Git", true, Some("Cmd+G"))?;
     let open_diff_tab =
         MenuItem::with_id(app, MENU_ITEM_OPEN_DIFF_TAB_ID, "Diff", true, Some("Cmd+E"))?;
-    let open_files_tab =
-        MenuItem::with_id(app, MENU_ITEM_OPEN_FILES_TAB_ID, "Files", true, None::<&str>)?;
+    let open_files_tab = MenuItem::with_id(
+        app,
+        MENU_ITEM_OPEN_FILES_TAB_ID,
+        "Files",
+        true,
+        None::<&str>,
+    )?;
     let open_terminal_tab = MenuItem::with_id(
         app,
         MENU_ITEM_OPEN_TERMINAL_TAB_ID,
@@ -174,12 +186,27 @@ fn build_macos_menu<R: tauri::Runtime>(
         Some("Cmd+T"),
     )?;
 
-    let theme_light =
-        MenuItem::with_id(app, MENU_ITEM_THEME_LIGHT_ID, "Light Theme", true, None::<&str>)?;
-    let theme_dark =
-        MenuItem::with_id(app, MENU_ITEM_THEME_DARK_ID, "Dark Theme", true, None::<&str>)?;
-    let theme_system =
-        MenuItem::with_id(app, MENU_ITEM_THEME_SYSTEM_ID, "System Theme", true, None::<&str>)?;
+    let theme_light = MenuItem::with_id(
+        app,
+        MENU_ITEM_THEME_LIGHT_ID,
+        "Light Theme",
+        true,
+        None::<&str>,
+    )?;
+    let theme_dark = MenuItem::with_id(
+        app,
+        MENU_ITEM_THEME_DARK_ID,
+        "Dark Theme",
+        true,
+        None::<&str>,
+    )?;
+    let theme_system = MenuItem::with_id(
+        app,
+        MENU_ITEM_THEME_SYSTEM_ID,
+        "System Theme",
+        true,
+        None::<&str>,
+    )?;
 
     let toggle_sidebar = MenuItem::with_id(
         app,
@@ -213,8 +240,13 @@ fn build_macos_menu<R: tauri::Runtime>(
         Some("Cmd+Shift+L"),
     )?;
 
-    let report_bug =
-        MenuItem::with_id(app, MENU_ITEM_REPORT_BUG_ID, "Report a Bug", true, None::<&str>)?;
+    let report_bug = MenuItem::with_id(
+        app,
+        MENU_ITEM_REPORT_BUG_ID,
+        "Report a Bug",
+        true,
+        None::<&str>,
+    )?;
     let request_feature = MenuItem::with_id(
         app,
         MENU_ITEM_REQUEST_FEATURE_ID,
@@ -222,11 +254,20 @@ fn build_macos_menu<R: tauri::Runtime>(
         true,
         None::<&str>,
     )?;
-    let join_discord =
-        MenuItem::with_id(app, MENU_ITEM_JOIN_DISCORD_ID, "Join Discord", true, None::<&str>)?;
+    let join_discord = MenuItem::with_id(
+        app,
+        MENU_ITEM_JOIN_DISCORD_ID,
+        "Join Discord",
+        true,
+        None::<&str>,
+    )?;
 
-    let theme_submenu =
-        Submenu::with_items(app, "Theme", true, &[&theme_light, &theme_dark, &theme_system])?;
+    let theme_submenu = Submenu::with_items(
+        app,
+        "Theme",
+        true,
+        &[&theme_light, &theme_dark, &theme_system],
+    )?;
 
     let window_menu = Submenu::with_id_and_items(
         app,
@@ -377,12 +418,16 @@ fn desktop_open_path(path: String, app: Option<String>) -> Result<(), String> {
     #[cfg(target_os = "macos")]
     {
         let mut command = Command::new("open");
-        if let Some(app_name) = app.as_ref().map(|value| value.trim()).filter(|value| !value.is_empty()) {
+        if let Some(app_name) = app
+            .as_ref()
+            .map(|value| value.trim())
+            .filter(|value| !value.is_empty())
+        {
             command.arg("-a").arg(app_name);
         }
         command.arg(trimmed);
         command.spawn().map_err(|err| err.to_string())?;
-        return Ok(());
+        Ok(())
     }
 
     #[cfg(not(target_os = "macos"))]
@@ -439,7 +484,7 @@ fn desktop_filter_installed_apps(apps: Vec<String>) -> Result<Vec<String>, Strin
             }
         }
 
-        return Ok(installed);
+        Ok(installed)
     }
 
     #[cfg(not(target_os = "macos"))]
@@ -494,9 +539,11 @@ fn desktop_get_installed_apps(
             let cached_icon_map: HashMap<String, String> = HashMap::new();
             tauri::async_runtime::spawn_blocking(move || {
                 log::info!("[open-in] scan start: {} candidates", app_names.len());
-                let refreshed = build_installed_apps(&app_names, &cached_icon_map, force_icon_refresh);
+                let refreshed =
+                    build_installed_apps(&app_names, &cached_icon_map, force_icon_refresh);
                 if log::log_enabled!(log::Level::Info) {
-                    let names: Vec<String> = refreshed.iter().map(|entry| entry.name.clone()).collect();
+                    let names: Vec<String> =
+                        refreshed.iter().map(|entry| entry.name.clone()).collect();
                     log::info!("[open-in] scan apps: {:?}", names);
                 }
                 log::info!("[open-in] scan done: {} installed", refreshed.len());
@@ -519,9 +566,11 @@ fn desktop_get_installed_apps(
             let cached_icon_map: HashMap<String, String> = HashMap::new();
             tauri::async_runtime::spawn_blocking(move || {
                 log::info!("[open-in] scan start: {} candidates", app_names.len());
-                let refreshed = build_installed_apps(&app_names, &cached_icon_map, force_icon_refresh);
+                let refreshed =
+                    build_installed_apps(&app_names, &cached_icon_map, force_icon_refresh);
                 if log::log_enabled!(log::Level::Info) {
-                    let names: Vec<String> = refreshed.iter().map(|entry| entry.name.clone()).collect();
+                    let names: Vec<String> =
+                        refreshed.iter().map(|entry| entry.name.clone()).collect();
                     log::info!("[open-in] scan apps: {:?}", names);
                 }
                 log::info!("[open-in] scan done: {} installed", refreshed.len());
@@ -538,11 +587,11 @@ fn desktop_get_installed_apps(
             });
         }
 
-        return Ok(InstalledAppsResponse {
+        Ok(InstalledAppsResponse {
             apps: cached_apps,
             has_cache,
             is_cache_stale,
-        });
+        })
     }
 
     #[cfg(not(target_os = "macos"))]
@@ -588,7 +637,7 @@ fn desktop_fetch_app_icons(apps: Vec<String>) -> Result<Vec<AppIconPayload>, Str
             });
         }
 
-        return Ok(results);
+        Ok(results)
     }
 
     #[cfg(not(target_os = "macos"))]
@@ -630,7 +679,10 @@ fn resolve_app_bundle_path(app_name: &str) -> Option<PathBuf> {
         }
     }
 
-    if let Ok(output) = Command::new("mdfind").args(["-name", &bundle_name]).output() {
+    if let Ok(output) = Command::new("mdfind")
+        .args(["-name", &bundle_name])
+        .output()
+    {
         if output.status.success() {
             let stdout = String::from_utf8_lossy(&output.stdout);
             for line in stdout.lines() {
@@ -651,9 +703,10 @@ fn resolve_app_bundle_path(app_name: &str) -> Option<PathBuf> {
 
 #[cfg(target_os = "macos")]
 fn installed_apps_cache_path() -> PathBuf {
-    let home = env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("/"));
-    home
-        .join(".config")
+    let home = env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/"));
+    home.join(".config")
         .join("openchamber")
         .join(INSTALLED_APPS_CACHE_FILE)
 }
@@ -692,10 +745,10 @@ fn build_installed_apps(
             let icon_data_url = if force_icon_refresh {
                 resolve_app_icon_path(&app_path).and_then(|icon| icon_to_data_url(&icon, trimmed))
             } else {
-                cached_icon_map
-                    .get(trimmed)
-                    .cloned()
-                    .or_else(|| resolve_app_icon_path(&app_path).and_then(|icon| icon_to_data_url(&icon, trimmed)))
+                cached_icon_map.get(trimmed).cloned().or_else(|| {
+                    resolve_app_icon_path(&app_path)
+                        .and_then(|icon| icon_to_data_url(&icon, trimmed))
+                })
             };
             results.push(InstalledAppInfo {
                 name: trimmed.to_string(),
@@ -723,17 +776,19 @@ fn resolve_app_icon_path(app_path: &Path) -> Option<PathBuf> {
     }
 
     if let Some(icon_file) = read_bundle_icon_file(app_path) {
-        let icon_path = app_path
-            .join("Contents")
-            .join("Resources")
-            .join(&icon_file);
+        let icon_path = app_path.join("Contents").join("Resources").join(&icon_file);
         if icon_path.exists() {
             return Some(icon_path);
         }
     }
 
     if let Ok(output) = Command::new("mdls")
-        .args(["-name", "kMDItemIconFile", "-raw", &app_path.to_string_lossy()])
+        .args([
+            "-name",
+            "kMDItemIconFile",
+            "-raw",
+            &app_path.to_string_lossy(),
+        ])
         .output()
     {
         if output.status.success() {
@@ -745,10 +800,7 @@ fn resolve_app_icon_path(app_path: &Path) -> Option<PathBuf> {
                 } else {
                     format!("{icon_name}.icns")
                 };
-                let icon_path = app_path
-                    .join("Contents")
-                    .join("Resources")
-                    .join(icon_file);
+                let icon_path = app_path.join("Contents").join("Resources").join(icon_file);
                 if icon_path.exists() {
                     return Some(icon_path);
                 }
@@ -865,7 +917,10 @@ fn is_app_bundle_installed(bundle_name: &str) -> bool {
     let system_app_path = format!("/System/Applications/{bundle_name}");
     let utilities_path = format!("/System/Applications/Utilities/{bundle_name}");
 
-    if Path::new(&app_path).exists() || Path::new(&system_app_path).exists() || Path::new(&utilities_path).exists() {
+    if Path::new(&app_path).exists()
+        || Path::new(&system_app_path).exists()
+        || Path::new(&utilities_path).exists()
+    {
         return true;
     }
 
@@ -973,7 +1028,13 @@ fn read_desktop_local_port_from_disk() -> Option<u16> {
         .as_ref()
         .and_then(|v| v.get("desktopLocalPort"))
         .and_then(|v| v.as_u64())
-        .and_then(|v| if v > 0 && v <= u16::MAX as u64 { Some(v as u16) } else { None })
+        .and_then(|v| {
+            if v > 0 && v <= u16::MAX as u64 {
+                Some(v as u16)
+            } else {
+                None
+            }
+        })
 }
 
 fn write_desktop_local_port_to_disk(port: u16) -> Result<()> {
@@ -996,7 +1057,6 @@ fn write_desktop_local_port_to_disk(port: u16) -> Result<()> {
     fs::write(&path, serde_json::to_string_pretty(&root)?)?;
     Ok(())
 }
-
 
 fn read_desktop_hosts_config_from_disk() -> DesktopHostsConfig {
     let path = settings_file_path();
@@ -1101,7 +1161,6 @@ fn desktop_hosts_set(config: DesktopHostsConfig) -> Result<(), String> {
     write_desktop_hosts_config_to_disk(&config).map_err(|err| err.to_string())
 }
 
-
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct HostProbeResult {
@@ -1185,7 +1244,8 @@ fn is_nonempty_string(value: &str) -> bool {
     !value.trim().is_empty()
 }
 
-const CHANGELOG_URL: &str = "https://raw.githubusercontent.com/btriapitsyn/openchamber/main/CHANGELOG.md";
+const CHANGELOG_URL: &str =
+    "https://raw.githubusercontent.com/btriapitsyn/openchamber/main/CHANGELOG.md";
 
 fn parse_semver_num(value: &str) -> Option<u32> {
     let trimmed = value.trim().trim_start_matches('v');
@@ -1252,7 +1312,10 @@ async fn fetch_changelog_notes(from_version: &str, to_version: &str) -> Option<S
     let mut relevant: Vec<String> = Vec::new();
     for idx in 0..markers.len() {
         let (start, ver_num) = markers[idx];
-        let end = markers.get(idx + 1).map(|m| m.0).unwrap_or_else(|| changelog.len());
+        let end = markers
+            .get(idx + 1)
+            .map(|m| m.0)
+            .unwrap_or_else(|| changelog.len());
         let Some(ver_num) = ver_num else {
             continue;
         };
@@ -1406,8 +1469,15 @@ async fn spawn_local_server(app: &tauri::AppHandle) -> Result<String> {
         }
 
         let mut candidate = value.to_string();
-        if fs::metadata(&candidate).map(|m| m.is_dir()).unwrap_or(false) {
-            let bin_name = if cfg!(windows) { "opencode.exe" } else { "opencode" };
+        if fs::metadata(&candidate)
+            .map(|m| m.is_dir())
+            .unwrap_or(false)
+        {
+            let bin_name = if cfg!(windows) {
+                "opencode.exe"
+            } else {
+                "opencode"
+            };
             candidate = PathBuf::from(candidate)
                 .join(bin_name)
                 .to_string_lossy()
@@ -1464,13 +1534,13 @@ async fn spawn_local_server(app: &tauri::AppHandle) -> Result<String> {
     push_unique("/usr/sbin".to_string());
     push_unique("/sbin".to_string());
 
-        if let Some(home) = resolved_home_dir.as_deref() {
-            // OpenCode installer default.
-            push_unique(format!("{home}/.opencode/bin"));
-            push_unique(format!("{home}/.local/bin"));
-            push_unique(format!("{home}/.bun/bin"));
-            push_unique(format!("{home}/.cargo/bin"));
-            push_unique(format!("{home}/bin"));
+    if let Some(home) = resolved_home_dir.as_deref() {
+        // OpenCode installer default.
+        push_unique(format!("{home}/.opencode/bin"));
+        push_unique(format!("{home}/.local/bin"));
+        push_unique(format!("{home}/.bun/bin"));
+        push_unique(format!("{home}/.cargo/bin"));
+        push_unique(format!("{home}/bin"));
     }
 
     if let Ok(existing) = env::var("PATH") {
@@ -1740,7 +1810,8 @@ fn desktop_restart(app: tauri::AppHandle) {
 fn create_main_window(app: &tauri::AppHandle, url: &str, local_origin: &str) -> Result<()> {
     let parsed = url::Url::parse(url).map_err(|err| anyhow!("Invalid URL: {err}"))?;
 
-    let home = std::env::var(if cfg!(windows) { "USERPROFILE" } else { "HOME" }).unwrap_or_default();
+    let home =
+        std::env::var(if cfg!(windows) { "USERPROFILE" } else { "HOME" }).unwrap_or_default();
     #[cfg(target_os = "macos")]
     fn macos_major_version() -> Option<u32> {
         fn cmd_stdout(cmd: &str, args: &[&str]) -> Option<String> {
@@ -1753,11 +1824,16 @@ fn create_main_window(app: &tauri::AppHandle, url: &str, local_origin: &str) -> 
 
         // Use marketing version (sw_vers), but map legacy 10.x to minor (10.15 -> 15).
         // This matches WebKit UA fallback logic in the UI.
-        if let Some(raw) = cmd_stdout("/usr/bin/sw_vers", &["-productVersion"]).or_else(|| cmd_stdout("sw_vers", &["-productVersion"])) {
+        if let Some(raw) = cmd_stdout("/usr/bin/sw_vers", &["-productVersion"])
+            .or_else(|| cmd_stdout("sw_vers", &["-productVersion"]))
+        {
             let raw = raw.trim();
             let mut parts = raw.split('.');
             let major = parts.next().and_then(|v| v.parse::<u32>().ok())?;
-            let minor = parts.next().and_then(|v| v.parse::<u32>().ok()).unwrap_or(0);
+            let minor = parts
+                .next()
+                .and_then(|v| v.parse::<u32>().ok())
+                .unwrap_or(0);
             return Some(if major == 10 { minor } else { major });
         }
 
@@ -1788,7 +1864,7 @@ fn create_main_window(app: &tauri::AppHandle, url: &str, local_origin: &str) -> 
     let local_json = serde_json::to_string(local_origin).unwrap_or_else(|_| "\"\"".into());
 
     let mut init_script = format!(
-        "(function(){{try{{window.__OPENCHAMBER_HOME__={home_json};window.__OPENCHAMBER_MACOS_MAJOR__={macos_major};window.__OPENCHAMBER_LOCAL_ORIGIN__={local_json};}}catch(_e){{}}}})();"
+        "(function(){{try{{window.__OPENCHAMBER_HOME__={home_json};window.__OPENCHAMBER_MACOS_MAJOR__={macos_major};window.__OPENCHAMBER_LOCAL_ORIGIN__={local_json};window.__OPENCHAMBER_RUNTIME_PLATFORM__='desktop';}}catch(_e){{}}}})();"
     );
 
     // Cleanup: older builds injected a native-ish Instance switcher button into pages.
@@ -1808,15 +1884,17 @@ fn create_main_window(app: &tauri::AppHandle, url: &str, local_origin: &str) -> 
         .inner_size(1280.0, 800.0)
         .decorations(true)
         .visible(false)
-        .initialization_script(&init_script)
-        ;
+        .initialization_script(&init_script);
 
     #[cfg(target_os = "macos")]
     {
         builder = builder
             .hidden_title(true)
             .title_bar_style(tauri::TitleBarStyle::Overlay)
-            .traffic_light_position(tauri::Position::Logical(tauri::LogicalPosition { x: 17.0, y: 26.0 }));
+            .traffic_light_position(tauri::Position::Logical(tauri::LogicalPosition {
+                x: 17.0,
+                y: 26.0,
+            }));
     }
 
     let window = builder.build()?;
@@ -1847,7 +1925,15 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_notification::init())
-        .plugin(tauri_plugin_window_state::Builder::default().build())
+        .plugin(
+            tauri_plugin_window_state::Builder::new()
+                .with_state_flags(
+                    tauri_plugin_window_state::StateFlags::all()
+                        - tauri_plugin_window_state::StateFlags::DECORATIONS
+                        - tauri_plugin_window_state::StateFlags::VISIBLE,
+                )
+                .build(),
+        )
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(log_builder.build())
         .on_page_load(|window, _payload| {

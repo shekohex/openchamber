@@ -4,8 +4,8 @@ import { useDirectoryStore } from '@/stores/useDirectoryStore';
 import { useProjectsStore } from '@/stores/useProjectsStore';
 import { opencodeClient } from '@/lib/opencode/client';
 import { checkIsGitRepository } from '@/lib/gitApi';
-import { writeTextToClipboard } from '@/lib/desktop';
 import { streamDebugEnabled } from '@/stores/utils/streamDebug';
+import { copyTextToClipboard as copyPlainTextToClipboard } from '@/lib/clipboard';
 
 export interface DebugMessageInfo {
   messageId: string;
@@ -265,11 +265,29 @@ export const debugUtils = {
       const resp = await fetch('/api/health');
       const contentType = resp.headers.get('content-type') || '';
       const body = await safeText(resp);
+      const isJson = contentType.toLowerCase().includes('application/json');
+      let parsed: Record<string, unknown> | null = null;
+      if (isJson && body) {
+        try {
+          const candidate = JSON.parse(body) as unknown;
+          if (candidate && typeof candidate === 'object' && !Array.isArray(candidate)) {
+            parsed = candidate as Record<string, unknown>;
+          }
+        } catch {
+          parsed = null;
+        }
+      }
       opencodeHealth = {
         status: resp.status,
         ok: resp.ok,
         contentType,
-        type: contentType.includes('application/json') ? 'json' : 'html',
+        type: isJson ? 'json' : 'html',
+        openCodePort: parsed?.openCodePort ?? null,
+        openCodeRunning: parsed?.openCodeRunning ?? null,
+        openCodeSecureConnection: parsed?.openCodeSecureConnection ?? null,
+        openCodeAuthSource: parsed?.openCodeAuthSource ?? null,
+        isOpenCodeReady: parsed?.isOpenCodeReady ?? null,
+        lastOpenCodeError: parsed?.lastOpenCodeError ?? null,
         preview: body ? body.slice(0, 120) : null,
       };
     } catch (error) {
@@ -356,12 +374,14 @@ export const debugUtils = {
     return JSON.stringify(report, null, 2);
   },
 
+  async copyTextToClipboard(text: string) {
+    return copyPlainTextToClipboard(text);
+  },
+
   async copyDiagnosticsReport() {
     const report = await this.buildDiagnosticsReport();
-    if (await writeTextToClipboard(report)) {
-      return { ok: true, report } as const;
-    }
-    return { ok: false, report } as const;
+    const result = await this.copyTextToClipboard(report);
+    return { ...result, report } as const;
   },
 
    checkLastMessage() {

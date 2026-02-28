@@ -13,8 +13,9 @@ import type {
   SkillsCatalogSourceResponse,
 } from '@/lib/api/types';
 
-import { useSkillsStore } from '@/stores/useSkillsStore';
+import { refreshSkillsAfterOpenCodeRestart, useSkillsStore } from '@/stores/useSkillsStore';
 import { opencodeClient } from '@/lib/opencode/client';
+import { startConfigUpdate, finishConfigUpdate, updateConfigUpdateMessage } from '@/lib/configUpdate';
 
 const FALLBACK_SOURCES: SkillsCatalogSource[] = [
   {
@@ -79,7 +80,7 @@ export interface SkillsCatalogState {
   loadSource: (sourceId: string, options?: { refresh?: boolean }) => Promise<boolean>;
   loadMoreClawdHub: () => Promise<boolean>;
   scanRepo: (request: SkillsRepoScanRequest) => Promise<SkillsRepoScanResponse>;
-  installSkills: (request: SkillsInstallRequest) => Promise<SkillsInstallResponse>;
+  installSkills: (request: SkillsInstallRequest, options?: { directory?: string | null }) => Promise<SkillsInstallResponse>;
 }
 
 export const useSkillsCatalogStore = create<SkillsCatalogState>()(
@@ -348,10 +349,15 @@ export const useSkillsCatalogStore = create<SkillsCatalogState>()(
         }
       },
 
-      installSkills: async (request) => {
+      installSkills: async (request, options) => {
+        startConfigUpdate('Installing skills…');
         set({ isInstalling: true, lastInstallError: null });
+        let requiresReload = false;
         try {
-          const currentDirectory = getCurrentDirectory();
+          const directoryOverride = typeof options?.directory === 'string' && options.directory.trim().length > 0
+            ? options.directory.trim()
+            : null;
+          const currentDirectory = directoryOverride ?? getCurrentDirectory();
           const queryParams = currentDirectory ? `?directory=${encodeURIComponent(currentDirectory)}` : '';
 
           const response = await fetch(`/api/config/skills/install${queryParams}`, {
@@ -364,25 +370,39 @@ export const useSkillsCatalogStore = create<SkillsCatalogState>()(
           if (!payload) {
             const error = { kind: 'unknown', message: 'Failed to install skills' } as SkillsInstallError;
             set({ lastInstallError: error });
+            updateConfigUpdateMessage('Failed to install skills. Please retry.');
             return { ok: false, error };
           }
 
           if (!response.ok || !payload.ok) {
             const error = payload.error || ({ kind: 'unknown', message: 'Failed to install skills' } as SkillsInstallError);
             set({ lastInstallError: error });
+            updateConfigUpdateMessage(error.message || 'Failed to install skills. Please retry.');
             return { ok: false, error };
           }
 
-          // Refresh installed skills list.
-          void useSkillsStore.getState().loadSkills();
+          if (payload.requiresReload) {
+            requiresReload = true;
+            await refreshSkillsAfterOpenCodeRestart({
+              message: payload.message,
+              delayMs: payload.reloadDelayMs,
+            });
+          } else {
+            updateConfigUpdateMessage(payload.message || 'Refreshing skills…');
+            void useSkillsStore.getState().loadSkills();
+          }
 
           return payload;
         } catch (error) {
           const err = { kind: 'unknown', message: error instanceof Error ? error.message : String(error) } as SkillsInstallError;
           set({ lastInstallError: err });
+          updateConfigUpdateMessage('Failed to install skills. Please retry.');
           return { ok: false, error: err };
         } finally {
           set({ isInstalling: false });
+          if (!requiresReload) {
+            finishConfigUpdate();
+          }
         }
       },
     }),

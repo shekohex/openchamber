@@ -159,6 +159,61 @@ type PullRequestDraftSnapshot = {
   draft: boolean;
   additionalContext: string;
   targetBaseBranch?: string;
+  selectedRemoteName?: string;
+};
+
+const getTrackingRemoteName = (trackingBranch: string | null | undefined): string => {
+  const normalized = String(trackingBranch || '').trim();
+  if (!normalized) {
+    return '';
+  }
+
+  const slashIndex = normalized.indexOf('/');
+  if (slashIndex <= 0) {
+    return '';
+  }
+
+  return normalized.slice(0, slashIndex).trim();
+};
+
+const pickInitialPrRemote = (
+  remotes: GitRemote[],
+  options: { selectedRemoteName?: string; trackingBranch?: string }
+): GitRemote | null => {
+  if (remotes.length === 0) {
+    return null;
+  }
+
+  const selectedRemoteName = String(options.selectedRemoteName || '').trim();
+  if (selectedRemoteName) {
+    const fromSnapshot = remotes.find((remote) => remote.name === selectedRemoteName);
+    if (fromSnapshot) {
+      return fromSnapshot;
+    }
+  }
+
+  const trackingRemoteName = getTrackingRemoteName(options.trackingBranch);
+  if (trackingRemoteName) {
+    const maybeUpstream =
+      trackingRemoteName === 'origin'
+        ? remotes.find((remote) => remote.name === 'upstream')
+        : null;
+    if (maybeUpstream) {
+      return maybeUpstream;
+    }
+
+    const fromTracking = remotes.find((remote) => remote.name === trackingRemoteName);
+    if (fromTracking) {
+      return fromTracking;
+    }
+  }
+
+  const originRemote = remotes.find((remote) => remote.name === 'origin');
+  if (originRemote) {
+    return originRemote;
+  }
+
+  return remotes[0] ?? null;
 };
 
 type TimelineCommentItem = {
@@ -188,24 +243,25 @@ export const PullRequestSection: React.FC<{
   directory: string;
   branch: string;
   baseBranch: string;
+  trackingBranch?: string;
   remotes?: GitRemote[];
   remoteBranches?: string[];
   variant?: 'framed' | 'plain';
   onGeneratedDescription?: () => void;
-}> = ({ directory, branch, baseBranch, remotes = [], remoteBranches = [], variant = 'framed', onGeneratedDescription }) => {
+}> = ({ directory, branch, baseBranch, trackingBranch, remotes = [], remoteBranches = [], variant = 'framed', onGeneratedDescription }) => {
   const { github } = useRuntimeAPIs();
   const githubAuthStatus = useGitHubAuthStore((state) => state.status);
   const githubAuthChecked = useGitHubAuthStore((state) => state.hasChecked);
   const setSettingsDialogOpen = useUIStore((state) => state.setSettingsDialogOpen);
-  const setSidebarSection = useUIStore((state) => state.setSidebarSection);
+  const setSettingsPage = useUIStore((state) => state.setSettingsPage);
   const setActiveMainTab = useUIStore((state) => state.setActiveMainTab);
   const currentSessionId = useSessionStore((state) => state.currentSessionId);
   const { isMobile, hasTouchInput } = useDeviceInfo();
 
   const openGitHubSettings = React.useCallback(() => {
-    setSidebarSection('settings');
+    setSettingsPage('github');
     setSettingsDialogOpen(true);
-  }, [setSettingsDialogOpen, setSidebarSection]);
+  }, [setSettingsDialogOpen, setSettingsPage]);
 
   const snapshotKey = React.useMemo(() => getPullRequestSnapshotKey(directory, branch), [directory, branch]);
   const initialSnapshot = React.useMemo(
@@ -249,7 +305,12 @@ export const PullRequestSection: React.FC<{
 
   const [isContextOpen, setIsContextOpen] = React.useState(false);
   const [isContextSheetOpen, setIsContextSheetOpen] = React.useState(false);
-  const [selectedRemote, setSelectedRemote] = React.useState<GitRemote | null>(() => remotes[0] ?? null);
+  const [selectedRemote, setSelectedRemote] = React.useState<GitRemote | null>(() =>
+    pickInitialPrRemote(remotes, {
+      selectedRemoteName: initialSnapshot?.selectedRemoteName,
+      trackingBranch,
+    })
+  );
 
   const availableBaseBranches = React.useMemo(() => {
     const selectedRemoteName = selectedRemote?.name?.trim() || null;
@@ -280,10 +341,22 @@ export const PullRequestSection: React.FC<{
 
   // Update selected remote when remotes change
   React.useEffect(() => {
-    if (remotes.length > 0 && !selectedRemote) {
-      setSelectedRemote(remotes[0]);
+    if (remotes.length === 0) {
+      if (selectedRemote) {
+        setSelectedRemote(null);
+      }
+      return;
     }
-  }, [remotes, selectedRemote]);
+
+    if (!selectedRemote || !remotes.some((remote) => remote.name === selectedRemote.name)) {
+      setSelectedRemote(
+        pickInitialPrRemote(remotes, {
+          selectedRemoteName: initialSnapshot?.selectedRemoteName,
+          trackingBranch,
+        })
+      );
+    }
+  }, [initialSnapshot?.selectedRemoteName, remotes, selectedRemote, trackingBranch]);
 
   React.useEffect(() => {
     const normalizedBase = normalizeBranchRef(baseBranch);
@@ -600,7 +673,7 @@ export const PullRequestSection: React.FC<{
           </div>
         ) : null}
         {run.output?.text ? (
-          <div className="rounded border border-border/40 bg-background/40 px-2 py-2 typography-micro text-muted-foreground whitespace-pre-wrap max-h-48 overflow-y-auto">
+          <div className="rounded border border-border/40 bg-transparent px-2 py-2 typography-micro text-muted-foreground whitespace-pre-wrap max-h-48 overflow-y-auto">
             {run.output.text}
           </div>
         ) : null}
@@ -678,7 +751,7 @@ export const PullRequestSection: React.FC<{
                       {step.conclusion ? <span className="ml-auto flex-shrink-0">{step.conclusion}</span> : null}
                     </button>
                     <CollapsibleContent>
-                      <div className="ml-6 mt-1 rounded border border-border/40 bg-background/40 px-2 py-2 typography-micro text-muted-foreground space-y-1">
+                      <div className="ml-6 mt-1 rounded border border-border/40 bg-transparent px-2 py-2 typography-micro text-muted-foreground space-y-1">
                         {typeof step.number === 'number' ? <div>Step: {step.number}</div> : null}
                         {step.status ? <div>Status: {step.status}</div> : null}
                         {step.conclusion ? <div>Conclusion: {step.conclusion}</div> : null}
@@ -934,11 +1007,17 @@ export const PullRequestSection: React.FC<{
     setBody(snapshot?.body ?? '');
     setDraft(snapshot?.draft ?? false);
     setTargetBaseBranch(snapshot?.targetBaseBranch ? normalizeBranchRef(snapshot.targetBaseBranch) : normalizeBranchRef(baseBranch));
+    setSelectedRemote(
+      pickInitialPrRemote(remotes, {
+        selectedRemoteName: snapshot?.selectedRemoteName,
+        trackingBranch,
+      })
+    );
     setStatus(statusSnapshot);
     setError(null);
     setIsInitialStatusResolved(Boolean(statusSnapshot));
     void refresh({ force: true, markInitialResolved: true });
-  }, [baseBranch, branch, refresh, snapshotKey]);
+  }, [baseBranch, branch, refresh, remotes, snapshotKey, trackingBranch]);
 
   // Refetch when selected remote changes
   React.useEffect(() => {
@@ -1008,8 +1087,9 @@ export const PullRequestSection: React.FC<{
       draft,
       additionalContext,
       targetBaseBranch,
+      selectedRemoteName: selectedRemote?.name,
     });
-  }, [snapshotKey, title, body, draft, additionalContext, targetBaseBranch, directory, branch]);
+  }, [snapshotKey, title, body, draft, additionalContext, targetBaseBranch, selectedRemote?.name, directory, branch]);
 
   React.useEffect(() => {
     if (!status) {
@@ -1023,13 +1103,14 @@ export const PullRequestSection: React.FC<{
     if (!directory) return;
     setIsGenerating(true);
     try {
-      const zenModel = useConfigStore.getState().settingsZenModel;
-      const generated = await generatePullRequestDescription(directory, {
+      const payload: { base: string; head: string; context?: string; files?: string[] } = {
         base: targetBaseBranch,
         head: branch,
-        context: additionalContext,
-        ...(zenModel ? { zenModel } : {}),
-      });
+      };
+      if (additionalContext) {
+        payload.context = additionalContext;
+      }
+      const generated = await generatePullRequestDescription(directory, payload);
 
       if (generated.title?.trim()) {
         setTitle(generated.title.trim());
@@ -1044,7 +1125,7 @@ export const PullRequestSection: React.FC<{
     } finally {
       setIsGenerating(false);
     }
-  }, [branch, directory, isGenerating, additionalContext, onGeneratedDescription, targetBaseBranch]);
+  }, [additionalContext, branch, directory, isGenerating, onGeneratedDescription, targetBaseBranch]);
 
   const createPr = React.useCallback(async () => {
     if (!github?.prCreate) {
@@ -1198,7 +1279,7 @@ export const PullRequestSection: React.FC<{
 
   const containerClassName =
     variant === 'framed'
-      ? 'rounded-xl border border-border/60 bg-background/70 overflow-hidden'
+      ? 'rounded-xl border border-border/60 bg-transparent overflow-hidden'
       : 'border-0 bg-transparent rounded-none';
   const headerClassName =
     variant === 'framed'

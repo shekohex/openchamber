@@ -27,6 +27,212 @@ import { MULTIRUN_EXECUTION_FORK_PROMPT_META_TEXT } from '@/lib/messages/executi
 import { useMessageTTS } from '@/hooks/useMessageTTS';
 import { useConfigStore } from '@/stores/useConfigStore';
 import { TextSelectionMenu } from './TextSelectionMenu';
+import { copyTextToClipboard } from '@/lib/clipboard';
+
+type SubtaskPartLike = Part & {
+    type: 'subtask';
+    description?: unknown;
+    command?: unknown;
+    agent?: unknown;
+    prompt?: unknown;
+    taskSessionID?: unknown;
+    model?: {
+        providerID?: unknown;
+        modelID?: unknown;
+    };
+};
+
+type ShellActionPartLike = Part & {
+    type: 'text';
+    shellAction?: {
+        command?: unknown;
+        output?: unknown;
+        status?: unknown;
+    };
+};
+
+const isSubtaskPart = (part: Part): part is SubtaskPartLike => {
+    return part.type === 'subtask';
+};
+
+const isShellActionPart = (part: Part): part is ShellActionPartLike => {
+    const textPart = part as unknown as { type?: unknown; shellAction?: unknown };
+    return textPart.type === 'text' && typeof textPart.shellAction === 'object' && textPart.shellAction !== null;
+};
+
+const normalizeSubtaskModel = (model: SubtaskPartLike['model']): string | null => {
+    if (!model || typeof model !== 'object') return null;
+    const providerID = typeof model.providerID === 'string' ? model.providerID.trim() : '';
+    const modelID = typeof model.modelID === 'string' ? model.modelID.trim() : '';
+    if (!providerID || !modelID) return null;
+    return `${providerID}/${modelID}`;
+};
+
+const UserSubtaskPart: React.FC<{ part: SubtaskPartLike }> = ({ part }) => {
+    const [expanded, setExpanded] = React.useState(false);
+    const setCurrentSession = useSessionStore((state) => state.setCurrentSession);
+
+    const description = typeof part.description === 'string' ? part.description.trim() : '';
+    const command = typeof part.command === 'string' ? part.command.trim() : '';
+    const agent = typeof part.agent === 'string' ? part.agent.trim() : '';
+    const prompt = typeof part.prompt === 'string' ? part.prompt.trim() : '';
+    const taskSessionID = typeof part.taskSessionID === 'string' ? part.taskSessionID.trim() : '';
+    const model = normalizeSubtaskModel(part.model);
+
+    return (
+        <div className="mt-2">
+            <div className="flex items-center gap-2 flex-wrap">
+                <span className="typography-meta font-semibold text-foreground">Delegated task</span>
+                {command ? (
+                    <span className="inline-flex h-5 items-center rounded px-1.5 text-[11px] leading-none bg-foreground/5 text-muted-foreground">
+                        /{command}
+                    </span>
+                ) : null}
+                {agent ? (
+                    <span className="inline-flex h-5 items-center rounded px-1.5 text-[11px] leading-none bg-foreground/5 text-muted-foreground">
+                        @{agent}
+                    </span>
+                ) : null}
+                {model ? (
+                    <span className="inline-flex h-5 items-center rounded px-1.5 text-[11px] leading-none bg-foreground/5 text-muted-foreground">
+                        {model}
+                    </span>
+                ) : null}
+            </div>
+
+            {description ? (
+                <div className="typography-ui-label text-foreground/90 mt-1.5">
+                    {description}
+                </div>
+            ) : null}
+
+            {prompt ? (
+                <div className="mt-2 border-t border-border/60 pt-1.5">
+                    <button
+                        type="button"
+                        className="typography-meta text-muted-foreground hover:text-foreground transition-colors underline underline-offset-2"
+                        onClick={() => setExpanded((value) => !value)}
+                    >
+                        {expanded ? 'Hide prompt' : 'Show prompt'}
+                    </button>
+                    {expanded ? (
+                        <pre className="typography-meta mt-1.5 overflow-x-auto whitespace-pre-wrap break-words text-foreground/85">
+                            {prompt}
+                        </pre>
+                    ) : null}
+                </div>
+            ) : null}
+
+            {taskSessionID ? (
+                <div className="mt-1.5">
+                    <button
+                        type="button"
+                        className="typography-meta text-muted-foreground hover:text-foreground transition-colors underline underline-offset-2"
+                        onClick={() => {
+                            void setCurrentSession(taskSessionID);
+                        }}
+                    >
+                        Open subtask session
+                    </button>
+                </div>
+            ) : null}
+        </div>
+    );
+};
+
+const UserShellActionPart: React.FC<{ part: ShellActionPartLike }> = ({ part }) => {
+    const [expanded, setExpanded] = React.useState(false);
+    const [copiedOutput, setCopiedOutput] = React.useState(false);
+    const copiedResetTimeoutRef = React.useRef<number | null>(null);
+
+    const command = typeof part.shellAction?.command === 'string' ? part.shellAction.command.trim() : '';
+    const output = typeof part.shellAction?.output === 'string' ? part.shellAction.output : '';
+    const status = typeof part.shellAction?.status === 'string' ? part.shellAction.status.trim().toLowerCase() : '';
+    const hasOutput = output.trim().length > 0;
+
+    const clearCopiedResetTimeout = React.useCallback(() => {
+        if (copiedResetTimeoutRef.current !== null && typeof window !== 'undefined') {
+            window.clearTimeout(copiedResetTimeoutRef.current);
+            copiedResetTimeoutRef.current = null;
+        }
+    }, []);
+
+    React.useEffect(() => {
+        return () => {
+            clearCopiedResetTimeout();
+        };
+    }, [clearCopiedResetTimeout]);
+
+    const copyOutputToClipboard = React.useCallback(async () => {
+        if (!hasOutput) return;
+
+        const result = await copyTextToClipboard(output);
+        if (!result.ok) return;
+
+        clearCopiedResetTimeout();
+        setCopiedOutput(true);
+        if (typeof window !== 'undefined') {
+            copiedResetTimeoutRef.current = window.setTimeout(() => {
+                setCopiedOutput(false);
+                copiedResetTimeoutRef.current = null;
+            }, 2000);
+        }
+    }, [clearCopiedResetTimeout, hasOutput, output]);
+
+    return (
+        <div className="mt-2">
+            <div className="flex items-center gap-2 flex-wrap">
+                <span className="typography-meta font-semibold text-foreground">Shell command</span>
+                {status ? (
+                    <span className={cn(
+                        'inline-flex h-5 items-center rounded px-1.5 text-[11px] leading-none',
+                        status === 'error'
+                            ? 'bg-[var(--status-error-background)] text-[var(--status-error)]'
+                            : 'bg-foreground/5 text-muted-foreground'
+                    )}>
+                        {status}
+                    </span>
+                ) : null}
+            </div>
+
+            {command ? (
+                <pre className="typography-meta mt-1.5 overflow-x-auto whitespace-pre-wrap break-words text-foreground/90 font-mono">
+                    {command}
+                </pre>
+            ) : null}
+
+            {hasOutput ? (
+                <div className="mt-2 border-t border-border/60 pt-1.5">
+                    <div className="flex items-center gap-3 flex-wrap">
+                        <button
+                            type="button"
+                            className="typography-meta text-muted-foreground hover:text-foreground transition-colors underline underline-offset-2"
+                            onClick={() => setExpanded((value) => !value)}
+                        >
+                            {expanded ? 'Hide output' : 'Show output'}
+                        </button>
+                        <button
+                            type="button"
+                            className="inline-flex items-center justify-center text-muted-foreground hover:text-foreground transition-colors"
+                            onClick={() => {
+                                void copyOutputToClipboard();
+                            }}
+                            aria-label={copiedOutput ? 'Copied' : 'Copy output'}
+                            title={copiedOutput ? 'Copied' : 'Copy output'}
+                        >
+                            {copiedOutput ? <RiCheckLine className="h-3.5 w-3.5" /> : <RiFileCopyLine className="h-3.5 w-3.5" />}
+                        </button>
+                    </div>
+                    {expanded ? (
+                        <pre className="typography-meta mt-1.5 max-h-56 overflow-auto whitespace-pre-wrap break-words text-foreground/85 font-mono">
+                            {output}
+                        </pre>
+                    ) : null}
+                </div>
+            ) : null}
+        </div>
+    );
+};
 
 const formatTurnDuration = (durationMs: number): string => {
     const totalSeconds = durationMs / 1000;
@@ -94,10 +300,18 @@ const UserMessageBody: React.FC<{
     const [copyHintVisible, setCopyHintVisible] = React.useState(false);
     const copyHintTimeoutRef = React.useRef<number | null>(null);
 
-    const textParts = React.useMemo(() => {
+    const userContentParts = React.useMemo(() => {
         return parts.filter((part) => {
-            if (part.type !== 'text') return false;
-            return !isEmptyTextPart(part);
+            if (part.type === 'text') {
+                return !isEmptyTextPart(part);
+            }
+            if (isSubtaskPart(part)) {
+                return true;
+            }
+            if (isShellActionPart(part)) {
+                return true;
+            }
+            return false;
         });
     }, [parts]);
 
@@ -160,7 +374,23 @@ const UserMessageBody: React.FC<{
             onTouchStart={isTouchContext && canCopyMessage && hasCopyableText ? revealCopyHint : undefined}
         >
             <div className="leading-relaxed overflow-hidden text-foreground/90 text-base">
-                {textParts.map((part, index) => {
+                {userContentParts.map((part, index) => {
+                    if (isSubtaskPart(part)) {
+                        return (
+                            <FadeInOnReveal key={part.id ?? `user-subtask-${index}`}>
+                                <UserSubtaskPart part={part} />
+                            </FadeInOnReveal>
+                        );
+                    }
+
+                    if (isShellActionPart(part)) {
+                        return (
+                            <FadeInOnReveal key={part.id ?? `user-shell-${index}`}>
+                                <UserShellActionPart part={part} />
+                            </FadeInOnReveal>
+                        );
+                    }
+
                     let mentionForPart: AgentMentionInfo | undefined;
                     if (agentMention && mentionToken && !mentionInjected) {
                         const candidateText = extractTextContent(part);
@@ -170,7 +400,7 @@ const UserMessageBody: React.FC<{
                         }
                     }
                     return (
-                        <FadeInOnReveal key={`user-text-${index}`}>
+                        <FadeInOnReveal key={part.id ?? `user-text-${index}`}>
                             <UserTextPart
                                 part={part}
                                 messageId={messageId}
@@ -329,7 +559,7 @@ const AssistantMessageBody: React.FC<Omit<MessageBodyProps, 'isUser'>> = ({
     const openMultiRunLauncherWithPrompt = useUIStore((state) => state.openMultiRunLauncherWithPrompt);
     const isLastAssistantInTurn = turnGroupingContext?.isLastAssistantInTurn ?? false;
     const hasStopFinish = messageFinish === 'stop';
-    
+
     // TTS for message playback
     const { isPlaying: isTTSPlaying, play: playTTS, stop: stopTTS } = useMessageTTS();
     const showMessageTTSButtons = useConfigStore((state) => state.showMessageTTSButtons);
@@ -710,6 +940,7 @@ const AssistantMessageBody: React.FC<Omit<MessageBodyProps, 'isUser'>> = ({
                         syntaxTheme={syntaxTheme}
                         isMobile={isMobile}
                         onContentChange={onContentChange}
+                        onShowPopup={onShowPopup}
                         hasPrevTool={false}
                         hasNextTool={false}
                     />
@@ -767,6 +998,7 @@ const AssistantMessageBody: React.FC<Omit<MessageBodyProps, 'isUser'>> = ({
                                 syntaxTheme={syntaxTheme}
                                 isMobile={isMobile}
                                 onContentChange={onContentChange}
+                                onShowPopup={onShowPopup}
                                 hasPrevTool={connection?.hasPrev ?? false}
                                 hasNextTool={connection?.hasNext ?? false}
                             />
@@ -1012,7 +1244,7 @@ const AssistantMessageBody: React.FC<Omit<MessageBodyProps, 'isUser'>> = ({
                     {showErrorMessage && (
                         <FadeInOnReveal key="assistant-error">
                             <div className="group/assistant-text relative break-words">
-                                <SimpleMarkdownRenderer content={errorMessage ?? ''} />
+                                <SimpleMarkdownRenderer content={errorMessage ?? ''} onShowPopup={onShowPopup} />
                             </div>
                         </FadeInOnReveal>
                     )}
@@ -1021,7 +1253,7 @@ const AssistantMessageBody: React.FC<Omit<MessageBodyProps, 'isUser'>> = ({
                             <div
                                 className="group/assistant-text relative break-words"
                             >
-                                <SimpleMarkdownRenderer content={summaryBody} />
+                                <SimpleMarkdownRenderer content={summaryBody} onShowPopup={onShowPopup} />
                                 {shouldShowFooter && (
                                     <div className="mt-2 mb-1 flex items-center justify-start gap-1.5">
                                         <div className="flex items-center gap-1.5">

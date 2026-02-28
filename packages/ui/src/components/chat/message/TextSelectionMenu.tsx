@@ -2,9 +2,9 @@ import React from 'react';
 import { createPortal } from 'react-dom';
 import { useSessionStore } from '@/stores/useSessionStore';
 import { useUIStore } from '@/stores/useUIStore';
-import { writeTextToClipboard } from '@/lib/desktop';
 import { RiChatNewLine, RiAddLine, RiFileCopyLine } from '@remixicon/react';
 import { cn } from '@/lib/utils';
+import { copyTextToClipboard } from '@/lib/clipboard';
 
 interface TextSelectionMenuProps {
   containerRef: React.RefObject<HTMLElement | null>;
@@ -224,10 +224,9 @@ export const TextSelectionMenu: React.FC<TextSelectionMenuProps> = ({ containerR
   const handleCopy = React.useCallback(async () => {
     if (!selectedText) return;
 
-    try {
-      await writeTextToClipboard(selectedText);
-    } catch (err) {
-      console.error('Failed to copy:', err);
+    const result = await copyTextToClipboard(selectedText);
+    if (!result.ok) {
+      console.error('Failed to copy:', result.error);
     }
 
     hideMenu();
@@ -322,7 +321,7 @@ export const TextSelectionMenu: React.FC<TextSelectionMenuProps> = ({ containerR
         className={cn(
           'flex items-center gap-1',
           'rounded-lg border border-[var(--interactive-border)]',
-          'bg-[var(--surface-elevated)] shadow-lg',
+          'bg-[var(--surface-elevated)] shadow-none',
           'px-1.5 py-1',
           'transition-[opacity,transform] duration-200 ease-out will-change-[opacity,transform]',
           isClosing

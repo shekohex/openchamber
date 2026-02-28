@@ -5,8 +5,8 @@ import { Ghostty, Terminal as GhosttyTerminal, FitAddon } from 'ghostty-web';
 import { isMobileDeviceViaCSS } from '@/lib/device';
 import type { TerminalTheme } from '@/lib/terminalTheme';
 import { getGhosttyTerminalOptions } from '@/lib/terminalTheme';
-import { writeTextToClipboard } from '@/lib/desktop';
 import type { TerminalChunk } from '@/stores/useTerminalStore';
+import { copyTextToClipboard } from '@/lib/clipboard';
 import { cn } from '@/lib/utils';
 import { OverlayScrollbar } from '@/components/ui/OverlayScrollbar';
 
@@ -55,6 +55,16 @@ type TerminalController = {
   fit: () => void;
 };
 
+type TerminalWithViewport = {
+  scrollToBottom?: () => void;
+  getViewportY?: () => number;
+  hasSelection?: () => boolean;
+};
+
+type FitAddonWithObserveResize = FitAddon & {
+  observeResize?: () => void;
+};
+
 interface TerminalViewportProps {
   sessionKey: string;
   chunks: TerminalChunk[];
@@ -97,6 +107,7 @@ const TerminalViewport = React.forwardRef<TerminalController, TerminalViewportPr
     const writeScheduledRef = React.useRef<number | null>(null);
     const isWritingRef = React.useRef(false);
     const lastProcessedChunkIdRef = React.useRef<number | null>(null);
+    const followOutputRef = React.useRef(true);
     const touchScrollCleanupRef = React.useRef<(() => void) | null>(null);
     const viewportDiscoveryTimeoutRef = React.useRef<number | null>(null);
     const viewportDiscoveryAttemptsRef = React.useRef(0);
@@ -313,7 +324,7 @@ const TerminalViewport = React.forwardRef<TerminalController, TerminalViewportPr
 
     React.useEffect(() => {
       const container = containerRef.current;
-      if (!useHiddenInputOverlay || !container) {
+      if (!useHiddenInputOverlay || !container || enableTouchScroll) {
         return;
       }
 
@@ -338,82 +349,89 @@ const TerminalViewport = React.forwardRef<TerminalController, TerminalViewportPr
       return () => {
         container.removeEventListener('focusin', handleContainerFocusIn, true);
       };
-    }, [useHiddenInputOverlay, focusHiddenInput]);
+    }, [enableTouchScroll, useHiddenInputOverlay, focusHiddenInput]);
+
+    const getTerminalSelectionText = React.useCallback((): string => {
+      const terminal = terminalRef.current as unknown as {
+        getSelection?: () => string;
+      } | null;
+      if (!terminal || typeof terminal.getSelection !== 'function') {
+        return '';
+      }
+      const text = terminal.getSelection();
+      return typeof text === 'string' ? text : '';
+    }, []);
+
+    const getDomSelectionTextInViewport = React.useCallback((): string => {
+      if (typeof window === 'undefined') {
+        return '';
+      }
+      const selection = window.getSelection();
+      if (!selection) {
+        return '';
+      }
+
+      const text = selection.toString();
+      if (!text.trim()) {
+        return '';
+      }
+
+      const container = containerRef.current;
+      if (!container) {
+        return '';
+      }
+
+      const anchorNode = selection.anchorNode;
+      const focusNode = selection.focusNode;
+      if (anchorNode && !container.contains(anchorNode)) {
+        return '';
+      }
+      if (focusNode && !container.contains(focusNode)) {
+        return '';
+      }
+
+      return text;
+    }, []);
 
     const copySelectionToClipboard = React.useCallback(async () => {
-      if (typeof window === 'undefined' || typeof document === 'undefined') {
+      if (typeof document === 'undefined') {
         return;
       }
-      const selection = window.getSelection();
-      if (!selection) {
-        return;
-      }
-      const text = selection.toString();
+
+      const text = getTerminalSelectionText() || getDomSelectionTextInViewport();
       if (!text.trim()) {
         return;
       }
 
-      const container = containerRef.current;
-      if (!container) {
-        return;
-      }
-      const anchorNode = selection.anchorNode;
-      const focusNode = selection.focusNode;
-      if (anchorNode && !container.contains(anchorNode)) {
-        return;
-      }
-      if (focusNode && !container.contains(focusNode)) {
-        return;
-      }
-
-      if (await writeTextToClipboard(text)) {
-        return;
-      }
-
-      try {
-        const textarea = document.createElement('textarea');
-        textarea.value = text;
-        textarea.style.position = 'fixed';
-        textarea.style.opacity = '0';
-        document.body.appendChild(textarea);
-        textarea.focus();
-        textarea.select();
-        document.execCommand('copy');
-        document.body.removeChild(textarea);
-      } catch {
-        return;
-      }
-    }, []);
+      await copyTextToClipboard(text);
+    }, [getDomSelectionTextInViewport, getTerminalSelectionText]);
 
     const hasCopyableSelectionInViewport = React.useCallback((): boolean => {
+      const terminalSelection = getTerminalSelectionText();
+      if (terminalSelection.trim()) {
+        return true;
+      }
+      return Boolean(getDomSelectionTextInViewport().trim());
+    }, [getDomSelectionTextInViewport, getTerminalSelectionText]);
+
+    React.useEffect(() => {
       if (typeof window === 'undefined') {
-        return false;
-      }
-      const selection = window.getSelection();
-      if (!selection) {
-        return false;
-      }
-      const text = selection.toString();
-      if (!text.trim()) {
-        return false;
+        return;
       }
 
-      const container = containerRef.current;
-      if (!container) {
-        return false;
-      }
+      const handleMenuCopy = (event: Event) => {
+        if (!hasCopyableSelectionInViewport()) {
+          return;
+        }
+        event.preventDefault();
+        void copySelectionToClipboard();
+      };
 
-      const anchorNode = selection.anchorNode;
-      const focusNode = selection.focusNode;
-      if (anchorNode && !container.contains(anchorNode)) {
-        return false;
-      }
-      if (focusNode && !container.contains(focusNode)) {
-        return false;
-      }
-
-      return true;
-    }, []);
+      window.addEventListener('openchamber:copy', handleMenuCopy);
+      return () => {
+        window.removeEventListener('openchamber:copy', handleMenuCopy);
+      };
+    }, [copySelectionToClipboard, hasCopyableSelectionInViewport]);
 
     const resetWriteState = React.useCallback(() => {
       pendingWriteRef.current = '';
@@ -827,9 +845,8 @@ const TerminalViewport = React.forwardRef<TerminalController, TerminalViewportPr
         scrollByPixels(deltaPixels);
       };
 
-        const handleTouchEnd = (event: TouchEvent) => {
+      const handleTouchEnd = (event: TouchEvent) => {
         const wasTap = !state.didMove;
-
 
         state.lastY = null;
         state.lastTime = null;
@@ -911,6 +928,7 @@ const TerminalViewport = React.forwardRef<TerminalController, TerminalViewportPr
       let localResizeObserver: ResizeObserver | null = null;
       let localTextareaObserver: MutationObserver | null = null;
       let localDisposables: Array<{ dispose: () => void }> = [];
+      let restorePatchedScrollToBottom: (() => void) | null = null;
 
       const container = containerRef.current;
       if (!container) {
@@ -949,9 +967,23 @@ const TerminalViewport = React.forwardRef<TerminalController, TerminalViewportPr
             return;
           }
 
-          const options = getGhosttyTerminalOptions(fontFamily, fontSize, theme, ghostty, useHiddenInputOverlay);
+          const options = getGhosttyTerminalOptions(fontFamily, fontSize, theme, ghostty, false);
 
           const terminal = new GhosttyTerminal(options);
+          followOutputRef.current = true;
+
+          const terminalWithViewport = terminal as unknown as TerminalWithViewport;
+          if (typeof terminalWithViewport.scrollToBottom === 'function') {
+            const originalScrollToBottom = terminalWithViewport.scrollToBottom.bind(terminalWithViewport);
+            terminalWithViewport.scrollToBottom = () => {
+              if (followOutputRef.current) {
+                originalScrollToBottom();
+              }
+            };
+            restorePatchedScrollToBottom = () => {
+              terminalWithViewport.scrollToBottom = originalScrollToBottom;
+            };
+          }
 
           const fitAddon = new FitAddon();
 
@@ -992,10 +1024,30 @@ const TerminalViewport = React.forwardRef<TerminalController, TerminalViewportPr
           }
 
           fitTerminal();
+          const fitAddonWithResize = fitAddon as FitAddonWithObserveResize;
+          if (typeof fitAddonWithResize.observeResize === 'function') {
+            fitAddonWithResize.observeResize();
+          }
           setupTouchScroll();
           localDisposables = [
             terminal.onData((data: string) => {
               inputHandlerRef.current(data);
+            }),
+            terminal.onScroll((viewportY: number) => {
+              if (typeof viewportY === 'number' && Number.isFinite(viewportY)) {
+                const hasSelection = typeof terminal.hasSelection === 'function' && terminal.hasSelection();
+                followOutputRef.current = !hasSelection && viewportY <= 0.5;
+              }
+            }),
+            terminal.onSelectionChange(() => {
+              const hasSelection = typeof terminal.hasSelection === 'function' && terminal.hasSelection();
+              if (hasSelection) {
+                followOutputRef.current = false;
+                return;
+              }
+
+              const viewportY = typeof terminal.getViewportY === 'function' ? terminal.getViewportY() : 0;
+              followOutputRef.current = viewportY <= 0.5;
             }),
           ];
 
@@ -1028,6 +1080,8 @@ const TerminalViewport = React.forwardRef<TerminalController, TerminalViewportPr
         window.removeEventListener('blur', handleWindowBlur);
 
         localDisposables.forEach((disposable) => disposable.dispose());
+        restorePatchedScrollToBottom?.();
+        restorePatchedScrollToBottom = null;
         if (localTerminalTextarea) {
           localTerminalTextarea.removeEventListener('focus', handleTerminalTextareaFocus);
           localTerminalTextarea.removeEventListener('blur', handleTerminalTextareaBlur);
@@ -1414,25 +1468,34 @@ const TerminalViewport = React.forwardRef<TerminalController, TerminalViewportPr
         className={cn('relative h-full w-full terminal-viewport-container', className)}
         style={{ backgroundColor: theme.background }}
         onTouchStart={(event) => {
-          if (useHiddenInputOverlay) {
+          if (!useHiddenInputOverlay || enableTouchScroll) {
+            return;
+          }
+          if (!hasCopyableSelectionInViewport()) {
             const touch = event.touches?.[0];
             focusHiddenInput(touch?.clientX, touch?.clientY);
           }
         }}
         onClick={(event) => {
           if (useHiddenInputOverlay) {
+            if (enableTouchScroll) {
+              return;
+            }
+            if (hasCopyableSelectionInViewport()) {
+              return;
+            }
             focusHiddenInput(event.clientX, event.clientY);
           } else {
             terminalRef.current?.focus();
           }
         }}
         onMouseUp={() => {
-          if (!enableTouchScroll) {
+          if (!enableTouchScroll && hasCopyableSelectionInViewport()) {
             void copySelectionToClipboard();
           }
         }}
         onTouchEnd={() => {
-          if (!enableTouchScroll) {
+          if (!enableTouchScroll && hasCopyableSelectionInViewport()) {
             void copySelectionToClipboard();
           }
         }}

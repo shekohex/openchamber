@@ -13,7 +13,7 @@ declare global {
 
 window.__OPENCHAMBER_RUNTIME_APIS__ = createWebAPIs();
 
-if (window.__OPENCHAMBER_RUNTIME_APIS__?.runtime?.platform === 'web') {
+if (import.meta.env.PROD && window.__OPENCHAMBER_RUNTIME_APIS__?.runtime?.platform === 'web') {
   registerSW({
     onRegistered(registration: ServiceWorkerRegistration | undefined) {
       if (!registration) {
@@ -28,6 +28,10 @@ if (window.__OPENCHAMBER_RUNTIME_APIS__?.runtime?.platform === 'web') {
       console.warn('[PWA] service worker registration failed:', error);
     },
   });
+} else if ('serviceWorker' in navigator) {
+  void navigator.serviceWorker.getRegistrations()
+    .then((registrations) => Promise.all(registrations.map((registration) => registration.unregister())))
+    .catch(() => {});
 }
 
 import('@openchamber/ui/main');

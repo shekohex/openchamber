@@ -4,6 +4,7 @@ import { devtools, persist, createJSONStorage } from "zustand/middleware";
 import type { Message, Part } from "@opencode-ai/sdk/v2";
 import { opencodeClient } from "@/lib/opencode/client";
 import { isExecutionForkMetaText } from "@/lib/messages/executionMeta";
+import { isLikelyProviderAuthFailure, PROVIDER_AUTH_FAILURE_MESSAGE } from "@/lib/messages/providerAuthError";
 import type { SessionMemoryState, MessageStreamLifecycle, AttachedFile } from "./types/sessionTypes";
 import { MEMORY_LIMITS, getMemoryLimits, getBackgroundTrimLimit } from "./types/sessionTypes";
 import {
@@ -29,23 +30,113 @@ const cleanupPendingUserMessageMeta = (
     return nextPending;
 };
 
-interface QueuedPart {
+const COMPACTION_WINDOW_MS = 30_000;
+
+const timeoutRegistry = new Map<string, ReturnType<typeof setTimeout>>();
+const lastContentRegistry = new Map<string, string>();
+const streamingCooldownTimers = new Map<string, ReturnType<typeof setTimeout>>();
+
+// --- rAF batching for streaming parts ---
+// Buffer incoming streaming parts and flush them in a single requestAnimationFrame
+// callback. This coalesces N SSE tokens per frame into one synchronous flush,
+// which React 18 + Zustand batch into a single re-render.
+interface QueuedStreamingPart {
     sessionId: string;
     messageId: string;
     part: Part;
     role?: string;
     currentSessionId?: string;
 }
+const streamingPartQueue: QueuedStreamingPart[] = [];
+let streamingFlushScheduled = false;
+let streamingFlushRafId: number | null = null;
+let streamingFlushTimeoutId: ReturnType<typeof setTimeout> | null = null;
+const STREAMING_FLUSH_TIMEOUT_MS = 50;
+const STREAMING_QUEUE_HARD_LIMIT = 3000;
 
-let batchQueue: QueuedPart[] = [];
-let flushTimer: ReturnType<typeof setTimeout> | null = null;
+type StreamingPartImmediateHandler = (
+    sessionId: string,
+    messageId: string,
+    part: Part,
+    role?: string,
+    currentSessionId?: string,
+) => void;
 
-const USER_BATCH_WINDOW_MS = 50;
-const COMPACTION_WINDOW_MS = 30_000;
+const cancelScheduledStreamingFlush = (): void => {
+    if (streamingFlushRafId !== null) {
+        cancelAnimationFrame(streamingFlushRafId);
+        streamingFlushRafId = null;
+    }
+    if (streamingFlushTimeoutId !== null) {
+        clearTimeout(streamingFlushTimeoutId);
+        streamingFlushTimeoutId = null;
+    }
+    streamingFlushScheduled = false;
+};
 
-const timeoutRegistry = new Map<string, ReturnType<typeof setTimeout>>();
-const lastContentRegistry = new Map<string, string>();
-const streamingCooldownTimers = new Map<string, ReturnType<typeof setTimeout>>();
+const flushQueuedStreamingParts = (immediateHandler: StreamingPartImmediateHandler): void => {
+    if (streamingPartQueue.length === 0) {
+        cancelScheduledStreamingFlush();
+        return;
+    }
+
+    cancelScheduledStreamingFlush();
+
+    const batch = streamingPartQueue.splice(0);
+    if (batch.length === 0) {
+        return;
+    }
+
+    for (const entry of batch) {
+        immediateHandler(entry.sessionId, entry.messageId, entry.part, entry.role, entry.currentSessionId);
+    }
+};
+
+const discardQueuedStreamingPartsForSession = (sessionId: string): void => {
+    if (streamingPartQueue.length === 0) {
+        return;
+    }
+
+    for (let i = streamingPartQueue.length - 1; i >= 0; i--) {
+        if (streamingPartQueue[i].sessionId === sessionId) {
+            streamingPartQueue.splice(i, 1);
+        }
+    }
+
+    if (streamingPartQueue.length === 0) {
+        cancelScheduledStreamingFlush();
+    }
+};
+
+const scheduleStreamingFlush = (flush: () => void): void => {
+    if (streamingFlushScheduled) {
+        return;
+    }
+
+    streamingFlushScheduled = true;
+
+    const shouldUseRaf =
+        typeof requestAnimationFrame === "function" &&
+        (typeof document === "undefined" || !document.hidden);
+
+    if (shouldUseRaf) {
+        streamingFlushRafId = requestAnimationFrame(() => {
+            streamingFlushRafId = null;
+            if (!streamingFlushScheduled) {
+                return;
+            }
+            flush();
+        });
+    }
+
+    streamingFlushTimeoutId = setTimeout(() => {
+        streamingFlushTimeoutId = null;
+        if (!streamingFlushScheduled) {
+            return;
+        }
+        flush();
+    }, STREAMING_FLUSH_TIMEOUT_MS);
+};
 
 const MIN_SORTABLE_LENGTH = 10;
 
@@ -354,7 +445,7 @@ interface MessageState {
 
 interface MessageActions {
     loadMessages: (sessionId: string, limit?: number) => Promise<void>;
-    sendMessage: (content: string, providerID: string, modelID: string, agent?: string, currentSessionId?: string, attachments?: AttachedFile[], agentMentionName?: string | null, additionalParts?: Array<{ text: string; attachments?: AttachedFile[]; synthetic?: boolean }>, variant?: string) => Promise<void>;
+    sendMessage: (content: string, providerID: string, modelID: string, agent?: string, currentSessionId?: string, attachments?: AttachedFile[], agentMentionName?: string | null, additionalParts?: Array<{ text: string; attachments?: AttachedFile[]; synthetic?: boolean }>, variant?: string, inputMode?: 'normal' | 'shell', format?: { type: 'json_schema'; schema: Record<string, unknown>; retryCount?: number }) => Promise<void>;
     abortCurrentOperation: (currentSessionId?: string) => Promise<void>;
     _addStreamingPartImmediate: (sessionId: string, messageId: string, part: Part, role?: string, currentSessionId?: string) => void;
     addStreamingPart: (sessionId: string, messageId: string, part: Part, role?: string, currentSessionId?: string) => void;
@@ -408,18 +499,19 @@ export const useMessageStore = create<MessageStore>()(
                                 : Math.max(baseLimit, userExpandedLimit ?? 0);
 
                         // Don't pass Infinity to API - use undefined for "fetch all".
-                        // For finite loads, overfetch by 1 so hasMoreAbove is accurate.
-                        const fetchLimit = noLimit ? undefined : targetLimit + 1;
+                        // Use targetLimit directly and infer "has more" when payload fills the window,
+                        // matching OpenCode behavior and avoiding hidden "load older" on exact-limit responses.
+                        const fetchLimit = noLimit ? undefined : targetLimit;
                         const allMessages = await executeWithSessionDirectory(sessionId, () => opencodeClient.getSessionMessages(sessionId, fetchLimit));
 
                         // Filter out reverted messages first
                         const revertMessageId = getSessionRevertMessageId(sessionId);
                         const messagesWithoutReverted = filterRevertedMessages(allMessages, revertMessageId);
 
-                        // Accurate older-history detection for finite loads.
-                        // If server returns > targetLimit, there are older messages above current window.
+                        // If server fills the requested window, assume there may be more above.
+                        // This is intentionally optimistic and corrected on subsequent load-more calls.
                         const hasMoreAbove = typeof fetchLimit === 'number'
-                            ? messagesWithoutReverted.length > targetLimit
+                            ? messagesWithoutReverted.length >= targetLimit
                             : false;
 
                         const watermark = get().sessionMemoryState.get(sessionId)?.trimmedHeadMaxId;
@@ -579,7 +671,7 @@ export const useMessageStore = create<MessageStore>()(
                         });
                 },
 
-                sendMessage: async (content: string, providerID: string, modelID: string, agent?: string, currentSessionId?: string, attachments?: AttachedFile[], agentMentionName?: string | null, additionalParts?: Array<{ text: string; attachments?: AttachedFile[]; synthetic?: boolean }>, variant?: string) => {
+                sendMessage: async (content: string, providerID: string, modelID: string, agent?: string, currentSessionId?: string, attachments?: AttachedFile[], agentMentionName?: string | null, additionalParts?: Array<{ text: string; attachments?: AttachedFile[]; synthetic?: boolean }>, variant?: string, inputMode: 'normal' | 'shell' = 'normal', format?: { type: 'json_schema'; schema: Record<string, unknown>; retryCount?: number }) => {
                     if (!currentSessionId) {
                         throw new Error("No session selected");
                     }
@@ -596,54 +688,60 @@ export const useMessageStore = create<MessageStore>()(
 
                     await executeWithSessionDirectory(sessionId, async () => {
                         try {
-                            let effectiveContent = content;
-                            const isCommand = content.startsWith("/");
-
-                            if (isCommand) {
-                                const spaceIndex = content.indexOf(" ");
-                                const command = spaceIndex === -1 ? content.substring(1) : content.substring(1, spaceIndex);
-                                const commandArgs = spaceIndex === -1 ? "" : content.substring(spaceIndex + 1).trim();
-
-                                const apiClient = opencodeClient.getApiClient();
-                                const directory = opencodeClient.getDirectory();
-
-                                if (command === "init") {
-                                    const messageId = `msg_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`;
-
-                                    await apiClient.session.init({
-                                        sessionID: sessionId,
-                                        ...(directory ? { directory } : {}),
-                                        messageID: messageId,
-                                        providerID,
-                                        modelID,
-                                    });
-
-                                    return;
-                                }
-
-                                if (command === "summarize") {
-                                    await apiClient.session.summarize({
-                                        sessionID: sessionId,
-                                        ...(directory ? { directory } : {}),
-                                        providerID,
-                                        modelID,
-                                    });
-
-                                    return;
-                                }
-
-                                try {
-                                    const commandDetails = await opencodeClient.getCommandDetails(command);
-                                    if (commandDetails?.template) {
-                                        effectiveContent = commandDetails.template.replace(/\$ARGUMENTS/g, commandArgs);
-                                    } else {
-                                        effectiveContent = content;
-                                    }
-                                } catch (error) {
-                                    console.error("Command template resolution failed:", error);
-                                    effectiveContent = content;
-                                }
-                            }
+                            const trimmedContent = content.trimStart();
+                            const firstTokenLooksLikeAbsolutePath = (() => {
+                                if (!trimmedContent.startsWith('/')) return false;
+                                const firstWhitespaceIndex = trimmedContent.search(/\s/);
+                                const firstToken = firstWhitespaceIndex === -1
+                                    ? trimmedContent
+                                    : trimmedContent.slice(0, firstWhitespaceIndex);
+                                if (firstToken.length <= 1) return false;
+                                const tokenWithoutLeadingSlash = firstToken.slice(1);
+                                if (!tokenWithoutLeadingSlash.includes('/')) return false;
+                                return true;
+                            })();
+                            const commandPayload = (() => {
+                                if (inputMode === 'shell') return null;
+                                if (!trimmedContent.startsWith("/")) return null;
+                                if (firstTokenLooksLikeAbsolutePath) return null;
+                                const firstLineEnd = trimmedContent.indexOf("\n");
+                                const firstLine = firstLineEnd === -1 ? trimmedContent : trimmedContent.slice(0, firstLineEnd);
+                                const [commandToken, ...firstLineArgs] = firstLine.split(" ");
+                                const command = commandToken.slice(1).trim();
+                                if (command.toLowerCase() === "shell") return null;
+                                if (!command) return null;
+                                const restOfInput = firstLineEnd === -1 ? "" : trimmedContent.slice(firstLineEnd + 1);
+                                const argsFromFirstLine = firstLineArgs.join(" ").trim();
+                                const args = restOfInput
+                                    ? (argsFromFirstLine ? `${argsFromFirstLine}\n${restOfInput}` : restOfInput)
+                                    : argsFromFirstLine;
+                                return {
+                                    command,
+                                    arguments: args,
+                                };
+                            })();
+                            const shellPayload = (() => {
+                                if (inputMode !== 'shell') return null;
+                                const command = content.trim();
+                                if (!command.trim()) return null;
+                                return { command };
+                            })();
+                            const slashShellPayload = (() => {
+                                if (!trimmedContent.startsWith("/")) return null;
+                                if (firstTokenLooksLikeAbsolutePath) return null;
+                                const firstLineEnd = trimmedContent.indexOf("\n");
+                                const firstLine = firstLineEnd === -1 ? trimmedContent : trimmedContent.slice(0, firstLineEnd);
+                                const [commandToken, ...firstLineArgs] = firstLine.split(" ");
+                                const commandName = commandToken.slice(1).trim().toLowerCase();
+                                if (commandName !== "shell") return null;
+                                const restOfInput = firstLineEnd === -1 ? "" : trimmedContent.slice(firstLineEnd + 1);
+                                const argsFromFirstLine = firstLineArgs.join(" ").trim();
+                                const command = restOfInput
+                                    ? (argsFromFirstLine ? `${argsFromFirstLine}\n${restOfInput}` : restOfInput)
+                                    : argsFromFirstLine;
+                                if (!command.trim()) return null;
+                                return { command };
+                            })();
 
                             set({
                                 lastUsedProvider: { providerID, modelID },
@@ -723,17 +821,63 @@ export const useMessageStore = create<MessageStore>()(
                                     })),
                                 }));
 
-                                await opencodeClient.sendMessage({
-                                    id: sessionId,
-                                    providerID,
-                                    modelID,
-                                    text: effectiveContent,
-                                    agent,
-                                    variant,
-                                    files: filePayloads.length > 0 ? filePayloads : undefined,
-                                    additionalParts: additionalPartsPayload && additionalPartsPayload.length > 0 ? additionalPartsPayload : undefined,
-                                    agentMentions: agentMentionName ? [{ name: agentMentionName }] : undefined,
-                                });
+                                const apiClient = opencodeClient.getApiClient();
+                                const directory = opencodeClient.getDirectory();
+
+                                if (shellPayload || slashShellPayload) {
+                                    await apiClient.session.shell({
+                                        sessionID: sessionId,
+                                        ...(directory ? { directory } : {}),
+                                        ...(agent ? { agent } : {}),
+                                        model: {
+                                            providerID,
+                                            modelID,
+                                        },
+                                        command: (shellPayload ?? slashShellPayload)!.command,
+                                    });
+                                } else if (commandPayload && commandPayload.command.toLowerCase() === 'compact') {
+                                    await apiClient.session.summarize({
+                                        sessionID: sessionId,
+                                        ...(directory ? { directory } : {}),
+                                        providerID,
+                                        modelID,
+                                    });
+                                } else if (commandPayload) {
+                                    await opencodeClient.sendCommand({
+                                        id: sessionId,
+                                        providerID,
+                                        modelID,
+                                        command: commandPayload.command,
+                                        arguments: commandPayload.arguments,
+                                        agent,
+                                        variant,
+                                        files: filePayloads.length > 0 ? filePayloads : undefined,
+                                    });
+                                } else {
+                                    if (format) {
+                                        console.info('[git-generation][browser] dispatch structured sendMessage', {
+                                            sessionId,
+                                            providerID,
+                                            modelID,
+                                            agent,
+                                            variant,
+                                            directory,
+                                            formatType: format.type,
+                                        });
+                                    }
+                                    await opencodeClient.sendMessage({
+                                        id: sessionId,
+                                        providerID,
+                                        modelID,
+                                        text: content,
+                                        agent,
+                                        variant,
+                                        ...(format ? { format } : {}),
+                                        files: filePayloads.length > 0 ? filePayloads : undefined,
+                                        additionalParts: additionalPartsPayload && additionalPartsPayload.length > 0 ? additionalPartsPayload : undefined,
+                                        agentMentions: agentMentionName ? [{ name: agentMentionName }] : undefined,
+                                    });
+                                }
 
                                 if (filePayloads.length > 0) {
                                     try {
@@ -760,6 +904,8 @@ export const useMessageStore = create<MessageStore>()(
                                         return { abortControllers: nextControllers };
                                     });
                                     return;
+                                } else if (isLikelyProviderAuthFailure(error.message)) {
+                                    errorMessage = PROVIDER_AUTH_FAILURE_MESSAGE;
                                 } else if (error.message) {
                                     errorMessage = error.message;
                                 }
@@ -787,6 +933,8 @@ export const useMessageStore = create<MessageStore>()(
                                 errorMessage = "OpenCode is restarting. Please wait a moment and try again.";
                             } else if (error.message?.includes("504") || error.message?.includes("Gateway")) {
                                 errorMessage = "Gateway timeout - your message is being processed. Please wait for response.";
+                            } else if (isLikelyProviderAuthFailure(error.message)) {
+                                errorMessage = PROVIDER_AUTH_FAILURE_MESSAGE;
                             } else if (error.message) {
                                 errorMessage = error.message;
                             }
@@ -810,6 +958,8 @@ export const useMessageStore = create<MessageStore>()(
                     if (!currentSessionId) {
                         return;
                     }
+
+                    discardQueuedStreamingPartsForSession(currentSessionId);
 
                     const stateSnapshot = get();
                     const { abortControllers, messages: storeMessages } = stateSnapshot;
@@ -1091,14 +1241,15 @@ export const useMessageStore = create<MessageStore>()(
                                 ...memoryState,
                                 backgroundMessageCount: (memoryState.backgroundMessageCount || 0) + 1,
                             });
-                            state.sessionMemoryState = newMemoryState;
+                            updates.sessionMemoryState = newMemoryState;
                         }
 
                         if (actualRole === 'assistant') {
-                            const currentMemoryState = state.sessionMemoryState.get(sessionId);
+                            const baseMemoryMap = updates.sessionMemoryState ?? state.sessionMemoryState;
+                            const currentMemoryState = baseMemoryMap.get(sessionId);
                             if (currentMemoryState) {
                                 const now = Date.now();
-                                const nextMemoryState = new Map(state.sessionMemoryState);
+                                const nextMemoryState = new Map(baseMemoryMap);
                                 nextMemoryState.set(sessionId, {
                                     ...currentMemoryState,
                                     isStreaming: true,
@@ -1106,7 +1257,7 @@ export const useMessageStore = create<MessageStore>()(
                                     lastAccessedAt: now,
                                     isZombie: false,
                                 });
-                                state.sessionMemoryState = nextMemoryState;
+                                updates.sessionMemoryState = nextMemoryState;
                             }
                         }
 
@@ -1145,7 +1296,8 @@ export const useMessageStore = create<MessageStore>()(
                                 const incomingText = extractTextFromPart(part).trim();
                                 const shouldKeep =
                                     incomingText.startsWith('User has requested to enter plan mode') ||
-                                    incomingText.startsWith('The plan at ');
+                                    incomingText.startsWith('The plan at ') ||
+                                    incomingText.startsWith('The following tool was executed by the user');
                                 if (!shouldKeep) {
                                     (window as any).__messageTracker?.(messageId, 'skipped_synthetic_user_part');
                                     return state;
@@ -1173,7 +1325,7 @@ export const useMessageStore = create<MessageStore>()(
                             const newMessages = new Map(state.messages);
                             newMessages.set(sessionId, updatedMessages);
 
-                            return finalizeAbortState({ messages: newMessages });
+                            return finalizeAbortState({ messages: newMessages, ...updates });
                         }
 
                         if (actualRole === 'assistant' && messageIndex !== -1) {
@@ -1226,7 +1378,8 @@ export const useMessageStore = create<MessageStore>()(
                                     const incomingText = extractTextFromPart(part).trim();
                                     const shouldKeep =
                                         incomingText.startsWith('User has requested to enter plan mode') ||
-                                        incomingText.startsWith('The plan at ');
+                                        incomingText.startsWith('The plan at ') ||
+                                        incomingText.startsWith('The following tool was executed by the user');
                                     if (!shouldKeep) {
                                         (window as any).__messageTracker?.(messageId, 'skipped_synthetic_new_user_part');
                                         return state;
@@ -1280,7 +1433,7 @@ export const useMessageStore = create<MessageStore>()(
                                 const newMessages = new Map(state.messages);
                                 newMessages.set(sessionId, updatedMessages);
 
-                                return finalizeAbortState({ messages: newMessages });
+                                return finalizeAbortState({ messages: newMessages, ...updates });
                             }
 
                             if ((part as any)?.type === 'text') {
@@ -1292,6 +1445,10 @@ export const useMessageStore = create<MessageStore>()(
                                     if (latestUser) {
                                         const latestUserText = latestUser.parts.map((p) => extractTextFromPart(p)).join('').trim();
                                         if (latestUserText.length > 0 && latestUserText === textIncoming) {
+                                            // Cap ignoredAssistantMessageIds size — it's only relevant for active streaming
+                                            if (ignoredAssistantMessageIds.size > 1000) {
+                                                ignoredAssistantMessageIds.clear();
+                                            }
                                             ignoredAssistantMessageIds.add(messageId);
                                             (window as any).__messageTracker?.(messageId, 'ignored_assistant_echo');
                                             return state;
@@ -1447,26 +1604,18 @@ export const useMessageStore = create<MessageStore>()(
                 },
 
                 addStreamingPart: (sessionId: string, messageId: string, part: Part, role?: string, currentSessionId?: string) => {
+                    streamingPartQueue.push({ sessionId, messageId, part, role, currentSessionId });
 
-                    if (role !== 'user') {
-                        get()._addStreamingPartImmediate(sessionId, messageId, part, role, currentSessionId);
+                    const flushQueuedParts = () => {
+                        flushQueuedStreamingParts(get()._addStreamingPartImmediate);
+                    };
+
+                    if (streamingPartQueue.length >= STREAMING_QUEUE_HARD_LIMIT) {
+                        flushQueuedParts();
                         return;
                     }
 
-                    batchQueue.push({ sessionId, messageId, part, role, currentSessionId });
-
-                    if (!flushTimer) {
-                        flushTimer = setTimeout(() => {
-                            const itemsToProcess = [...batchQueue];
-                            batchQueue = [];
-                            flushTimer = null;
-
-                            const store = get();
-                            for (const item of itemsToProcess) {
-                                store._addStreamingPartImmediate(item.sessionId, item.messageId, item.part, item.role, item.currentSessionId);
-                            }
-                        }, USER_BATCH_WINDOW_MS);
-                    }
+                    scheduleStreamingFlush(flushQueuedParts);
                 },
 
                 forceCompleteMessage: (sessionId: string | null | undefined, messageId: string, source: "timeout" | "cooldown" = "timeout") => {
@@ -1707,12 +1856,14 @@ export const useMessageStore = create<MessageStore>()(
                         };
 
                         if (messageIndex === -1) {
-                            console.info("[MESSAGE-DEBUG] updateMessageInfo: messageIndex === -1", {
-                                sessionId,
-                                messageId,
-                                messageInfo,
-                                existingCount: normalizedSessionMessages.length,
-                            });
+                            if (process.env.NODE_ENV === 'development') {
+                                console.info("[MESSAGE-DEBUG] updateMessageInfo: messageIndex === -1", {
+                                    sessionId,
+                                    messageId,
+                                    messageInfo,
+                                    existingCount: normalizedSessionMessages.length,
+                                });
+                            }
 
                             if (normalizedSessionMessages.length > 0) {
                                 const firstMessage = normalizedSessionMessages[0];
@@ -1948,6 +2099,8 @@ export const useMessageStore = create<MessageStore>()(
                 },
 
                 completeStreamingMessage: (sessionId: string, messageId: string) => {
+                    flushQueuedStreamingParts(get()._addStreamingPartImmediate);
+
                     const state = get();
 
                     (window as any).__messageTracker?.(
@@ -2428,6 +2581,28 @@ export const useMessageStore = create<MessageStore>()(
                             result.abortControllers = nextControllers;
                         }
 
+                        // Clean up module-level registries for evicted session's message IDs
+                        for (const messageId of removedIds) {
+                            const existingTimeout = timeoutRegistry.get(messageId);
+                            if (existingTimeout) {
+                                clearTimeout(existingTimeout);
+                                timeoutRegistry.delete(messageId);
+                            }
+                            lastContentRegistry.delete(messageId);
+                        }
+
+                        // Clean up cooldown timer for evicted session
+                        const cooldownTimer = streamingCooldownTimers.get(lruSessionId);
+                        if (cooldownTimer) {
+                            clearTimeout(cooldownTimer);
+                            streamingCooldownTimers.delete(lruSessionId);
+                        }
+
+                        // Belt-and-suspenders: cap ignoredAssistantMessageIds size
+                        if (ignoredAssistantMessageIds.size > 1000) {
+                            ignoredAssistantMessageIds.clear();
+                        }
+
                         return result;
                     });
                 },
@@ -2465,7 +2640,7 @@ export const useMessageStore = create<MessageStore>()(
                     });
 
                     try {
-                        const fetchLimit = desiredLimit + 1;
+                        const fetchLimit = desiredLimit;
                         const allMessages = await executeWithSessionDirectory(
                             sessionId,
                             () => opencodeClient.getSessionMessages(sessionId, fetchLimit)
@@ -2473,7 +2648,7 @@ export const useMessageStore = create<MessageStore>()(
 
                         if (direction === "up" && currentMessages.length > 0) {
                             const dedupedMessages = dedupeMessagesById(allMessages);
-                            const hasPotentialMore = allMessages.length >= fetchLimit;
+                            const hasPotentialMore = allMessages.length >= desiredLimit;
                             const firstCurrentMessage = currentMessages[0];
                             const indexInAll = dedupedMessages.findIndex((message) => message.info.id === firstCurrentMessage.info.id);
 

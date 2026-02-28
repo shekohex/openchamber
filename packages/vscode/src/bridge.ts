@@ -5,7 +5,7 @@ import * as fs from 'fs';
 import { spawn, execFile } from 'child_process';
 import { promisify } from 'util';
 import { type OpenCodeManager } from './opencode';
-import { createAgent, createCommand, deleteAgent, deleteCommand, getAgentSources, getCommandSources, updateAgent, updateCommand, type AgentScope, type CommandScope, AGENT_SCOPE, COMMAND_SCOPE, discoverSkills, getSkillSources, createSkill, updateSkill, deleteSkill, readSkillSupportingFile, writeSkillSupportingFile, deleteSkillSupportingFile, type SkillScope, SKILL_SCOPE, getProviderSources, removeProviderConfig } from './opencodeConfig';
+import { createAgent, createCommand, deleteAgent, deleteCommand, getAgentSources, getCommandSources, updateAgent, updateCommand, type AgentScope, type CommandScope, AGENT_SCOPE, COMMAND_SCOPE, discoverSkills, getSkillSources, createSkill, updateSkill, deleteSkill, readSkillSupportingFile, writeSkillSupportingFile, deleteSkillSupportingFile, type SkillScope, type SkillSource, type DiscoveredSkill, SKILL_SCOPE, getProviderSources, removeProviderConfig, listMcpConfigs, getMcpConfig, createMcpConfig, updateMcpConfig, deleteMcpConfig } from './opencodeConfig';
 import { getProviderAuth, removeProviderAuth } from './opencodeAuth';
 import { fetchQuotaForProvider, listConfiguredQuotaProviders } from './quotaProviders';
 import * as gitService from './gitService';
@@ -79,6 +79,16 @@ type ApiProxyResponsePayload = {
   bodyBase64: string;
 };
 
+type NotificationBridgePayload = {
+  title?: string;
+  body?: string;
+  tag?: string;
+};
+
+type NotificationsNotifyRequestPayload = {
+  payload?: NotificationBridgePayload;
+};
+
 interface FileEntry {
   name: string;
   path: string;
@@ -97,10 +107,193 @@ export interface BridgeContext {
 
 const SETTINGS_KEY = 'openchamber.settings';
 const CLIENT_RELOAD_DELAY_MS = 800;
+const MAX_FILE_ATTACH_SIZE_BYTES = 10 * 1024 * 1024;
 const execFileAsync = promisify(execFile);
 const gpgconfCandidates = ['gpgconf', '/opt/homebrew/bin/gpgconf', '/usr/local/bin/gpgconf'];
 
 const OPENCHAMBER_SHARED_SETTINGS_PATH = path.join(os.homedir(), '.config', 'openchamber', 'settings.json');
+
+const guessMimeTypeFromExtension = (ext: string) => {
+  switch (ext) {
+    case '.png':
+    case '.jpg':
+    case '.jpeg':
+    case '.gif':
+    case '.bmp':
+    case '.webp':
+      return `image/${ext.replace('.', '')}`;
+    case '.pdf':
+      return 'application/pdf';
+    case '.txt':
+    case '.log':
+      return 'text/plain';
+    case '.json':
+      return 'application/json';
+    case '.md':
+    case '.markdown':
+      return 'text/markdown';
+    default:
+      return 'application/octet-stream';
+  }
+};
+
+const readUriAsAttachment = async (
+  uri: vscode.Uri,
+  fallbackName?: string,
+): Promise<
+  | { file: { name: string; mimeType: string; size: number; dataUrl: string } }
+  | { skipped: { name: string; reason: string } }
+> => {
+  const name = path.basename(uri.fsPath || uri.path || fallbackName || 'file');
+
+  try {
+    const stat = await vscode.workspace.fs.stat(uri);
+    if ((stat.type & vscode.FileType.Directory) !== 0) {
+      return { skipped: { name, reason: 'Folders are not supported' } };
+    }
+
+    const size = stat.size ?? 0;
+    if (size > MAX_FILE_ATTACH_SIZE_BYTES) {
+      return { skipped: { name, reason: 'File exceeds 10MB limit' } };
+    }
+
+    const bytes = await vscode.workspace.fs.readFile(uri);
+    const ext = path.extname(name).toLowerCase();
+    const mimeType = guessMimeTypeFromExtension(ext);
+    const base64 = Buffer.from(bytes).toString('base64');
+    const dataUrl = `data:${mimeType};base64,${base64}`;
+
+    return { file: { name, mimeType, size, dataUrl } };
+  } catch (error) {
+    return { skipped: { name, reason: error instanceof Error ? error.message : 'Failed to read file' } };
+  }
+};
+
+const isPathInside = (candidatePath: string, parentPath: string): boolean => {
+  const normalizedCandidate = path.resolve(candidatePath);
+  const normalizedParent = path.resolve(parentPath);
+  return normalizedCandidate === normalizedParent || normalizedCandidate.startsWith(`${normalizedParent}${path.sep}`);
+};
+
+const findWorktreeRootForSkills = (workingDirectory?: string): string | null => {
+  if (!workingDirectory) return null;
+  let current = path.resolve(workingDirectory);
+  while (true) {
+    if (fs.existsSync(path.join(current, '.git'))) {
+      return current;
+    }
+    const parent = path.dirname(current);
+    if (parent === current) return null;
+    current = parent;
+  }
+};
+
+const getProjectAncestors = (workingDirectory?: string): string[] => {
+  if (!workingDirectory) return [];
+  const result: string[] = [];
+  let current = path.resolve(workingDirectory);
+  const stop = findWorktreeRootForSkills(workingDirectory) || current;
+  while (true) {
+    result.push(current);
+    if (current === stop) break;
+    const parent = path.dirname(current);
+    if (parent === current) break;
+    current = parent;
+  }
+  return result;
+};
+
+const inferSkillScopeAndSourceFromLocation = (location: string, workingDirectory?: string): { scope: SkillScope; source: SkillSource } => {
+  const resolvedPath = path.resolve(location);
+  const source: SkillSource = resolvedPath.includes(`${path.sep}.agents${path.sep}skills${path.sep}`)
+    ? 'agents'
+    : resolvedPath.includes(`${path.sep}.claude${path.sep}skills${path.sep}`)
+      ? 'claude'
+      : 'opencode';
+
+  const projectAncestors = getProjectAncestors(workingDirectory);
+  const isProjectScoped = projectAncestors.some((ancestor) => {
+    const candidates = [
+      path.join(ancestor, '.opencode'),
+      path.join(ancestor, '.claude', 'skills'),
+      path.join(ancestor, '.agents', 'skills'),
+    ];
+    return candidates.some((candidate) => isPathInside(resolvedPath, candidate));
+  });
+
+  if (isProjectScoped) {
+    return { scope: 'project', source };
+  }
+
+  const home = os.homedir();
+  const userRoots = [
+    path.join(home, '.config', 'opencode'),
+    path.join(home, '.opencode'),
+    path.join(home, '.claude', 'skills'),
+    path.join(home, '.agents', 'skills'),
+    process.env.OPENCODE_CONFIG_DIR ? path.resolve(process.env.OPENCODE_CONFIG_DIR) : null,
+  ].filter((value): value is string => Boolean(value));
+
+  if (userRoots.some((root) => isPathInside(resolvedPath, root))) {
+    return { scope: 'user', source };
+  }
+
+  return { scope: 'user', source };
+};
+
+const fetchOpenCodeSkillsFromApi = async (ctx: BridgeContext | undefined, workingDirectory?: string): Promise<DiscoveredSkill[] | null> => {
+  const apiUrl = ctx?.manager?.getApiUrl();
+  if (!apiUrl) {
+    return null;
+  }
+
+  try {
+    const base = apiUrl.endsWith('/') ? apiUrl : `${apiUrl}/`;
+    const url = new URL('skill', base);
+    if (workingDirectory) {
+      url.searchParams.set('directory', workingDirectory);
+    }
+
+    const response = await fetch(url.toString(), {
+      method: 'GET',
+      headers: {
+        Accept: 'application/json',
+        ...(ctx?.manager?.getOpenCodeAuthHeaders() || {}),
+      },
+      signal: AbortSignal.timeout(8_000),
+    });
+
+    if (!response.ok) {
+      return null;
+    }
+
+    const payload = await response.json();
+    if (!Array.isArray(payload)) {
+      return null;
+    }
+
+    return payload
+      .map((item) => {
+        const name = typeof item?.name === 'string' ? item.name.trim() : '';
+        const location = typeof item?.location === 'string' ? item.location : '';
+        const description = typeof item?.description === 'string' ? item.description : '';
+        if (!name || !location) {
+          return null;
+        }
+        const inferred = inferSkillScopeAndSourceFromLocation(location, workingDirectory);
+        return {
+          name,
+          path: location,
+          scope: inferred.scope,
+          source: inferred.source,
+          description,
+        } as DiscoveredSkill;
+      })
+      .filter((item): item is DiscoveredSkill => item !== null);
+  } catch {
+    return null;
+  }
+};
 
 const readSharedSettingsFromDisk = (): Record<string, unknown> => {
   try {
@@ -178,28 +371,253 @@ const normalizeMergeMethod = (value: string): 'merge' | 'squash' | 'rebase' => {
   return 'merge';
 };
 
-const extractZenOutputText = (value: unknown): string | null => {
-  if (!value || typeof value !== 'object') return null;
-  const root = value as Record<string, unknown>;
-  const output = root.output;
-  if (!Array.isArray(output)) return null;
+const BRIDGE_ZEN_DEFAULT_MODEL = 'gpt-5-nano';
+const BRIDGE_GIT_GENERATION_TIMEOUT_MS = 2 * 60 * 1000;
+const BRIDGE_GIT_GENERATION_POLL_INTERVAL_MS = 500;
+let bridgeGitModelCatalogCache: Set<string> | null = null;
+let bridgeGitModelCatalogCacheAt = 0;
+const BRIDGE_GIT_MODEL_CATALOG_CACHE_TTL_MS = 30 * 1000;
 
-  const messageItem = output.find((item) => {
-    if (!item || typeof item !== 'object') return false;
-    return (item as Record<string, unknown>).type === 'message';
-  }) as Record<string, unknown> | undefined;
-  if (!messageItem) return null;
+const sleep = (ms: number) => new Promise<void>((resolve) => {
+  setTimeout(resolve, ms);
+});
 
-  const content = messageItem.content;
-  if (!Array.isArray(content)) return null;
+const fetchBridgeGitModelCatalog = async (
+  apiUrl: string,
+  authHeaders?: Record<string, string>
+): Promise<Set<string>> => {
+  const now = Date.now();
+  if (bridgeGitModelCatalogCache && now - bridgeGitModelCatalogCacheAt < BRIDGE_GIT_MODEL_CATALOG_CACHE_TTL_MS) {
+    return bridgeGitModelCatalogCache;
+  }
 
-  const textItem = content.find((item) => {
-    if (!item || typeof item !== 'object') return false;
-    return (item as Record<string, unknown>).type === 'output_text';
-  }) as Record<string, unknown> | undefined;
+  const headers = authHeaders || {};
+  const modelsUrl = new URL(`${apiUrl.replace(/\/+$/, '')}/model`);
+  const response = await fetch(modelsUrl.toString(), {
+    method: 'GET',
+    headers: {
+      Accept: 'application/json',
+      ...headers,
+    },
+    signal: AbortSignal.timeout(8_000),
+  });
 
-  const text = typeof textItem?.text === 'string' ? textItem.text.trim() : '';
-  return text || null;
+  if (!response.ok) {
+    throw new Error('Failed to fetch model catalog');
+  }
+
+  const payload = await response.json().catch(() => null) as unknown;
+  const refs = new Set<string>();
+  if (Array.isArray(payload)) {
+    for (const item of payload) {
+      if (!item || typeof item !== 'object') {
+        continue;
+      }
+      const record = item as Record<string, unknown>;
+      const providerID = typeof record.providerID === 'string' ? record.providerID.trim() : '';
+      const modelID = typeof record.modelID === 'string' ? record.modelID.trim() : '';
+      if (providerID && modelID) {
+        refs.add(`${providerID}/${modelID}`);
+      }
+    }
+  }
+
+  bridgeGitModelCatalogCache = refs;
+  bridgeGitModelCatalogCacheAt = now;
+  return refs;
+};
+
+const resolveBridgeGitGenerationModel = async (
+  payloadModel: { providerId?: string; modelId?: string; zenModel?: string },
+  settings: Record<string, unknown>,
+  apiUrl: string,
+  authHeaders?: Record<string, string>
+): Promise<{ providerID: string; modelID: string }> => {
+  let catalog: Set<string> | null = null;
+  try {
+    catalog = await fetchBridgeGitModelCatalog(apiUrl, authHeaders);
+  } catch {
+    catalog = null;
+  }
+
+  const hasModel = (providerID: string, modelID: string): boolean => {
+    if (!catalog) {
+      return false;
+    }
+    return catalog.has(`${providerID}/${modelID}`);
+  };
+
+  const requestProviderId = typeof payloadModel.providerId === 'string' ? payloadModel.providerId.trim() : '';
+  const requestModelId = typeof payloadModel.modelId === 'string' ? payloadModel.modelId.trim() : '';
+  if (requestProviderId && requestModelId && hasModel(requestProviderId, requestModelId)) {
+    return { providerID: requestProviderId, modelID: requestModelId };
+  }
+
+  const settingsProviderId = readStringField(settings, 'gitProviderId');
+  const settingsModelId = readStringField(settings, 'gitModelId');
+  if (settingsProviderId && settingsModelId && hasModel(settingsProviderId, settingsModelId)) {
+    return { providerID: settingsProviderId, modelID: settingsModelId };
+  }
+
+  const payloadZenModel = typeof payloadModel.zenModel === 'string' ? payloadModel.zenModel.trim() : '';
+  const settingsZenModel = readStringField(settings, 'zenModel');
+  return {
+    providerID: 'zen',
+    modelID: payloadZenModel || settingsZenModel || BRIDGE_ZEN_DEFAULT_MODEL,
+  };
+};
+
+const extractTextFromMessageParts = (parts: unknown): string => {
+  if (!Array.isArray(parts)) {
+    return '';
+  }
+
+  const textParts = parts
+    .filter((part) => {
+      if (!part || typeof part !== 'object') return false;
+      const record = part as Record<string, unknown>;
+      return record.type === 'text' && typeof record.text === 'string';
+    })
+    .map((part) => (part as Record<string, unknown>).text as string)
+    .map((text) => text.trim())
+    .filter((text) => text.length > 0);
+
+  return textParts.join('\n').trim();
+};
+
+const generateBridgeTextWithSessionFlow = async ({
+  apiUrl,
+  directory,
+  prompt,
+  providerID,
+  modelID,
+  authHeaders,
+}: {
+  apiUrl: string;
+  directory: string;
+  prompt: string;
+  providerID: string;
+  modelID: string;
+  authHeaders?: Record<string, string>;
+}): Promise<string> => {
+  const headers = authHeaders || {};
+  const apiBase = apiUrl.replace(/\/+$/, '');
+  const deadlineAt = Date.now() + BRIDGE_GIT_GENERATION_TIMEOUT_MS;
+  const remainingMs = () => Math.max(1_000, deadlineAt - Date.now());
+  let sessionId: string | null = null;
+
+  try {
+    const sessionUrl = new URL(`${apiBase}/session`);
+    if (directory) {
+      sessionUrl.searchParams.set('directory', directory);
+    }
+
+    const createResponse = await fetch(sessionUrl.toString(), {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        ...headers,
+      },
+      body: JSON.stringify({ title: 'Git Generation' }),
+      signal: AbortSignal.timeout(remainingMs()),
+    });
+
+    if (!createResponse.ok) {
+      throw new Error('Failed to create OpenCode session');
+    }
+
+    const session = await createResponse.json().catch(() => null) as unknown;
+    const sessionObj = session && typeof session === 'object' ? session as Record<string, unknown> : null;
+    const createdSessionId = sessionObj && typeof sessionObj.id === 'string' ? sessionObj.id : '';
+    if (!createdSessionId) {
+      throw new Error('Invalid session response');
+    }
+    sessionId = createdSessionId;
+
+    const promptUrl = new URL(`${apiBase}/session/${encodeURIComponent(sessionId)}/prompt_async`);
+    if (directory) {
+      promptUrl.searchParams.set('directory', directory);
+    }
+
+    const promptResponse = await fetch(promptUrl.toString(), {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        ...headers,
+      },
+      body: JSON.stringify({
+        model: {
+          providerID,
+          modelID,
+        },
+        parts: [{ type: 'text', text: prompt }],
+      }),
+      signal: AbortSignal.timeout(remainingMs()),
+    });
+
+    if (!promptResponse.ok) {
+      throw new Error('Failed to send prompt');
+    }
+
+    const messagesUrl = new URL(`${apiBase}/session/${encodeURIComponent(sessionId)}/message`);
+    if (directory) {
+      messagesUrl.searchParams.set('directory', directory);
+    }
+    messagesUrl.searchParams.set('limit', '10');
+
+    while (Date.now() < deadlineAt) {
+      await sleep(BRIDGE_GIT_GENERATION_POLL_INTERVAL_MS);
+
+      const messagesResponse = await fetch(messagesUrl.toString(), {
+        method: 'GET',
+        headers: {
+          Accept: 'application/json',
+          ...headers,
+        },
+        signal: AbortSignal.timeout(remainingMs()),
+      });
+
+      if (!messagesResponse.ok) {
+        continue;
+      }
+
+      const messages = await messagesResponse.json().catch(() => null) as unknown;
+      if (!Array.isArray(messages)) {
+        continue;
+      }
+
+      for (let i = messages.length - 1; i >= 0; i--) {
+        const message = messages[i] as Record<string, unknown> | null;
+        if (!message || typeof message !== 'object') {
+          continue;
+        }
+        const info = message.info as Record<string, unknown> | undefined;
+        if (info?.role !== 'assistant' || info?.finish !== 'stop') {
+          continue;
+        }
+
+        const text = extractTextFromMessageParts(message.parts);
+        if (text) {
+          return text;
+        }
+      }
+    }
+
+    throw new Error('Timeout waiting for generation to complete');
+  } finally {
+    if (sessionId) {
+      const deleteUrl = new URL(`${apiBase}/session/${encodeURIComponent(sessionId)}`);
+      try {
+        await fetch(deleteUrl.toString(), {
+          method: 'DELETE',
+          headers,
+          signal: AbortSignal.timeout(5_000),
+        });
+      } catch {
+        // ignore cleanup failures
+      }
+    }
+  }
 };
 
 const parseJsonObjectSafe = (value: string): Record<string, unknown> | null => {
@@ -783,18 +1201,134 @@ const sanitizeForwardHeaders = (input: Record<string, string> | undefined): Reco
   return headers;
 };
 
+const getFsAccessRoot = (): string => vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || os.homedir();
+
+const getFsMimeType = (filePath: string): string => {
+  const ext = path.extname(filePath).toLowerCase();
+  const mimeMap: Record<string, string> = {
+    '.png': 'image/png',
+    '.jpg': 'image/jpeg',
+    '.jpeg': 'image/jpeg',
+    '.gif': 'image/gif',
+    '.webp': 'image/webp',
+    '.svg': 'image/svg+xml',
+    '.txt': 'text/plain; charset=utf-8',
+    '.md': 'text/markdown; charset=utf-8',
+    '.markdown': 'text/markdown; charset=utf-8',
+    '.mmd': 'text/plain; charset=utf-8',
+    '.mermaid': 'text/plain; charset=utf-8',
+    '.json': 'application/json; charset=utf-8',
+    '.pdf': 'application/pdf',
+  };
+  return mimeMap[ext] || 'application/octet-stream';
+};
+
+type FsReadPathResolution =
+  | { ok: true; resolvedPath: string }
+  | { ok: false; status: number; error: string };
+
+const resolveFileReadPath = async (targetPath: string): Promise<FsReadPathResolution> => {
+  const trimmed = targetPath.trim();
+  if (!trimmed) {
+    return { ok: false, status: 400, error: 'Path is required' };
+  }
+
+  const baseRoot = getFsAccessRoot();
+  const resolved = resolveUserPath(trimmed, baseRoot);
+  if (!resolved) {
+    return { ok: false, status: 400, error: 'Path is required' };
+  }
+
+  try {
+    const [canonicalPath, canonicalBase] = await Promise.all([
+      fs.promises.realpath(resolved),
+      fs.promises.realpath(baseRoot).catch(() => path.resolve(baseRoot)),
+    ]);
+
+    if (!isPathInside(canonicalPath, canonicalBase)) {
+      return { ok: false, status: 403, error: 'Access to file denied' };
+    }
+
+    return { ok: true, resolvedPath: canonicalPath };
+  } catch (error) {
+    const err = error as NodeJS.ErrnoException;
+    if (err?.code === 'ENOENT') {
+      return { ok: false, status: 404, error: 'File not found' };
+    }
+    return { ok: false, status: 500, error: 'Failed to resolve file path' };
+  }
+};
+
+const buildProxyJsonError = (status: number, error: string): ApiProxyResponsePayload => ({
+  status,
+  headers: { 'content-type': 'application/json' },
+  bodyBase64: base64EncodeUtf8(JSON.stringify({ error })),
+});
+
+const tryHandleLocalFsProxy = async (method: string, requestPath: string): Promise<ApiProxyResponsePayload | null> => {
+  let parsed: URL;
+  try {
+    parsed = new URL(requestPath, 'https://openchamber.local');
+  } catch {
+    return buildProxyJsonError(400, 'Invalid request path');
+  }
+
+  if (parsed.pathname !== '/api/fs/read' && parsed.pathname !== '/api/fs/raw') {
+    return null;
+  }
+
+  if (method !== 'GET' && method !== 'HEAD') {
+    return buildProxyJsonError(405, 'Method not allowed');
+  }
+
+  const targetPath = parsed.searchParams.get('path') || '';
+  const resolution = await resolveFileReadPath(targetPath);
+  if (!resolution.ok) {
+    return buildProxyJsonError(resolution.status, resolution.error);
+  }
+
+  try {
+    const stats = await fs.promises.stat(resolution.resolvedPath);
+    if (!stats.isFile()) {
+      return buildProxyJsonError(400, 'Specified path is not a file');
+    }
+
+    if (parsed.pathname === '/api/fs/read') {
+      const content = await fs.promises.readFile(resolution.resolvedPath, 'utf8');
+      return {
+        status: 200,
+        headers: {
+          'content-type': 'text/plain; charset=utf-8',
+          'cache-control': 'no-store',
+        },
+        bodyBase64: base64EncodeUtf8(content),
+      };
+    }
+
+    const raw = await fs.promises.readFile(resolution.resolvedPath);
+    return {
+      status: 200,
+      headers: {
+        'content-type': getFsMimeType(resolution.resolvedPath),
+        'cache-control': 'no-store',
+      },
+      bodyBase64: Buffer.from(raw).toString('base64'),
+    };
+  } catch (error) {
+    const err = error as NodeJS.ErrnoException;
+    if (err?.code === 'ENOENT') {
+      return buildProxyJsonError(404, 'File not found');
+    }
+    return buildProxyJsonError(500, 'Unable to read file');
+  }
+};
+
 export async function handleBridgeMessage(message: BridgeRequest, ctx?: BridgeContext): Promise<BridgeResponse> {
   const { id, type, payload } = message;
 
   try {
     switch (type) {
       case 'api:proxy': {
-        const apiUrl = ctx?.manager?.getApiUrl();
-        if (!apiUrl) {
-          const data = buildUnavailableApiResponse();
-          return { id, type, success: true, data };
-        }
-
         const { method, path: requestPath, headers, bodyBase64 } = (payload || {}) as ApiProxyRequestPayload;
         const normalizedMethod = typeof method === 'string' && method.trim() ? method.trim().toUpperCase() : 'GET';
         const normalizedPath =
@@ -804,9 +1338,23 @@ export async function handleBridgeMessage(message: BridgeRequest, ctx?: BridgeCo
               : `/${requestPath.trim()}`
             : '/';
 
+        const localFsResponse = await tryHandleLocalFsProxy(normalizedMethod, normalizedPath);
+        if (localFsResponse) {
+          return { id, type, success: true, data: localFsResponse };
+        }
+
+        const apiUrl = ctx?.manager?.getApiUrl();
+        if (!apiUrl) {
+          const data = buildUnavailableApiResponse();
+          return { id, type, success: true, data };
+        }
+
         const base = `${apiUrl.replace(/\/+$/, '')}/`;
         const targetUrl = new URL(normalizedPath.replace(/^\/+/, ''), base).toString();
-        const requestHeaders: Record<string, string> = sanitizeForwardHeaders(headers);
+        const requestHeaders: Record<string, string> = {
+          ...sanitizeForwardHeaders(headers),
+          ...ctx?.manager?.getOpenCodeAuthHeaders(),
+        };
 
         // Ensure SSE requests are negotiated correctly.
         if (normalizedPath === '/event' || normalizedPath === '/global/event') {
@@ -875,7 +1423,10 @@ export async function handleBridgeMessage(message: BridgeRequest, ctx?: BridgeCo
 
         const base = `${apiUrl.replace(/\/+$/, '')}/`;
         const targetUrl = new URL(normalizedPath.replace(/^\/+/, ''), base).toString();
-        const requestHeaders: Record<string, string> = sanitizeForwardHeaders(headers);
+        const requestHeaders: Record<string, string> = {
+          ...sanitizeForwardHeaders(headers),
+          ...ctx?.manager?.getOpenCodeAuthHeaders(),
+        };
 
         try {
           const response = await fetch(targetUrl, {
@@ -1013,13 +1564,15 @@ export async function handleBridgeMessage(message: BridgeRequest, ctx?: BridgeCo
         if (!target) {
           return { id, type, success: false, error: 'Path is required' };
         }
+
+        const resolution = await resolveFileReadPath(target);
+        if (!resolution.ok) {
+          return { id, type, success: false, error: resolution.error };
+        }
+
         try {
-          const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || os.homedir();
-          const resolvedPath = resolveUserPath(target, workspaceRoot);
-          const uri = vscode.Uri.file(resolvedPath);
-          const bytes = await vscode.workspace.fs.readFile(uri);
-          const content = Buffer.from(bytes).toString('utf8');
-          return { id, type, success: true, data: { content, path: normalizeFsPath(resolvedPath) } };
+          const content = await fs.promises.readFile(resolution.resolvedPath, 'utf8');
+          return { id, type, success: true, data: { content, path: normalizeFsPath(resolution.resolvedPath) } };
         } catch (error) {
           const message = error instanceof Error ? error.message : 'Failed to read file';
           return { id, type, success: false, error: message };
@@ -1164,7 +1717,6 @@ export async function handleBridgeMessage(message: BridgeRequest, ctx?: BridgeCo
       }
 
       case 'api:files/pick': {
-        const MAX_SIZE = 10 * 1024 * 1024;
         const allowMany = (payload as { allowMany?: boolean })?.allowMany !== false;
         const defaultUri = vscode.workspace.workspaceFolders?.[0]?.uri;
 
@@ -1183,50 +1735,59 @@ export async function handleBridgeMessage(message: BridgeRequest, ctx?: BridgeCo
         const files: Array<{ name: string; mimeType: string; size: number; dataUrl: string }> = [];
         const skipped: Array<{ name: string; reason: string }> = [];
 
-        const guessMime = (ext: string) => {
-          switch (ext) {
-            case '.png':
-            case '.jpg':
-            case '.jpeg':
-            case '.gif':
-            case '.bmp':
-            case '.webp':
-              return `image/${ext.replace('.', '')}`;
-            case '.pdf':
-              return 'application/pdf';
-            case '.txt':
-            case '.log':
-              return 'text/plain';
-            case '.json':
-              return 'application/json';
-            case '.md':
-            case '.markdown':
-              return 'text/markdown';
-            default:
-              return 'application/octet-stream';
-          }
-        };
-
         for (const uri of picks) {
+          const result = await readUriAsAttachment(uri);
+          if ('file' in result) {
+            files.push(result.file);
+          } else {
+            skipped.push(result.skipped);
+          }
+        }
+
+        return { id, type, success: true, data: { files, skipped } };
+      }
+
+      case 'api:files/drop': {
+        const uris = Array.isArray((payload as { uris?: unknown[] })?.uris)
+          ? (payload as { uris: unknown[] }).uris.filter((value): value is string => typeof value === 'string' && value.trim().length > 0)
+          : [];
+
+        if (uris.length === 0) {
+          return { id, type, success: true, data: { files: [], skipped: [] } };
+        }
+
+        const files: Array<{ name: string; mimeType: string; size: number; dataUrl: string }> = [];
+        const skipped: Array<{ name: string; reason: string }> = [];
+
+        const dedupedUris = Array.from(new Set(uris.map((value) => value.trim())));
+
+        for (const rawUri of dedupedUris) {
+          let uri: vscode.Uri;
           try {
-            const stat = await vscode.workspace.fs.stat(uri);
-            const size = stat.size ?? 0;
-            const name = path.basename(uri.fsPath);
-
-            if (size > MAX_SIZE) {
-              skipped.push({ name, reason: 'File exceeds 10MB limit' });
-              continue;
-            }
-
-            const bytes = await vscode.workspace.fs.readFile(uri);
-            const ext = path.extname(name).toLowerCase();
-            const mimeType = guessMime(ext);
-            const base64 = Buffer.from(bytes).toString('base64');
-            const dataUrl = `data:${mimeType};base64,${base64}`;
-            files.push({ name, mimeType, size, dataUrl });
+            uri = vscode.Uri.parse(rawUri, true);
           } catch (error) {
-            const name = path.basename(uri.fsPath);
-            skipped.push({ name, reason: error instanceof Error ? error.message : 'Failed to read file' });
+            skipped.push({
+              name: rawUri,
+              reason: error instanceof Error ? error.message : 'Invalid URI',
+            });
+            continue;
+          }
+
+          if (uri.scheme !== 'file') {
+            skipped.push({
+              name: rawUri,
+              reason: `Unsupported URI scheme: ${uri.scheme}`,
+            });
+            continue;
+          }
+
+          const name = path.basename(uri.fsPath || uri.path || rawUri);
+
+          const result = await readUriAsAttachment(uri, name);
+          if ('file' in result) {
+            files.push(result.file);
+          } else {
+            skipped.push(result.skipped);
           }
         }
 
@@ -1838,6 +2399,84 @@ export async function handleBridgeMessage(message: BridgeRequest, ctx?: BridgeCo
         return { id, type, success: false, error: `Unsupported method: ${normalizedMethod}` };
       }
 
+      case 'api:config/mcp': {
+        const { method, name, body, directory } = (payload || {}) as { method?: string; name?: string; body?: Record<string, unknown>; directory?: string };
+        const normalizedMethod = typeof method === 'string' && method.trim() ? method.trim().toUpperCase() : 'GET';
+        const mcpName = typeof name === 'string' ? name.trim() : '';
+
+        const workingDirectory = (typeof directory === 'string' && directory.trim())
+          ? directory.trim()
+          : (ctx?.manager?.getWorkingDirectory() || vscode.workspace.workspaceFolders?.[0]?.uri.fsPath);
+
+        if (normalizedMethod === 'GET' && !mcpName) {
+          const configs = listMcpConfigs(workingDirectory);
+          return { id, type, success: true, data: configs };
+        }
+
+        if (!mcpName) {
+          return { id, type, success: false, error: 'MCP server name is required' };
+        }
+
+        if (normalizedMethod === 'GET') {
+          const config = getMcpConfig(mcpName, workingDirectory);
+          if (!config) {
+            return { id, type, success: false, error: `MCP server "${mcpName}" not found` };
+          }
+          return { id, type, success: true, data: config };
+        }
+
+        if (normalizedMethod === 'POST') {
+          const scope = body?.scope as 'user' | 'project' | undefined;
+          createMcpConfig(mcpName, (body || {}) as Record<string, unknown>, workingDirectory, scope);
+          await ctx?.manager?.restart();
+          return {
+            id,
+            type,
+            success: true,
+            data: {
+              success: true,
+              requiresReload: true,
+              message: `MCP server "${mcpName}" created. Reloading interface…`,
+              reloadDelayMs: CLIENT_RELOAD_DELAY_MS,
+            },
+          };
+        }
+
+        if (normalizedMethod === 'PATCH') {
+          updateMcpConfig(mcpName, (body || {}) as Record<string, unknown>, workingDirectory);
+          await ctx?.manager?.restart();
+          return {
+            id,
+            type,
+            success: true,
+            data: {
+              success: true,
+              requiresReload: true,
+              message: `MCP server "${mcpName}" updated. Reloading interface…`,
+              reloadDelayMs: CLIENT_RELOAD_DELAY_MS,
+            },
+          };
+        }
+
+        if (normalizedMethod === 'DELETE') {
+          deleteMcpConfig(mcpName, workingDirectory);
+          await ctx?.manager?.restart();
+          return {
+            id,
+            type,
+            success: true,
+            data: {
+              success: true,
+              requiresReload: true,
+              message: `MCP server "${mcpName}" deleted. Reloading interface…`,
+              reloadDelayMs: CLIENT_RELOAD_DELAY_MS,
+            },
+          };
+        }
+
+        return { id, type, success: false, error: `Unsupported method: ${normalizedMethod}` };
+      }
+
       case 'api:config/skills': {
         const { method, name, body } = (payload || {}) as { method?: string; name?: string; body?: Record<string, unknown> };
         const workingDirectory = ctx?.manager?.getWorkingDirectory() || vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
@@ -1845,7 +2484,7 @@ export async function handleBridgeMessage(message: BridgeRequest, ctx?: BridgeCo
 
         // LIST all skills (no name provided)
         if (!name && normalizedMethod === 'GET') {
-          const skills = discoverSkills(workingDirectory);
+          const skills = (await fetchOpenCodeSkillsFromApi(ctx, workingDirectory)) || discoverSkills(workingDirectory);
           return { id, type, success: true, data: { skills } };
         }
 
@@ -1855,7 +2494,9 @@ export async function handleBridgeMessage(message: BridgeRequest, ctx?: BridgeCo
         }
 
         if (normalizedMethod === 'GET') {
-          const sources = getSkillSources(skillName, workingDirectory);
+          const discoveredSkill = ((await fetchOpenCodeSkillsFromApi(ctx, workingDirectory)) || [])
+            .find((skill) => skill.name === skillName);
+          const sources = getSkillSources(skillName, workingDirectory, discoveredSkill || null);
           return {
             id,
             type,
@@ -1866,47 +2507,52 @@ export async function handleBridgeMessage(message: BridgeRequest, ctx?: BridgeCo
 
         if (normalizedMethod === 'POST') {
           const scopeValue = body?.scope as string | undefined;
+          const sourceValue = body?.source as string | undefined;
           const scope: SkillScope | undefined = scopeValue === 'project' ? SKILL_SCOPE.PROJECT : scopeValue === 'user' ? SKILL_SCOPE.USER : undefined;
-          createSkill(skillName, (body || {}) as Record<string, unknown>, workingDirectory, scope);
-          // Skills are just files - OpenCode loads them on-demand, no restart needed
+          const normalizedSource = sourceValue === 'agents' ? 'agents' : 'opencode';
+          createSkill(skillName, { ...(body || {}), source: normalizedSource } as Record<string, unknown>, workingDirectory, scope);
+          await ctx?.manager?.restart();
           return {
             id,
             type,
             success: true,
             data: {
               success: true,
-              requiresReload: false,
-              message: `Skill ${skillName} created successfully`,
+              requiresReload: true,
+              message: `Skill ${skillName} created successfully. Reloading interface…`,
+              reloadDelayMs: CLIENT_RELOAD_DELAY_MS,
             },
           };
         }
 
         if (normalizedMethod === 'PATCH') {
           updateSkill(skillName, (body || {}) as Record<string, unknown>, workingDirectory);
-          // Skills are just files - OpenCode loads them on-demand, no restart needed
+          await ctx?.manager?.restart();
           return {
             id,
             type,
             success: true,
             data: {
               success: true,
-              requiresReload: false,
-              message: `Skill ${skillName} updated successfully`,
+              requiresReload: true,
+              message: `Skill ${skillName} updated successfully. Reloading interface…`,
+              reloadDelayMs: CLIENT_RELOAD_DELAY_MS,
             },
           };
         }
 
         if (normalizedMethod === 'DELETE') {
           deleteSkill(skillName, workingDirectory);
-          // Skills are just files - OpenCode loads them on-demand, no restart needed
+          await ctx?.manager?.restart();
           return {
             id,
             type,
             success: true,
             data: {
               success: true,
-              requiresReload: false,
-              message: `Skill ${skillName} deleted successfully`,
+              requiresReload: true,
+              message: `Skill ${skillName} deleted successfully. Reloading interface…`,
+              reloadDelayMs: CLIENT_RELOAD_DELAY_MS,
             },
           };
         }
@@ -1943,7 +2589,8 @@ export async function handleBridgeMessage(message: BridgeRequest, ctx?: BridgeCo
               .filter((v) => v !== null) as SkillsCatalogSourceConfig[])
           : [];
 
-        const data = await getSkillsCatalog(workingDirectory, refresh, additionalSources);
+        const installedSkills = (await fetchOpenCodeSkillsFromApi(ctx, workingDirectory)) || undefined;
+        const data = await getSkillsCatalog(workingDirectory, refresh, additionalSources, installedSkills);
         return { id, type, success: true, data };
       }
 
@@ -1961,6 +2608,7 @@ export async function handleBridgeMessage(message: BridgeRequest, ctx?: BridgeCo
           source?: string;
           subpath?: string;
           scope?: 'user' | 'project';
+          targetSource?: 'opencode' | 'agents';
           selections?: Array<{ skillDir: string }>;
           conflictPolicy?: 'prompt' | 'skipAll' | 'overwriteAll';
           conflictDecisions?: Record<string, 'skip' | 'overwrite'>;
@@ -1972,11 +2620,36 @@ export async function handleBridgeMessage(message: BridgeRequest, ctx?: BridgeCo
           source: String(body.source || ''),
           subpath: body.subpath,
           scope: body.scope === 'project' ? 'project' : 'user',
+          targetSource: body.targetSource === 'agents' ? 'agents' : 'opencode',
           workingDirectory: body.scope === 'project' ? workingDirectory : undefined,
           selections: Array.isArray(body.selections) ? body.selections : [],
           conflictPolicy: body.conflictPolicy,
           conflictDecisions: body.conflictDecisions,
         });
+
+        if (data.ok) {
+          const installed = data.installed || [];
+          const skipped = data.skipped || [];
+          const requiresReload = installed.length > 0;
+
+          if (requiresReload) {
+            await ctx?.manager?.restart();
+          }
+
+          return {
+            id,
+            type,
+            success: true,
+            data: {
+              ok: true,
+              installed,
+              skipped,
+              requiresReload,
+              message: requiresReload ? 'Skills installed successfully. Reloading interface…' : 'No skills were installed',
+              reloadDelayMs: requiresReload ? CLIENT_RELOAD_DELAY_MS : undefined,
+            },
+          };
+        }
 
         return { id, type, success: true, data };
       }
@@ -2000,7 +2673,9 @@ export async function handleBridgeMessage(message: BridgeRequest, ctx?: BridgeCo
           return { id, type, success: false, error: 'File path is required' };
         }
 
-        const sources = getSkillSources(skillName, workingDirectory);
+        const discoveredSkill = ((await fetchOpenCodeSkillsFromApi(ctx, workingDirectory)) || [])
+          .find((skill) => skill.name === skillName);
+        const sources = getSkillSources(skillName, workingDirectory, discoveredSkill || null);
         if (!sources.md.dir) {
           return { id, type, success: false, error: `Skill "${skillName}" not found` };
         }
@@ -2190,6 +2865,28 @@ export async function handleBridgeMessage(message: BridgeRequest, ctx?: BridgeCo
           const errorMessage = error instanceof Error ? error.message : String(error);
           return { id, type, success: false, error: errorMessage };
         }
+      }
+
+      case 'notifications:can-notify': {
+        return { id, type, success: true, data: true };
+      }
+
+      case 'notifications:notify': {
+        const request = (payload || {}) as NotificationsNotifyRequestPayload;
+        const notification = request.payload || {};
+        const title = typeof notification.title === 'string' ? notification.title.trim() : '';
+        const body = typeof notification.body === 'string' ? notification.body.trim() : '';
+
+        const message = title && body
+          ? `${title}: ${body}`
+          : title || body;
+
+        if (!message) {
+          return { id, type, success: true, data: { shown: false } };
+        }
+
+        void vscode.window.showInformationMessage(message);
+        return { id, type, success: true, data: { shown: true } };
       }
 
       // ============== Git Operations ==============
@@ -2545,10 +3242,14 @@ export async function handleBridgeMessage(message: BridgeRequest, ctx?: BridgeCo
       }
 
       case 'api:git/pr-description': {
-        const { directory, base, head } = (payload || {}) as {
+        const { directory, base, head, context, providerId, modelId, zenModel: payloadZenModel } = (payload || {}) as {
           directory?: string;
           base?: string;
           head?: string;
+          context?: string;
+          providerId?: string;
+          modelId?: string;
+          zenModel?: string;
         };
         if (!directory) {
           return { id, type, success: false, error: 'Directory is required' };
@@ -2586,31 +3287,33 @@ export async function handleBridgeMessage(message: BridgeRequest, ctx?: BridgeCo
           return { id, type, success: false, error: 'No diffs available for selected files' };
         }
 
-        const prompt = `You are drafting a GitHub Pull Request title + description. Respond in JSON of the shape {"title": string, "body": string} (ONLY JSON in response, no markdown fences) with these rules:\n- title: concise, sentence case, <= 80 chars, no trailing punctuation, no commit-style prefixes (no "feat:", "fix:")\n- body: GitHub-flavored markdown with these sections in this order: Summary, Testing, Notes\n- Summary: 3-6 bullet points describing user-visible changes; avoid internal helper function names\n- Testing: bullet list ("- Not tested" allowed)\n- Notes: bullet list; include breaking/rollout notes only when relevant\n\nContext:\n- base branch: ${base}\n- head branch: ${head}\n\nDiff summary:\n${diffSummaries}`;
+        const prompt = `You are drafting a GitHub Pull Request title + description. Respond in JSON of the shape {"title": string, "body": string} (ONLY JSON in response, no markdown fences) with these rules:\n- title: concise, sentence case, <= 80 chars, no trailing punctuation, no commit-style prefixes (no "feat:", "fix:")\n- body: GitHub-flavored markdown with these sections in this order: Summary, Testing, Notes\n- Summary: 3-6 bullet points describing user-visible changes; avoid internal helper function names\n- Testing: bullet list ("- Not tested" allowed)\n- Notes: bullet list; include breaking/rollout notes only when relevant\n\nContext:\n- base branch: ${base}\n- head branch: ${head}${context?.trim() ? `\n- Additional context: ${context.trim()}` : ''}\n\nDiff summary:\n${diffSummaries}`;
 
         try {
-          const zenSettings = readSettings(ctx) as Record<string, unknown>;
-          const zenModelRaw = typeof zenSettings?.zenModel === 'string' ? (zenSettings.zenModel as string).trim() : '';
-          const zenModel = zenModelRaw.length > 0 ? zenModelRaw : 'gpt-5-nano';
-          const response = await fetch('https://opencode.ai/zen/v1/responses', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              model: zenModel,
-              input: [{ role: 'user', content: prompt }],
-              max_output_tokens: 1200,
-              stream: false,
-              reasoning: { effort: 'low' },
-            }),
-          });
-          if (!response.ok) {
-            return { id, type, success: false, error: 'Failed to generate PR description' };
+          const apiUrl = ctx?.manager?.getApiUrl();
+          if (!apiUrl) {
+            return { id, type, success: false, error: 'OpenCode API unavailable' };
           }
-          const data = await response.json().catch(() => null) as unknown;
-          const raw = extractZenOutputText(data);
+
+          const settings = readSettings(ctx) as Record<string, unknown>;
+          const { providerID, modelID } = await resolveBridgeGitGenerationModel(
+            { providerId, modelId, zenModel: payloadZenModel },
+            settings,
+            apiUrl,
+            ctx?.manager?.getOpenCodeAuthHeaders()
+          );
+          const raw = await generateBridgeTextWithSessionFlow({
+            apiUrl,
+            directory,
+            prompt,
+            providerID,
+            modelID,
+            authHeaders: ctx?.manager?.getOpenCodeAuthHeaders(),
+          });
           if (!raw) {
             return { id, type, success: false, error: 'No PR description returned by generator' };
           }
+
           const cleaned = String(raw)
             .trim()
             .replace(/^```json\s*/i, '')

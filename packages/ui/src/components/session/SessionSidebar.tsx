@@ -1,7 +1,8 @@
 import React from 'react';
 import type { Session } from '@opencode-ai/sdk/v2';
 import { toast } from '@/components/ui';
-import { isDesktopLocalOriginActive, isDesktopShell, isMobileRuntime as detectMobileRuntime, isTauriShell, isVSCodeRuntime, writeTextToClipboard } from '@/lib/desktop';
+import { copyTextToClipboard } from '@/lib/clipboard';
+import { isDesktopLocalOriginActive, isDesktopShell, isMobileRuntime as detectMobileRuntime, isTauriShell, isVSCodeRuntime } from '@/lib/desktop';
 import {
   DndContext,
   DragOverlay,
@@ -10,7 +11,9 @@ import {
   PointerSensor,
   useSensor,
   useSensors,
-  type Modifier,
+  useDraggable,
+  useDroppable,
+  type DragEndEvent,
 } from '@dnd-kit/core';
 import {
   SortableContext,
@@ -25,9 +28,21 @@ import {
   DropdownMenuContent,
   DropdownMenuItem,
   DropdownMenuTrigger,
+  DropdownMenuSub,
+  DropdownMenuSubTrigger,
+  DropdownMenuSubContent,
+  DropdownMenuSeparator,
 } from '@/components/ui/dropdown-menu';
 
 import { ScrollableOverlay } from '@/components/ui/ScrollableOverlay';
+import {
+  Dialog,
+  DialogContent,
+  DialogHeader,
+  DialogTitle,
+  DialogDescription,
+  DialogFooter,
+} from '@/components/ui/dialog';
 import { Tooltip, TooltipTrigger, TooltipContent } from '@/components/ui/tooltip';
 import { GridLoader } from '@/components/ui/grid-loader';
 import { MobileOverlayPanel } from '@/components/ui/MobileOverlayPanel';
@@ -35,14 +50,19 @@ import {
   RiAddLine,
   RiArrowDownSLine,
   RiArrowRightSLine,
+  RiCheckboxBlankLine,
+  RiCheckboxLine,
   RiCheckLine,
   RiCloseLine,
   RiDeleteBinLine,
   RiErrorWarningLine,
   RiFileCopyLine,
   RiFolderAddLine,
+  RiFolderLine,
   RiGitBranchLine,
   RiGitPullRequestLine,
+  RiGitRepositoryLine,
+  RiNodeTree,
   RiStickyNoteLine,
   RiLinkUnlinkM,
 
@@ -50,8 +70,10 @@ import {
 
   RiMore2Line,
   RiPencilAiLine,
+  RiPushpinLine,
   RiShare2Line,
   RiShieldLine,
+  RiUnpinLine,
 } from '@remixicon/react';
 import { sessionEvents } from '@/lib/sessionEvents';
 import { ArrowsMerge } from '@/components/icons/ArrowsMerge';
@@ -74,6 +96,9 @@ import { updateDesktopSettings } from '@/lib/persistence';
 import { GitHubIssuePickerDialog } from './GitHubIssuePickerDialog';
 import { GitHubPullRequestPickerDialog } from './GitHubPullRequestPickerDialog';
 import { ProjectNotesTodoPanel } from './ProjectNotesTodoPanel';
+import { BranchPickerDialog } from './BranchPickerDialog';
+import { useSessionFoldersStore } from '@/stores/useSessionFoldersStore';
+import { SessionFolderItem } from './SessionFolderItem';
 
 const ATTENTION_DIAMOND_INDICES = new Set([1, 3, 4, 5, 7]);
 
@@ -86,6 +111,11 @@ const GROUP_ORDER_STORAGE_KEY = 'oc.sessions.groupOrder';
 const GROUP_COLLAPSE_STORAGE_KEY = 'oc.sessions.groupCollapse';
 const PROJECT_ACTIVE_SESSION_STORAGE_KEY = 'oc.sessions.activeSessionByProject';
 const SESSION_EXPANDED_STORAGE_KEY = 'oc.sessions.expandedParents';
+const SESSION_PINNED_STORAGE_KEY = 'oc.sessions.pinned';
+
+const SESSION_PREFETCH_HOVER_DELAY_MS = 180;
+const SESSION_PREFETCH_CONCURRENCY = 1;
+const SESSION_PREFETCH_PENDING_LIMIT = 6;
 
 const formatDateLabel = (value: string | number) => {
   const targetDate = new Date(value);
@@ -110,6 +140,25 @@ const formatDateLabel = (value: string | number) => {
     year: 'numeric',
   });
   return formatted.replace(',', '');
+};
+
+/** Returns relative time if updated today, otherwise falls back to formatDateLabel using updated time. */
+const formatSessionDateLabel = (updatedMs: number): string => {
+  const today = new Date();
+  const updatedDate = new Date(updatedMs);
+  const isSameDay = (a: Date, b: Date) =>
+    a.getFullYear() === b.getFullYear() &&
+    a.getMonth() === b.getMonth() &&
+    a.getDate() === b.getDate();
+
+  if (isSameDay(updatedDate, today)) {
+    const diff = Date.now() - updatedMs;
+    if (diff < 60_000) return 'Just now';
+    if (diff < 3_600_000) return `${Math.floor(diff / 60_000)}min ago`;
+    return `${Math.floor(diff / 3_600_000)}h ago`;
+  }
+
+  return formatDateLabel(updatedMs);
 };
 
 const normalizePath = (value?: string | null) => {
@@ -146,17 +195,30 @@ const toFiniteNumber = (value: unknown): number | undefined => {
   return undefined;
 };
 
-const centerDragOverlayUnderPointer: Modifier = ({ transform, activeNodeRect, activatorEvent }) => {
-  if (!(activatorEvent instanceof MouseEvent) || !activeNodeRect) {
-    return transform;
+const getSessionCreatedAt = (session: Session): number => {
+  return toFiniteNumber(session.time?.created) ?? 0;
+};
+
+const getSessionUpdatedAt = (session: Session): number => {
+  return toFiniteNumber(session.time?.updated) ?? toFiniteNumber(session.time?.created) ?? 0;
+};
+
+const compareSessionsByPinnedAndTime = (
+  a: Session,
+  b: Session,
+  pinnedSessionIds: Set<string>
+): number => {
+  const aPinned = pinnedSessionIds.has(a.id);
+  const bPinned = pinnedSessionIds.has(b.id);
+  if (aPinned !== bPinned) {
+    return aPinned ? -1 : 1;
   }
-  const overlayHeight = 32;
-  const pointerLiftY = 16;
-  return {
-    ...transform,
-    x: transform.x,
-    y: transform.y - overlayHeight / 2 - pointerLiftY,
-  };
+
+  if (aPinned && bPinned) {
+    return getSessionCreatedAt(b) - getSessionCreatedAt(a);
+  }
+
+  return getSessionUpdatedAt(b) - getSessionUpdatedAt(a);
 };
 
 // Format project label: kebab-case/snake_case → Title Case
@@ -182,6 +244,148 @@ type SessionGroup = {
   directory: string | null;
   sessions: SessionNode[];
 };
+
+// --- Session Folder DnD helpers ---
+
+/**
+ * Wraps a session row so the entire row is draggable onto folder drop zones.
+ * Stops pointer propagation so the outer group-reorder DndContext does not
+ * capture the drag (otherwise dragging a session moves the whole workspace group).
+ */
+const DraggableSessionRow: React.FC<{
+  sessionId: string;
+  sessionDirectory: string | null;
+  sessionTitle: string;
+  children: React.ReactNode;
+}> = ({ sessionId, sessionDirectory, sessionTitle, children }) => {
+  const { attributes, listeners, setNodeRef, isDragging } = useDraggable({
+    id: `session-drag:${sessionId}`,
+    data: { type: 'session', sessionId, sessionDirectory, sessionTitle },
+  });
+
+  const handlePointerDown = React.useCallback(
+    (e: React.PointerEvent<HTMLDivElement>) => {
+      // Stop event from bubbling to the outer group-reorder DndContext
+      e.stopPropagation();
+      if (listeners?.onPointerDown) {
+        (listeners.onPointerDown as (event: React.PointerEvent) => void)(e);
+      }
+    },
+    [listeners],
+  );
+
+  return (
+    <div
+      ref={setNodeRef}
+      {...attributes}
+      onPointerDown={handlePointerDown}
+      className={isDragging ? 'opacity-30' : undefined}
+    >
+      {children}
+    </div>
+  );
+};
+
+/**
+ * Wraps a <SessionFolderItem> and makes it a droppable target.
+ * Uses a render-prop pattern so the ref/isOver state can be passed
+ * down as props (avoids hooks-in-callbacks restrictions).
+ */
+const DroppableFolderWrapper: React.FC<{
+  folderId: string;
+  children: (
+    droppableRef: (node: HTMLElement | null) => void,
+    isOver: boolean,
+  ) => React.ReactNode;
+}> = ({ folderId, children }) => {
+  const { setNodeRef, isOver } = useDroppable({
+    id: `folder-drop:${folderId}`,
+    data: { type: 'folder', folderId },
+  });
+  return <>{children(setNodeRef, isOver)}</>;
+};
+
+/**
+ * Provides an inner DndContext scoped to one group, allowing sessions to be
+ * dragged onto folder headers within that group.
+ */
+const SessionFolderDndScope: React.FC<{
+  scopeKey: string | null;
+  hasFolders: boolean;
+  onSessionDroppedOnFolder: (sessionId: string, folderId: string) => void;
+  children: React.ReactNode;
+}> = ({ scopeKey, hasFolders, onSessionDroppedOnFolder, children }) => {
+  const sensors = useSensors(
+    useSensor(PointerSensor, { activationConstraint: { distance: 8 } }),
+  );
+  const [activeDragId, setActiveDragId] = React.useState<string | null>(null);
+  const [activeDragTitle, setActiveDragTitle] = React.useState<string>('Session');
+  const [activeDragWidth, setActiveDragWidth] = React.useState<number | null>(null);
+  const [activeDragHeight, setActiveDragHeight] = React.useState<number | null>(null);
+
+  // Always need DndContext when scopeKey exists (DraggableSessionRow requires it).
+  // When there are no folders the drag just has nowhere to land – that's fine.
+  if (!scopeKey) {
+    return <>{children}</>;
+  }
+
+  const handleDragEnd = (event: DragEndEvent) => {
+    setActiveDragId(null);
+    setActiveDragWidth(null);
+    setActiveDragHeight(null);
+    const { active, over } = event;
+    if (!over) return;
+    const activeData = active.data.current as { type?: string; sessionId?: string } | undefined;
+    const overData = over.data.current as { type?: string; folderId?: string } | undefined;
+    if (activeData?.type === 'session' && activeData.sessionId && overData?.type === 'folder' && overData.folderId) {
+      onSessionDroppedOnFolder(activeData.sessionId, overData.folderId);
+    }
+  };
+
+  return (
+    <DndContext
+      sensors={sensors}
+      collisionDetection={closestCenter}
+      onDragStart={(event) => {
+        const data = event.active.data.current as { type?: string; sessionId?: string; sessionTitle?: string } | undefined;
+        if (data?.type === 'session' && data.sessionId) {
+          setActiveDragId(data.sessionId);
+          setActiveDragTitle(data.sessionTitle ?? 'Session');
+          const width = event.active.rect.current.initial?.width;
+          const height = event.active.rect.current.initial?.height;
+          setActiveDragWidth(typeof width === 'number' ? width : null);
+          setActiveDragHeight(typeof height === 'number' ? height : null);
+        }
+      }}
+      onDragCancel={() => {
+        setActiveDragId(null);
+        setActiveDragWidth(null);
+        setActiveDragHeight(null);
+      }}
+      onDragEnd={handleDragEnd}
+    >
+      {children}
+      <DragOverlay>
+        {activeDragId && hasFolders ? (
+          <div 
+            style={{ 
+              width: activeDragWidth ? `${activeDragWidth}px` : 'auto',
+              height: activeDragHeight ? `${activeDragHeight}px` : 'auto'
+            }}
+            className="flex items-center rounded-lg border border-[var(--interactive-border)] bg-[var(--surface-elevated)] px-2.5 py-1 shadow-none pointer-events-none"
+          >
+            <RiStickyNoteLine className="h-4 w-4 text-muted-foreground mr-2 flex-shrink-0" />
+            <div className="min-w-0 flex-1 truncate typography-ui-label font-normal text-foreground">
+              {activeDragTitle}
+            </div>
+          </div>
+        ) : null}
+      </DragOverlay>
+    </DndContext>
+  );
+};
+
+// --- End Session Folder DnD helpers ---
 
 interface SortableProjectItemProps {
   id: string;
@@ -252,13 +456,19 @@ const SortableProjectItem: React.FC<SortableProjectItemProps> = ({
     attributes,
     listeners,
     setNodeRef,
+    transform,
+    transition,
     isDragging,
   } = useSortable({ id });
 
   const [isMenuOpen, setIsMenuOpen] = React.useState(false);
 
   return (
-    <div ref={setNodeRef} className={cn('relative', isDragging && 'opacity-40')}>
+    <div
+      ref={setNodeRef}
+      style={{ transform: CSS.Transform.toString(transform), transition }}
+      className={cn('relative', isDragging && 'opacity-30')}
+    >
       {!hideHeader ? (
         <>
           {/* Sentinel for sticky detection */}
@@ -275,11 +485,11 @@ const SortableProjectItem: React.FC<SortableProjectItemProps> = ({
           <div
             className={cn(
               'sticky top-0 z-10 pt-2 pb-1.5 w-full text-left cursor-pointer group/project border-b select-none',
-              !isDesktopShell && 'bg-sidebar',
+              !isDesktopShell && 'bg-transparent',
             )}
             style={{
               backgroundColor: isDesktopShell
-                ? isStuck ? 'var(--sidebar-stuck-bg)' : 'transparent'
+                ? (isStuck ? 'transparent' : 'transparent')
                 : undefined,
               borderColor: isHovered
                 ? 'var(--color-border-hover)'
@@ -494,10 +704,13 @@ const SortableGroupItemBase: React.FC<{
   return (
     <div
       ref={setNodeRef}
-      style={{ transform: CSS.Transform.toString(transform), transition, willChange: 'transform' }}
+      style={{
+        transform: CSS.Transform.toString(transform),
+        transition,
+      }}
       className={cn(
         'space-y-0.5 rounded-md',
-        isDragging && 'opacity-0',
+        isDragging && 'opacity-50',
       )}
       {...attributes}
       {...listeners}
@@ -509,22 +722,14 @@ const SortableGroupItemBase: React.FC<{
 
 const SortableGroupItem = React.memo(SortableGroupItemBase);
 
-const GroupDragOverlayBase: React.FC<{ label: string; showBranchIcon: boolean; width?: number }> = ({ label, showBranchIcon, width }) => {
-  return (
-    <div style={width ? { width: `${width}px` } : undefined} className="h-8 min-w-[180px] max-w-[320px] rounded-sm border border-border bg-sidebar px-2 shadow-lg flex items-center gap-1.5">
-      {showBranchIcon ? <RiGitBranchLine className="h-3.5 w-3.5 flex-shrink-0 text-muted-foreground" /> : null}
-      <p className="text-[15px] font-semibold truncate text-foreground">{label}</p>
-    </div>
-  );
-};
 
-const GroupDragOverlay = React.memo(GroupDragOverlayBase);
 
 interface SessionSidebarProps {
   mobileVariant?: boolean;
   onSessionSelected?: (sessionId: string) => void;
   allowReselect?: boolean;
   hideDirectoryControls?: boolean;
+  hideProjectSelector?: boolean;
   showOnlyMainWorkspace?: boolean;
 }
 
@@ -533,6 +738,7 @@ export const SessionSidebar: React.FC<SessionSidebarProps> = ({
   onSessionSelected,
   allowReselect = false,
   hideDirectoryControls = false,
+  hideProjectSelector = true,
   showOnlyMainWorkspace = false,
 }) => {
   const [editingId, setEditingId] = React.useState<string | null>(null);
@@ -545,6 +751,7 @@ export const SessionSidebar: React.FC<SessionSidebarProps> = ({
   const [directoryStatus, setDirectoryStatus] = React.useState<Map<string, 'unknown' | 'exists' | 'missing'>>(
     () => new Map(),
   );
+  const directoryStatusRef = React.useRef<Map<string, 'unknown' | 'exists' | 'missing'>>(new Map());
   const checkingDirectories = React.useRef<Set<string>>(new Set());
   const safeStorage = React.useMemo(() => getSafeStorage(), []);
   const [collapsedProjects, setCollapsedProjects] = React.useState<Set<string>>(new Set());
@@ -554,9 +761,35 @@ export const SessionSidebar: React.FC<SessionSidebarProps> = ({
   const [hoveredProjectId, setHoveredProjectId] = React.useState<string | null>(null);
   const [issuePickerOpen, setIssuePickerOpen] = React.useState(false);
   const [pullRequestPickerOpen, setPullRequestPickerOpen] = React.useState(false);
+  const [isBranchPickerOpen, setIsBranchPickerOpen] = React.useState(false);
   const [projectNotesPanelOpen, setProjectNotesPanelOpen] = React.useState(false);
   const [stuckProjectHeaders, setStuckProjectHeaders] = React.useState<Set<string>>(new Set());
   const [openMenuSessionId, setOpenMenuSessionId] = React.useState<string | null>(null);
+  const [renamingFolderId, setRenamingFolderId] = React.useState<string | null>(null);
+  const [renameFolderDraft, setRenameFolderDraft] = React.useState('');
+  const [deleteSessionConfirm, setDeleteSessionConfirm] = React.useState<{
+    session: Session;
+    descendantCount: number;
+  } | null>(null);
+  const [deleteFolderConfirm, setDeleteFolderConfirm] = React.useState<{
+    scopeKey: string;
+    folderId: string;
+    folderName: string;
+    subFolderCount: number;
+    sessionCount: number;
+  } | null>(null);
+  const [pinnedSessionIds, setPinnedSessionIds] = React.useState<Set<string>>(() => {
+    try {
+      const raw = getSafeStorage().getItem(SESSION_PINNED_STORAGE_KEY);
+      if (!raw) {
+        return new Set();
+      }
+      const parsed = JSON.parse(raw) as string[];
+      return new Set(Array.isArray(parsed) ? parsed.filter((item) => typeof item === 'string') : []);
+    } catch {
+      return new Set();
+    }
+  });
   const [collapsedGroups, setCollapsedGroups] = React.useState<Set<string>>(() => {
     try {
       const raw = getSafeStorage().getItem(GROUP_COLLAPSE_STORAGE_KEY);
@@ -605,8 +838,7 @@ export const SessionSidebar: React.FC<SessionSidebarProps> = ({
       return new Map();
     }
   });
-  const [activeDraggedGroupId, setActiveDraggedGroupId] = React.useState<string | null>(null);
-  const [activeDraggedGroupWidth, setActiveDraggedGroupWidth] = React.useState<number | null>(null);
+
   const [isProjectRenameInline, setIsProjectRenameInline] = React.useState(false);
   const [projectRenameDraft, setProjectRenameDraft] = React.useState('');
   const [projectRootBranches, setProjectRootBranches] = React.useState<Map<string, string>>(new Map());
@@ -623,7 +855,6 @@ export const SessionSidebar: React.FC<SessionSidebarProps> = ({
   const activeProjectId = useProjectsStore((state) => state.activeProjectId);
   const addProject = useProjectsStore((state) => state.addProject);
   const removeProject = useProjectsStore((state) => state.removeProject);
-  const setActiveProject = useProjectsStore((state) => state.setActiveProject);
   const setActiveProjectIdOnly = useProjectsStore((state) => state.setActiveProjectIdOnly);
   const renameProject = useProjectsStore((state) => state.renameProject);
 
@@ -632,12 +863,27 @@ export const SessionSidebar: React.FC<SessionSidebarProps> = ({
   const setSessionSwitcherOpen = useUIStore((state) => state.setSessionSwitcherOpen);
   const setDeviceLoginOpen = useUIStore((state) => state.setDeviceLoginOpen);
   const openMultiRunLauncher = useUIStore((state) => state.openMultiRunLauncher);
+  const notifyOnSubtasks = useUIStore((state) => state.notifyOnSubtasks);
+  const showDeletionDialog = useUIStore((state) => state.showDeletionDialog);
+  const setShowDeletionDialog = useUIStore((state) => state.setShowDeletionDialog);
   const settingsAutoCreateWorktree = useConfigStore((state) => state.settingsAutoCreateWorktree);
 
   const instances = useInstancesStore((state) => state.instances);
   const currentInstanceId = useInstancesStore((state) => state.currentInstanceId);
   const setCurrentInstance = useInstancesStore((state) => state.setCurrentInstance);
   const touchInstance = useInstancesStore((state) => state.touchInstance);
+
+  // Session Folders store
+  const collapsedFolderIds = useSessionFoldersStore((state) => state.collapsedFolderIds);
+  const getFoldersForScope = useSessionFoldersStore((state) => state.getFoldersForScope);
+  const createFolder = useSessionFoldersStore((state) => state.createFolder);
+  const renameFolder = useSessionFoldersStore((state) => state.renameFolder);
+  const deleteFolder = useSessionFoldersStore((state) => state.deleteFolder);
+  const addSessionToFolder = useSessionFoldersStore((state) => state.addSessionToFolder);
+  const removeSessionFromFolder = useSessionFoldersStore((state) => state.removeSessionFromFolder);
+  const toggleFolderCollapse = useSessionFoldersStore((state) => state.toggleFolderCollapse);
+  const cleanupSessions = useSessionFoldersStore((state) => state.cleanupSessions);
+  const getSessionFolderId = useSessionFoldersStore((state) => state.getSessionFolderId);
 
   const gitDirectories = useGitStore((state) => state.directories);
 
@@ -646,6 +892,7 @@ export const SessionSidebar: React.FC<SessionSidebarProps> = ({
   const currentSessionId = useSessionStore((state) => state.currentSessionId);
   const newSessionDraftOpen = useSessionStore((state) => Boolean(state.newSessionDraft?.open));
   const setCurrentSession = useSessionStore((state) => state.setCurrentSession);
+  const loadMessages = useSessionStore((state) => state.loadMessages);
   const updateSessionTitle = useSessionStore((state) => state.updateSessionTitle);
   const shareSession = useSessionStore((state) => state.shareSession);
   const unshareSession = useSessionStore((state) => state.unshareSession);
@@ -659,7 +906,7 @@ export const SessionSidebar: React.FC<SessionSidebarProps> = ({
   const openNewSessionDraft = useSessionStore((state) => state.openNewSessionDraft);
 
   const tauriIpcAvailable = React.useMemo(() => isTauriShell(), []);
-  const isDesktopShellRuntime = React.useMemo(() => isDesktopShell(), []);
+  const isDesktopShellRuntime = isDesktopShell();
 
   const isVSCode = React.useMemo(() => isVSCodeRuntime(), []);
 
@@ -728,9 +975,138 @@ export const SessionSidebar: React.FC<SessionSidebarProps> = ({
     } catch { /* ignored */ }
   }, [safeStorage]);
 
-  const sortedSessions = React.useMemo(() => {
-    return [...sessions].sort((a, b) => (b.time?.updated || 0) - (a.time?.updated || 0));
+  React.useEffect(() => {
+    const existingSessionIds = new Set(sessions.map((session) => session.id));
+    setPinnedSessionIds((prev) => {
+      let changed = false;
+      const next = new Set<string>();
+      prev.forEach((id) => {
+        if (existingSessionIds.has(id)) {
+          next.add(id);
+        } else {
+          changed = true;
+        }
+      });
+      return changed ? next : prev;
+    });
   }, [sessions]);
+
+  React.useEffect(() => {
+    try {
+      safeStorage.setItem(SESSION_PINNED_STORAGE_KEY, JSON.stringify(Array.from(pinnedSessionIds)));
+    } catch {
+      // ignored
+    }
+  }, [pinnedSessionIds, safeStorage]);
+
+  const togglePinnedSession = React.useCallback((sessionId: string) => {
+    setPinnedSessionIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(sessionId)) {
+        next.delete(sessionId);
+      } else {
+        next.add(sessionId);
+      }
+      return next;
+    });
+  }, []);
+
+  const sortedSessions = React.useMemo(() => {
+    return [...sessions].sort((a, b) => compareSessionsByPinnedAndTime(a, b, pinnedSessionIds));
+  }, [sessions, pinnedSessionIds]);
+
+  React.useEffect(() => {
+    directoryStatusRef.current = directoryStatus;
+  }, [directoryStatus]);
+
+  const sessionPrefetchTimersRef = React.useRef<Map<string, number>>(new Map());
+  const sessionPrefetchQueueRef = React.useRef<string[]>([]);
+  const sessionPrefetchInFlightRef = React.useRef<Set<string>>(new Set());
+
+  const pumpSessionPrefetchQueue = React.useCallback(() => {
+    if (typeof window === 'undefined') {
+      return;
+    }
+
+    while (sessionPrefetchInFlightRef.current.size < SESSION_PREFETCH_CONCURRENCY && sessionPrefetchQueueRef.current.length > 0) {
+      const nextSessionId = sessionPrefetchQueueRef.current.shift();
+      if (!nextSessionId) {
+        break;
+      }
+
+      const state = useSessionStore.getState();
+      if (state.currentSessionId === nextSessionId) {
+        continue;
+      }
+
+      const hasMessages = state.messages.has(nextSessionId);
+      const memory = state.sessionMemoryState.get(nextSessionId);
+      const isHydrated = hasMessages && memory?.historyComplete !== undefined;
+      if (isHydrated) {
+        continue;
+      }
+
+      sessionPrefetchInFlightRef.current.add(nextSessionId);
+      void loadMessages(nextSessionId)
+        .catch(() => {
+          return;
+        })
+        .finally(() => {
+          sessionPrefetchInFlightRef.current.delete(nextSessionId);
+          pumpSessionPrefetchQueue();
+        });
+    }
+  }, [loadMessages]);
+
+  const scheduleSessionPrefetch = React.useCallback((sessionId: string | null | undefined) => {
+    if (!sessionId || sessionId === currentSessionId || typeof window === 'undefined') {
+      return;
+    }
+
+    const state = useSessionStore.getState();
+    const hasMessages = state.messages.has(sessionId);
+    const memory = state.sessionMemoryState.get(sessionId);
+    const isHydrated = hasMessages && memory?.historyComplete !== undefined;
+    if (isHydrated) {
+      return;
+    }
+
+    if (sessionPrefetchInFlightRef.current.has(sessionId)) {
+      return;
+    }
+
+    if (sessionPrefetchQueueRef.current.includes(sessionId)) {
+      return;
+    }
+
+    if (sessionPrefetchQueueRef.current.length >= SESSION_PREFETCH_PENDING_LIMIT) {
+      sessionPrefetchQueueRef.current.shift();
+    }
+
+    const existingTimer = sessionPrefetchTimersRef.current.get(sessionId);
+    if (existingTimer !== undefined) {
+      window.clearTimeout(existingTimer);
+    }
+
+    const timer = window.setTimeout(() => {
+      sessionPrefetchTimersRef.current.delete(sessionId);
+      sessionPrefetchQueueRef.current.push(sessionId);
+      pumpSessionPrefetchQueue();
+    }, SESSION_PREFETCH_HOVER_DELAY_MS);
+    sessionPrefetchTimersRef.current.set(sessionId, timer);
+  }, [currentSessionId, pumpSessionPrefetchQueue]);
+
+  React.useEffect(() => {
+    if (!currentSessionId || sortedSessions.length === 0) {
+      return;
+    }
+    const currentIndex = sortedSessions.findIndex((session) => session.id === currentSessionId);
+    if (currentIndex < 0) {
+      return;
+    }
+    scheduleSessionPrefetch(sortedSessions[currentIndex - 1]?.id);
+    scheduleSessionPrefetch(sortedSessions[currentIndex + 1]?.id);
+  }, [currentSessionId, scheduleSessionPrefetch, sortedSessions]);
 
   React.useEffect(() => {
     let cancelled = false;
@@ -784,9 +1160,9 @@ export const SessionSidebar: React.FC<SessionSidebarProps> = ({
       collection.push(session);
       map.set(parentID, collection);
     });
-    map.forEach((list) => list.sort((a, b) => (b.time?.updated || 0) - (a.time?.updated || 0)));
+    map.forEach((list) => list.sort((a, b) => compareSessionsByPinnedAndTime(a, b, pinnedSessionIds)));
     return map;
-  }, [sortedSessions]);
+  }, [sortedSessions, pinnedSessionIds]);
 
   React.useEffect(() => {
     const directories = new Set<string>();
@@ -804,7 +1180,7 @@ export const SessionSidebar: React.FC<SessionSidebarProps> = ({
     });
 
     directories.forEach((directory) => {
-      const known = directoryStatus.get(directory);
+      const known = directoryStatusRef.current.get(directory);
       if ((known && known !== 'unknown') || checkingDirectories.current.has(directory)) {
         return;
       }
@@ -857,13 +1233,19 @@ export const SessionSidebar: React.FC<SessionSidebarProps> = ({
           checkingDirectories.current.delete(directory);
         });
     });
-  }, [sortedSessions, projects, directoryStatus]);
+  }, [sortedSessions, projects]);
 
   React.useEffect(() => {
+    const prefetchTimers = sessionPrefetchTimersRef.current;
     return () => {
       if (copyTimeout.current) {
         clearTimeout(copyTimeout.current);
       }
+      prefetchTimers.forEach((timer) => {
+        clearTimeout(timer);
+      });
+      prefetchTimers.clear();
+      sessionPrefetchQueueRef.current = [];
     };
   }, []);
 
@@ -966,8 +1348,12 @@ export const SessionSidebar: React.FC<SessionSidebarProps> = ({
   );
 
   const handleCopyShareUrl = React.useCallback((url: string, sessionId: string) => {
-    writeTextToClipboard(url)
-      .then(() => {
+    void copyTextToClipboard(url)
+      .then((result) => {
+        if (!result.ok) {
+          toast.error('Failed to copy URL');
+          return;
+        }
         setCopiedSessionId(sessionId);
         if (copyTimeout.current) {
           clearTimeout(copyTimeout.current);
@@ -1013,42 +1399,56 @@ export const SessionSidebar: React.FC<SessionSidebarProps> = ({
   const deleteSession = useSessionStore((state) => state.deleteSession);
   const deleteSessions = useSessionStore((state) => state.deleteSessions);
 
-  const handleDeleteSession = React.useCallback(
+  const executeDeleteSession = React.useCallback(
     async (session: Session) => {
       const descendants = collectDescendants(session.id);
-
       if (descendants.length === 0) {
-
         const success = await deleteSession(session.id);
         if (success) {
-          toast.success('Session deleted', {
-            action: {
-              label: 'OK',
-              onClick: () => { },
-            },
-          });
+          toast.success('Session deleted');
         } else {
           toast.error('Failed to delete session');
         }
-      } else {
+        return;
+      }
 
-        const ids = [session.id, ...descendants.map((s) => s.id)];
-        const { deletedIds, failedIds } = await deleteSessions(ids);
-        if (deletedIds.length > 0) {
-          toast.success(`Deleted ${deletedIds.length} session${deletedIds.length === 1 ? '' : 's'}`, {
-            action: {
-              label: 'OK',
-              onClick: () => { },
-            },
-          });
-        }
-        if (failedIds.length > 0) {
-          toast.error(`Failed to delete ${failedIds.length} session${failedIds.length === 1 ? '' : 's'}`);
-        }
+      const ids = [session.id, ...descendants.map((s) => s.id)];
+      const { deletedIds, failedIds } = await deleteSessions(ids);
+      if (deletedIds.length > 0) {
+        toast.success(`Deleted ${deletedIds.length} session${deletedIds.length === 1 ? '' : 's'}`);
+      }
+      if (failedIds.length > 0) {
+        toast.error(`Failed to delete ${failedIds.length} session${failedIds.length === 1 ? '' : 's'}`);
       }
     },
     [collectDescendants, deleteSession, deleteSessions],
   );
+
+  const handleDeleteSession = React.useCallback(
+    (session: Session) => {
+      const descendants = collectDescendants(session.id);
+      if (!showDeletionDialog) {
+        void executeDeleteSession(session);
+        return;
+      }
+      setDeleteSessionConfirm({ session, descendantCount: descendants.length });
+    },
+    [collectDescendants, showDeletionDialog, executeDeleteSession],
+  );
+
+  const confirmDeleteSession = React.useCallback(async () => {
+    if (!deleteSessionConfirm) return;
+    const { session } = deleteSessionConfirm;
+    setDeleteSessionConfirm(null);
+    await executeDeleteSession(session);
+  }, [deleteSessionConfirm, executeDeleteSession]);
+
+  const confirmDeleteFolder = React.useCallback(() => {
+    if (!deleteFolderConfirm) return;
+    const { scopeKey, folderId } = deleteFolderConfirm;
+    setDeleteFolderConfirm(null);
+    deleteFolder(scopeKey, folderId);
+  }, [deleteFolderConfirm, deleteFolder]);
 
   const handleOpenDirectoryDialog = React.useCallback(() => {
     if (!tauriIpcAvailable || !isDesktopLocalOriginActive()) {
@@ -1093,6 +1493,24 @@ export const SessionSidebar: React.FC<SessionSidebarProps> = ({
     });
   }, [safeStorage]);
 
+  const createFolderAndStartRename = React.useCallback(
+    (scopeKey: string, parentId?: string | null) => {
+      if (!scopeKey) {
+        return null;
+      }
+
+      if (parentId && collapsedFolderIds.has(parentId)) {
+        toggleFolderCollapse(parentId);
+      }
+
+      const newFolder = createFolder(scopeKey, 'New folder', parentId);
+      setRenamingFolderId(newFolder.id);
+      setRenameFolderDraft(newFolder.name);
+      return newFolder;
+    },
+    [collapsedFolderIds, toggleFolderCollapse, createFolder],
+  );
+
   const buildNode = React.useCallback(
     (session: Session): SessionNode => {
       const children = childrenMap.get(session.id) ?? [];
@@ -1115,7 +1533,7 @@ export const SessionSidebar: React.FC<SessionSidebarProps> = ({
       projectIsRepo: boolean,
     ) => {
       const normalizedProjectRoot = normalizePath(projectRoot ?? null);
-      const sortedProjectSessions = [...projectSessions].sort((a, b) => (b.time?.updated || 0) - (a.time?.updated || 0));
+      const sortedProjectSessions = [...projectSessions].sort((a, b) => compareSessionsByPinnedAndTime(a, b, pinnedSessionIds));
 
       const sessionMap = new Map(sortedProjectSessions.map((session) => [session.id, session]));
       const childrenMap = new Map<string, Session[]>();
@@ -1128,7 +1546,7 @@ export const SessionSidebar: React.FC<SessionSidebarProps> = ({
         collection.push(session);
         childrenMap.set(parentID, collection);
       });
-      childrenMap.forEach((list) => list.sort((a, b) => (b.time?.updated || 0) - (a.time?.updated || 0)));
+      childrenMap.forEach((list) => list.sort((a, b) => compareSessionsByPinnedAndTime(a, b, pinnedSessionIds)));
 
       // Build worktree lookup map
       const worktreeByPath = new Map<string, WorktreeMetadata>();
@@ -1217,11 +1635,21 @@ export const SessionSidebar: React.FC<SessionSidebarProps> = ({
 
       sortedWorktrees.forEach((meta) => {
         const directory = normalizePath(meta.path) ?? meta.path;
-        const label = meta.label || meta.name || formatDirectoryName(directory, homeDirectory) || directory;
+        const currentBranch = gitDirectories.get(directory)?.status?.current?.trim() || null;
+        const metadataBranch = meta.branch?.trim() || null;
+        const shouldSyncLabelWithBranch = Boolean(
+          currentBranch
+          && metadataBranch
+          && meta.label
+          && normalizeForBranchComparison(meta.label) === normalizeForBranchComparison(metadataBranch),
+        );
+        const label = shouldSyncLabelWithBranch
+          ? currentBranch!
+          : (meta.label || meta.name || formatDirectoryName(directory, homeDirectory) || directory);
         groups.push({
           id: `worktree:${directory}`,
           label,
-          branch: meta.branch || null,
+          branch: currentBranch || metadataBranch,
           description: formatPathForDisplay(directory, homeDirectory),
           isMain: false,
           worktree: meta,
@@ -1236,10 +1664,11 @@ export const SessionSidebar: React.FC<SessionSidebarProps> = ({
         .sort((a, b) => (groupOrder.get(a) ?? 0) - (groupOrder.get(b) ?? 0));
 
       orphanKeys.forEach((directory) => {
+        const currentBranch = gitDirectories.get(directory)?.status?.current?.trim() || null;
         groups.push({
           id: `worktree:orphan:${directory}`,
           label: formatDirectoryName(directory, homeDirectory) || directory,
-          branch: null,
+          branch: currentBranch,
           description: formatPathForDisplay(directory, homeDirectory),
           isMain: false,
           worktree: null,
@@ -1250,7 +1679,7 @@ export const SessionSidebar: React.FC<SessionSidebarProps> = ({
 
       return groups;
     },
-    [homeDirectory, worktreeMetadata]
+    [homeDirectory, worktreeMetadata, pinnedSessionIds, gitDirectories]
   );
 
   const toggleGroupSessionLimit = React.useCallback((groupId: string) => {
@@ -1365,6 +1794,31 @@ export const SessionSidebar: React.FC<SessionSidebarProps> = ({
     };
   }, [normalizedProjects, projectGitBranchesKey]);
 
+  // Session Folders: cleanup stale session IDs when sessions are removed.
+  // Guard: skip cleanup while sessions are still loading to avoid wiping folder
+  // assignments before the server has returned its full session list.
+  const isSessionsLoading = useSessionStore((state) => state.isLoading);
+  React.useEffect(() => {
+    if (isSessionsLoading) return;
+    const idsByScope = new Map<string, Set<string>>();
+    sessions.forEach((session) => {
+      const directory = normalizePath((session as Session & { directory?: string | null }).directory ?? null);
+      if (!directory) return;
+      const existing = idsByScope.get(directory);
+      if (existing) {
+        existing.add(session.id);
+        return;
+      }
+      idsByScope.set(directory, new Set([session.id]));
+    });
+
+    const currentFoldersMap = useSessionFoldersStore.getState().foldersMap;
+    const allScopeKeys = new Set([...Object.keys(currentFoldersMap), ...idsByScope.keys()]);
+    allScopeKeys.forEach((scopeKey) => {
+      cleanupSessions(scopeKey, idsByScope.get(scopeKey) ?? new Set<string>());
+    });
+  }, [sessions, isSessionsLoading, cleanupSessions]); // removed foldersMap from deps to prevent cascade re-renders
+
   const getSessionsForProject = React.useCallback(
     (project: { normalizedPath: string }) => {
       // In VS Code, only show sessions from the main project directory (skip worktrees)
@@ -1395,16 +1849,25 @@ export const SessionSidebar: React.FC<SessionSidebarProps> = ({
     [availableWorktreesByProject, getSessionsByDirectory, sessionsByDirectory, isVSCode],
   );
 
+  // Keep last-known repo status to avoid UI jiggling during project switch
+  const lastRepoStatusRef = React.useRef(false);
+  if (activeProjectId && projectRepoStatus.has(activeProjectId)) {
+    lastRepoStatusRef.current = Boolean(projectRepoStatus.get(activeProjectId));
+  }
+
   const projectSections = React.useMemo(() => {
     return normalizedProjects.map((project) => {
       const projectSessions = getSessionsForProject(project);
       const worktreesForProject = availableWorktreesByProject.get(project.normalizedPath) ?? [];
+      const isRepo = projectRepoStatus.has(project.id)
+        ? Boolean(projectRepoStatus.get(project.id))
+        : lastRepoStatusRef.current;
       const groups = buildGroupedSessions(
         projectSessions,
         project.normalizedPath,
         worktreesForProject,
         projectRootBranches.get(project.id) ?? null,
-        Boolean(projectRepoStatus.get(project.id)),
+        isRepo,
       );
       return {
         project,
@@ -1434,11 +1897,26 @@ export const SessionSidebar: React.FC<SessionSidebarProps> = ({
       : null),
     [activeProjectForHeader],
   );
+  const branchPickerProject = React.useMemo(() => {
+    if (!activeProjectForHeader) {
+      return null;
+    }
+    return {
+      id: activeProjectForHeader.id,
+      path: activeProjectForHeader.path,
+      normalizedPath: activeProjectForHeader.normalizedPath,
+      label: activeProjectForHeader.label,
+    };
+  }, [activeProjectForHeader]);
 
   const activeProjectIsRepo = React.useMemo(
     () => (activeProjectForHeader ? Boolean(projectRepoStatus.get(activeProjectForHeader.id)) : false),
     [activeProjectForHeader, projectRepoStatus],
   );
+  // Only flip to false once the new project's status is actually resolved (present in map)
+  const stableActiveProjectIsRepo = activeProjectForHeader && projectRepoStatus.has(activeProjectForHeader.id)
+    ? activeProjectIsRepo
+    : lastRepoStatusRef.current;
   const reserveHeaderActionsSpace = Boolean(activeProjectForHeader);
   const useMobileNotesPanel = mobileVariant || deviceInfo.isMobile;
 
@@ -1649,8 +2127,19 @@ export const SessionSidebar: React.FC<SessionSidebarProps> = ({
     setIsProjectRenameInline(false);
   }, [activeProjectForHeader, projectRenameDraft, renameProject]);
 
-  const headerActionButtonClass =
-    'inline-flex h-6 w-6 items-center justify-center rounded-md text-muted-foreground hover:text-foreground hover:bg-interactive-hover/50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/50';
+  const desktopHeaderActionButtonClass =
+    'inline-flex h-6 w-6 items-center justify-center rounded-md leading-none text-foreground hover:bg-interactive-hover focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/50';
+  const mobileHeaderActionButtonClass =
+    'inline-flex h-6 w-6 items-center justify-center rounded-md leading-none text-muted-foreground hover:text-foreground hover:bg-interactive-hover/50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/50';
+  const headerActionButtonClass = mobileVariant ? mobileHeaderActionButtonClass : desktopHeaderActionButtonClass;
+  const headerActionIconClass = 'h-4.5 w-4.5';
+  const addProjectButtonClass = cn(
+    'inline-flex items-center justify-center rounded-md focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/50',
+    mobileVariant
+      ? 'h-8 w-8 text-muted-foreground hover:text-foreground hover:bg-interactive-hover/50'
+      : 'h-8 w-8 text-foreground hover:bg-interactive-hover',
+    !isDesktopShellRuntime && 'bg-transparent hover:bg-sidebar/40',
+  );
 
   const isMobileRuntime = React.useMemo(() => {
     return detectMobileRuntime();
@@ -1729,25 +2218,20 @@ export const SessionSidebar: React.FC<SessionSidebarProps> = ({
       const isActive = currentSessionId === session.id;
       const sessionTitle = session.title || 'Untitled Session';
       const hasChildren = node.children.length > 0;
+      const isPinnedSession = pinnedSessionIds.has(session.id);
       const isExpanded = expandedParents.has(session.id);
-      const needsAttention = sessionAttentionStates.get(session.id)?.needsAttention === true;
+      const isSubtaskSession = Boolean((session as Session & { parentID?: string | null }).parentID);
+      const rawNeedsAttention = sessionAttentionStates.get(session.id)?.needsAttention === true;
+      // When notifyOnSubtasks is disabled, suppress attention dots for child sessions.
+      const needsAttention = rawNeedsAttention && (!isSubtaskSession || notifyOnSubtasks);
       const sessionSummary = session.summary as
         | {
           additions?: number | string | null;
           deletions?: number | string | null;
+          files?: number | null;
           diffs?: Array<{ additions?: number | string | null; deletions?: number | string | null }>;
         }
         | undefined;
-      const diffTotals = sessionSummary?.diffs?.reduce<{ additions: number; deletions: number }>(
-        (acc, diff) => ({
-          additions: acc.additions + (toFiniteNumber(diff?.additions) ?? 0),
-          deletions: acc.deletions + (toFiniteNumber(diff?.deletions) ?? 0),
-        }),
-        { additions: 0, deletions: 0 },
-      );
-      const additions = toFiniteNumber(sessionSummary?.additions) ?? diffTotals?.additions;
-      const deletions = toFiniteNumber(sessionSummary?.deletions) ?? diffTotals?.deletions;
-      const hasSummary = typeof additions === 'number' || typeof deletions === 'number';
 
       if (editingId === session.id) {
         return (
@@ -1809,15 +2293,13 @@ export const SessionSidebar: React.FC<SessionSidebarProps> = ({
                     )}
                   </span>
                 ) : null}
-                <span className="flex-shrink-0">{formatDateLabel(session.time?.created || Date.now())}</span>
+                <span className="flex-shrink-0">{formatSessionDateLabel(session.time?.updated || session.time?.created || Date.now())}</span>
                 {session.share ? (
                   <RiShare2Line className="h-3 w-3 text-[color:var(--status-info)] flex-shrink-0" />
                 ) : null}
-                {hasSummary && ((additions ?? 0) !== 0 || (deletions ?? 0) !== 0) ? (
-                  <span className="flex-shrink-0 text-[0.7rem] leading-none">
-                    <span className="text-[color:var(--status-success)]">+{Math.max(0, additions ?? 0)}</span>
-                    <span className="text-muted-foreground/50">/</span>
-                    <span className="text-destructive">-{Math.max(0, deletions ?? 0)}</span>
+                {(sessionSummary?.files ?? 0) > 0 ? (
+                  <span className="flex-shrink-0">
+                    · {sessionSummary!.files} {sessionSummary!.files === 1 ? 'file' : 'files'} changed
                   </span>
                 ) : null}
                 {hasChildren ? (
@@ -1847,6 +2329,7 @@ export const SessionSidebar: React.FC<SessionSidebarProps> = ({
 
       return (
         <React.Fragment key={session.id}>
+          <DraggableSessionRow sessionId={session.id} sessionDirectory={sessionDirectory ?? null} sessionTitle={sessionTitle}>
           <div
             className={cn(
               'group relative flex items-center rounded-md px-1.5 py-1',
@@ -1873,8 +2356,8 @@ export const SessionSidebar: React.FC<SessionSidebarProps> = ({
                 )}
               >
                 {}
-                <div className="flex w-full items-center gap-2 min-w-0 flex-1 overflow-hidden">
-                  {showStatusMarker ? (
+                  <div className="flex w-full items-center gap-2 min-w-0 flex-1 overflow-hidden">
+                    {showStatusMarker ? (
                     <span className="inline-flex h-3.5 w-3.5 flex-shrink-0 items-center justify-center">
                       {isStreaming ? (
                         <GridLoader size="xs" className="text-primary" />
@@ -1894,6 +2377,9 @@ export const SessionSidebar: React.FC<SessionSidebarProps> = ({
                         </span>
                       )}
                     </span>
+                  ) : null}
+                  {isPinnedSession ? (
+                    <RiPushpinLine className="h-3 w-3 flex-shrink-0 text-primary" aria-label="Pinned session" />
                   ) : null}
                   <div className="block min-w-0 flex-1 truncate typography-ui-label font-normal text-foreground">
                     {sessionTitle}
@@ -1938,15 +2424,13 @@ export const SessionSidebar: React.FC<SessionSidebarProps> = ({
                       )}
                     </span>
                   ) : null}
-                  <span className="flex-shrink-0">{formatDateLabel(session.time?.created || Date.now())}</span>
+                  <span className="flex-shrink-0">{formatSessionDateLabel(session.time?.updated || session.time?.created || Date.now())}</span>
                   {session.share ? (
                     <RiShare2Line className="h-3 w-3 text-[color:var(--status-info)] flex-shrink-0" />
                   ) : null}
-                  {hasSummary && ((additions ?? 0) !== 0 || (deletions ?? 0) !== 0) ? (
-                    <span className="flex-shrink-0 text-[0.7rem] leading-none">
-                      <span className="text-[color:var(--status-success)]">+{Math.max(0, additions ?? 0)}</span>
-                      <span className="text-muted-foreground/50">/</span>
-                      <span className="text-destructive">-{Math.max(0, deletions ?? 0)}</span>
+                  {(sessionSummary?.files ?? 0) > 0 ? (
+                    <span className="flex-shrink-0">
+                      · {sessionSummary!.files} {sessionSummary!.files === 1 ? 'file' : 'files'} changed
                     </span>
                   ) : null}
                   {hasChildren ? (
@@ -1983,7 +2467,15 @@ export const SessionSidebar: React.FC<SessionSidebarProps> = ({
                       <RiMore2Line className={mobileVariant ? 'h-4 w-4' : 'h-3.5 w-3.5'} />
                     </button>
                   </DropdownMenuTrigger>
-                  <DropdownMenuContent align="end" className="min-w-[180px]">
+                  <DropdownMenuContent
+                    align="end"
+                    className="min-w-[180px]"
+                    onCloseAutoFocus={(event) => {
+                      if (renamingFolderId) {
+                        event.preventDefault();
+                      }
+                    }}
+                  >
                     <DropdownMenuItem
                       onClick={() => {
                         setEditingId(session.id);
@@ -1993,6 +2485,14 @@ export const SessionSidebar: React.FC<SessionSidebarProps> = ({
                     >
                       <RiPencilAiLine className="mr-1 h-4 w-4" />
                       Rename
+                    </DropdownMenuItem>
+                    <DropdownMenuItem onClick={() => togglePinnedSession(session.id)} className="[&>svg]:mr-1">
+                      {isPinnedSession ? (
+                        <RiUnpinLine className="mr-1 h-4 w-4" />
+                      ) : (
+                        <RiPushpinLine className="mr-1 h-4 w-4" />
+                      )}
+                      {isPinnedSession ? 'Unpin session' : 'Pin session'}
                     </DropdownMenuItem>
                     {!session.share ? (
                       <DropdownMenuItem onClick={() => handleShareSession(session)} className="[&>svg]:mr-1">
@@ -2027,6 +2527,72 @@ export const SessionSidebar: React.FC<SessionSidebarProps> = ({
                         </DropdownMenuItem>
                       </>
                     )}
+                    {/* Move to folder submenu */}
+                    {sessionDirectory ? (() => {
+                      const scopeFolders = getFoldersForScope(sessionDirectory);
+                      const currentFolderId = getSessionFolderId(sessionDirectory, session.id);
+                      return (
+                        <>
+                          <DropdownMenuSeparator />
+                          <DropdownMenuSub>
+                            <DropdownMenuSubTrigger className="[&>svg]:mr-1">
+                              <RiFolderLine className="h-4 w-4" />
+                              Move to folder
+                            </DropdownMenuSubTrigger>
+                            <DropdownMenuSubContent className="min-w-[180px]">
+                              {scopeFolders.length === 0 ? (
+                                <DropdownMenuItem disabled className="text-muted-foreground">
+                                  No folders yet
+                                </DropdownMenuItem>
+                              ) : (
+                                scopeFolders.map((folder) => (
+                                  <DropdownMenuItem
+                                    key={folder.id}
+                                    onClick={() => {
+                                      if (currentFolderId === folder.id) {
+                                        removeSessionFromFolder(sessionDirectory, session.id);
+                                      } else {
+                                        addSessionToFolder(sessionDirectory, folder.id, session.id);
+                                      }
+                                    }}
+                                  >
+                                    <span className="flex-1 truncate">{folder.name}</span>
+                                    {currentFolderId === folder.id ? (
+                                      <RiCheckLine className="ml-2 h-3.5 w-3.5 text-primary flex-shrink-0" />
+                                    ) : null}
+                                  </DropdownMenuItem>
+                                ))
+                              )}
+                              <DropdownMenuSeparator />
+                              <DropdownMenuItem
+                                 onClick={() => {
+                                    const newFolder = createFolderAndStartRename(sessionDirectory);
+                                    if (!newFolder) {
+                                      return;
+                                    }
+                                    addSessionToFolder(sessionDirectory, newFolder.id, session.id);
+                                  }}
+                              >
+                                <RiAddLine className="mr-1 h-4 w-4" />
+                                New folder...
+                              </DropdownMenuItem>
+                              {currentFolderId ? (
+                                <DropdownMenuItem
+                                  onClick={() => {
+                                    removeSessionFromFolder(sessionDirectory, session.id);
+                                  }}
+                                  className="text-destructive focus:text-destructive"
+                                >
+                                  <RiCloseLine className="mr-1 h-4 w-4" />
+                                  Remove from folder
+                                </DropdownMenuItem>
+                              ) : null}
+                            </DropdownMenuSubContent>
+                          </DropdownMenuSub>
+                        </>
+                      );
+                    })() : null}
+                    <DropdownMenuSeparator />
                     <DropdownMenuItem
                       className="text-destructive focus:text-destructive [&>svg]:mr-1"
                       onClick={() => handleDeleteSession(session)}
@@ -2039,6 +2605,7 @@ export const SessionSidebar: React.FC<SessionSidebarProps> = ({
               </div>
             </div>
           </div>
+          </DraggableSessionRow>
           {hasChildren && isExpanded
             ? node.children.map((child) =>
                 renderSessionNode(child, depth + 1, sessionDirectory ?? groupDirectory, projectId),
@@ -2062,6 +2629,8 @@ export const SessionSidebar: React.FC<SessionSidebarProps> = ({
       toggleParent,
       handleSessionSelect,
       handleSessionDoubleClick,
+      pinnedSessionIds,
+      togglePinnedSession,
       handleShareSession,
       handleCopyShareUrl,
       handleUnshareSession,
@@ -2069,6 +2638,13 @@ export const SessionSidebar: React.FC<SessionSidebarProps> = ({
       copiedSessionId,
       mobileVariant,
       openMenuSessionId,
+      renamingFolderId,
+      getFoldersForScope,
+      getSessionFolderId,
+      addSessionToFolder,
+      removeSessionFromFolder,
+      createFolderAndStartRename,
+      notifyOnSubtasks,
     ],
   );
 
@@ -2077,8 +2653,28 @@ export const SessionSidebar: React.FC<SessionSidebarProps> = ({
       const isExpanded = expandedSessionGroups.has(groupKey);
       const isCollapsed = collapsedGroups.has(groupKey);
       const maxVisible = hideDirectoryControls ? 10 : 5;
-      const totalSessions = group.sessions.length;
-      const visibleSessions = isExpanded ? group.sessions : group.sessions.slice(0, maxVisible);
+
+      // --- Session Folders: split into foldered vs ungrouped ---
+      const folderScopeKey = normalizePath(group.directory ?? null);
+      const scopeFolders = folderScopeKey ? getFoldersForScope(folderScopeKey) : [];
+      const sessionIdsInFolders = new Set(scopeFolders.flatMap((f) => f.sessionIds));
+      const ungroupedSessions = group.sessions.filter((node) => !sessionIdsInFolders.has(node.session.id));
+
+      // ALL folders for this scope – including empty ones (so newly created folders show up)
+      // Build enriched list: { folder, nodes } for every folder in scope
+      const allFoldersForGroup = scopeFolders.map((folder) => {
+        const nodes = folder.sessionIds
+          .map((sid) => group.sessions.find((node) => node.session.id === sid))
+          .filter((n): n is SessionNode => Boolean(n))
+          .sort((a, b) => compareSessionsByPinnedAndTime(a.session, b.session, pinnedSessionIds));
+        return { folder, nodes };
+      });
+
+      // Root-level folders (no parentId) — sub-folders are rendered inside their parent
+      const rootFolders = allFoldersForGroup.filter(({ folder }) => !folder.parentId);
+
+      const totalSessions = ungroupedSessions.length;
+      const visibleSessions = isExpanded ? ungroupedSessions : ungroupedSessions.slice(0, maxVisible);
       const remainingCount = totalSessions - visibleSessions.length;
       const collectGroupSessions = (nodes: SessionNode[]): Session[] => {
         const collected: Session[] = [];
@@ -2095,7 +2691,9 @@ export const SessionSidebar: React.FC<SessionSidebarProps> = ({
       };
       const allGroupSessions = collectGroupSessions(group.sessions);
       const normalizedGroupDirectory = normalizePath(group.directory ?? null);
-      const isGitProject = Boolean(projectId && projectRepoStatus.get(projectId));
+      const isGitProject = projectId && projectRepoStatus.has(projectId)
+        ? Boolean(projectRepoStatus.get(projectId))
+        : lastRepoStatusRef.current;
       const showBranchSubtitle = !group.isMain && isBranchDifferentFromLabel(group.branch, group.label);
       const isActiveGroup = Boolean(
         normalizedGroupDirectory
@@ -2103,14 +2701,106 @@ export const SessionSidebar: React.FC<SessionSidebarProps> = ({
           && normalizedGroupDirectory === currentSessionDirectory,
       );
 
+      // Helper: render a single folder item (root or sub) wrapped in DroppableFolderWrapper
+      const renderOneFolderItem = (folder: (typeof allFoldersForGroup)[number]['folder'], nodes: SessionNode[], depth: number) => {
+        // Find direct sub-folders of this folder
+        const directSubFolders = allFoldersForGroup.filter(({ folder: f }) => f.parentId === folder.id);
+        const subFolderItems = directSubFolders.length > 0 ? (
+          <>{directSubFolders.map(({ folder: sf, nodes: sn }) => renderOneFolderItem(sf, sn, depth + 1))}</>
+        ) : undefined;
+
+        return (
+          <DroppableFolderWrapper key={folder.id} folderId={folder.id}>
+            {(droppableRef, isDropTarget) => (
+              <SessionFolderItem
+                folder={folder}
+                sessions={nodes}
+                subFolderItems={subFolderItems}
+                isCollapsed={collapsedFolderIds.has(folder.id)}
+                onToggle={() => toggleFolderCollapse(folder.id)}
+                onRename={(name) => {
+                  if (folderScopeKey) renameFolder(folderScopeKey, folder.id, name);
+                }}
+                 onDelete={() => {
+                   if (!folderScopeKey) return;
+                   if (!showDeletionDialog) {
+                     deleteFolder(folderScopeKey, folder.id);
+                     return;
+                   }
+                   // Count affected sub-folders and sessions for the confirm dialog
+                   const subFolderCount = allFoldersForGroup.filter(({ folder: f }) => f.parentId === folder.id).length;
+                   const sessionCount = nodes.length;
+                   setDeleteFolderConfirm({
+                     scopeKey: folderScopeKey,
+                     folderId: folder.id,
+                     folderName: folder.name,
+                     subFolderCount,
+                     sessionCount,
+                   });
+                 }}
+                renderSessionNode={renderSessionNode}
+                groupDirectory={group.directory}
+                projectId={projectId}
+                mobileVariant={mobileVariant}
+                isRenaming={renamingFolderId === folder.id}
+                renameDraft={renamingFolderId === folder.id ? renameFolderDraft : undefined}
+                onRenameDraftChange={(value) => setRenameFolderDraft(value)}
+                onRenameSave={() => {
+                  const trimmed = renameFolderDraft.trim();
+                  if (trimmed && folderScopeKey) {
+                    renameFolder(folderScopeKey, folder.id, trimmed);
+                  }
+                  setRenamingFolderId(null);
+                  setRenameFolderDraft('');
+                }}
+                onRenameCancel={() => {
+                  setRenamingFolderId(null);
+                  setRenameFolderDraft('');
+                }}
+                droppableRef={droppableRef}
+                isDropTarget={isDropTarget}
+                depth={depth}
+                onNewSession={() => {
+                  if (projectId && projectId !== activeProjectId) {
+                    setActiveProjectIdOnly(projectId);
+                  }
+                  setActiveMainTab('chat');
+                  if (mobileVariant) {
+                    setSessionSwitcherOpen(false);
+                  }
+                  openNewSessionDraft({ directoryOverride: group.directory, targetFolderId: folder.id });
+                }}
+                onNewSubFolder={depth === 0 ? () => {
+                  if (!folderScopeKey) return;
+                  createFolderAndStartRename(folderScopeKey, folder.id);
+                } : undefined}
+              />
+            )}
+          </DroppableFolderWrapper>
+        );
+      };
+
       // VS Code sessions list uses a separate header (Agent Manager / New Session).
       // When the caller requests a flat list (hideGroupLabel), omit the per-group header entirely.
+      // Shared folder rendering helper (used in both branches).
+      // Uses DroppableFolderWrapper so each folder header becomes a DnD drop zone.
+      const renderFolderItems = () =>
+        rootFolders.map(({ folder, nodes }) => renderOneFolderItem(folder, nodes, 0));
+
       if (hideGroupLabel) {
         return (
           <div className="oc-group">
             <div className="oc-group-body pb-3">
+              <SessionFolderDndScope
+                scopeKey={folderScopeKey}
+                hasFolders={allFoldersForGroup.length > 0}
+                onSessionDroppedOnFolder={(sessionId, folderId) => {
+                  if (folderScopeKey) addSessionToFolder(folderScopeKey, folderId, sessionId);
+                }}
+              >
+              {renderFolderItems()}
               {visibleSessions.map((node) => renderSessionNode(node, 0, group.directory, projectId))}
-              {totalSessions === 0 ? (
+              {totalSessions === 0 && scopeFolders.length === 0 ? (
                 <div className="py-1 text-left typography-micro text-muted-foreground">
                   No sessions in this workspace yet.
                 </div>
@@ -2133,6 +2823,7 @@ export const SessionSidebar: React.FC<SessionSidebarProps> = ({
                   Show fewer sessions
                 </button>
               ) : null}
+              </SessionFolderDndScope>
             </div>
           </div>
         );
@@ -2142,7 +2833,7 @@ export const SessionSidebar: React.FC<SessionSidebarProps> = ({
         <div className="oc-group">
           <div
             className={cn(
-              "group/gh flex items-center justify-between gap-2 py-1 min-w-0 rounded-sm",
+              "group/gh relative flex items-center justify-between gap-1 py-1 min-w-0 rounded-sm",
               !hideGroupLabel && "hover:bg-interactive-hover/50 cursor-pointer"
             )}
             onClick={!hideGroupLabel ? () => {
@@ -2175,17 +2866,19 @@ export const SessionSidebar: React.FC<SessionSidebarProps> = ({
             aria-label={!hideGroupLabel ? (isCollapsed ? `Expand ${group.label}` : `Collapse ${group.label}`) : undefined}
           >
             {!hideGroupLabel ? (
-              <div className="min-w-0 flex items-center gap-1.5 px-0">
-                {isCollapsed ? (
-                  <RiArrowRightSLine className="h-3.5 w-3.5 flex-shrink-0 text-muted-foreground" />
-                ) : (
-                  <RiArrowDownSLine className="h-3.5 w-3.5 flex-shrink-0 text-muted-foreground" />
-                )}
+              <div className={cn(
+                "min-w-0 flex items-center gap-1.5 pl-1.5 transition-[padding]",
+                mobileVariant
+                  ? (!group.isMain && group.worktree ? "pr-14" : "pr-7")
+                  : (!group.isMain && group.worktree
+                    ? "group-hover/gh:pr-14 group-focus-within/gh:pr-14"
+                    : "group-hover/gh:pr-7 group-focus-within/gh:pr-7"),
+              )}>
                 {!group.isMain || isGitProject ? (
                   <RiGitBranchLine className="h-3.5 w-3.5 flex-shrink-0 text-muted-foreground" />
                 ) : null}
                 <div className="min-w-0 flex flex-col justify-center">
-                  <p className={cn('text-[15px] font-semibold truncate', isActiveGroup ? 'text-primary' : 'text-muted-foreground')}>
+                  <p className={cn('text-[14px] font-semibold truncate', isActiveGroup ? 'text-primary' : 'text-muted-foreground')}>
                     {group.label}
                   </p>
                   {showBranchSubtitle ? (
@@ -2194,91 +2887,112 @@ export const SessionSidebar: React.FC<SessionSidebarProps> = ({
                     </span>
                   ) : null}
                 </div>
+                {isCollapsed ? (
+                  <RiArrowRightSLine className="h-3.5 w-3.5 flex-shrink-0 text-muted-foreground" />
+                ) : (
+                  <RiArrowDownSLine className="h-3.5 w-3.5 flex-shrink-0 text-muted-foreground" />
+                )}
               </div>
             ) : <div />}
             {group.directory ? (
-              <div className="flex items-center gap-1 px-0.5">
+              <>
                 {!group.isMain && group.worktree ? (
+                  <div className={cn(
+                    'absolute right-7 top-1/2 -translate-y-1/2 z-10 transition-opacity',
+                    mobileVariant ? 'opacity-100' : 'opacity-0 group-hover/gh:opacity-100 group-focus-within/gh:opacity-100',
+                  )}>
+                    <Tooltip>
+                      <TooltipTrigger asChild>
+                        <button
+                          type="button"
+                          onClick={(event) => {
+                            event.stopPropagation();
+                            sessionEvents.requestDelete({
+                              sessions: allGroupSessions,
+                              mode: 'worktree',
+                              worktree: group.worktree,
+                            });
+                          }}
+                          className="inline-flex h-6 w-6 items-center justify-center rounded-md text-muted-foreground hover:text-destructive hover:bg-interactive-hover/50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/50"
+                          aria-label={`Delete ${group.label}`}
+                        >
+                          <RiDeleteBinLine className="h-4 w-4" />
+                        </button>
+                      </TooltipTrigger>
+                      <TooltipContent side="bottom" sideOffset={4}>
+                        <p>Delete worktree</p>
+                      </TooltipContent>
+                    </Tooltip>
+                  </div>
+                ) : null}
+                <div className={cn(
+                  'absolute right-0.5 top-1/2 -translate-y-1/2 z-10 transition-opacity',
+                  mobileVariant ? 'opacity-100' : 'opacity-0 group-hover/gh:opacity-100 group-focus-within/gh:opacity-100',
+                )}>
                   <Tooltip>
                     <TooltipTrigger asChild>
                       <button
                         type="button"
                         onClick={(event) => {
                           event.stopPropagation();
-                          sessionEvents.requestDelete({
-                            sessions: allGroupSessions,
-                            mode: 'worktree',
-                            worktree: group.worktree,
-                          });
+                          if (projectId && projectId !== activeProjectId) {
+                            setActiveProjectIdOnly(projectId);
+                          }
+                          setActiveMainTab('chat');
+                          if (mobileVariant) {
+                            setSessionSwitcherOpen(false);
+                          }
+                          openNewSessionDraft({ directoryOverride: group.directory });
                         }}
-                        className={cn(
-                          'inline-flex h-6 w-6 items-center justify-center rounded-md text-muted-foreground hover:text-destructive hover:bg-interactive-hover/50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/50 transition-opacity',
-                          mobileVariant ? 'opacity-100' : 'opacity-0 group-hover/gh:opacity-100 group-focus-within/gh:opacity-100',
-                        )}
-                        aria-label={`Delete ${group.label}`}
+                        className="inline-flex h-6 w-6 items-center justify-center rounded-md text-muted-foreground hover:text-foreground hover:bg-interactive-hover/50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/50"
+                        aria-label={`New session in ${group.label}`}
                       >
-                        <RiDeleteBinLine className="h-4 w-4" />
+                        <RiAddLine className="h-4 w-4" />
                       </button>
                     </TooltipTrigger>
                     <TooltipContent side="bottom" sideOffset={4}>
-                      <p>Delete worktree</p>
+                      <p>New session</p>
                     </TooltipContent>
                   </Tooltip>
-                ) : null}
-                <Tooltip>
-                  <TooltipTrigger asChild>
-                    <button
-                      type="button"
-                      onClick={(event) => {
-                        event.stopPropagation();
-                        if (projectId && projectId !== activeProjectId) {
-                          setActiveProject(projectId);
-                        }
-                        setActiveMainTab('chat');
-                        if (mobileVariant) {
-                          setSessionSwitcherOpen(false);
-                        }
-                        openNewSessionDraft({ directoryOverride: group.directory });
-                      }}
-                      className="inline-flex h-6 w-6 items-center justify-center rounded-md text-muted-foreground hover:text-foreground hover:bg-interactive-hover/50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/50"
-                      aria-label={`New session in ${group.label}`}
-                    >
-                      <RiAddLine className="h-4 w-4" />
-                    </button>
-                  </TooltipTrigger>
-                  <TooltipContent side="bottom" sideOffset={4}>
-                    <p>New session</p>
-                  </TooltipContent>
-                </Tooltip>
-              </div>
+                </div>
+              </>
             ) : null}
           </div>
           {!isCollapsed ? (
             <div className="oc-group-body pb-3">
-              {visibleSessions.map((node) => renderSessionNode(node, 0, group.directory, projectId))}
-              {totalSessions === 0 ? (
-                <div className="py-1 text-left typography-micro text-muted-foreground">
-                  No sessions in this workspace yet.
-                </div>
-              ) : null}
-              {remainingCount > 0 && !isExpanded ? (
-                <button
-                  type="button"
-                  onClick={() => toggleGroupSessionLimit(groupKey)}
-                  className="mt-0.5 flex items-center justify-start rounded-md px-1.5 py-0.5 text-left text-xs text-muted-foreground/70 leading-tight hover:text-foreground hover:underline"
-                >
-                  Show {remainingCount} more {remainingCount === 1 ? 'session' : 'sessions'}
-                </button>
-              ) : null}
-              {isExpanded && totalSessions > maxVisible ? (
-                <button
-                  type="button"
-                  onClick={() => toggleGroupSessionLimit(groupKey)}
-                  className="mt-0.5 flex items-center justify-start rounded-md px-1.5 py-0.5 text-left text-xs text-muted-foreground/70 leading-tight hover:text-foreground hover:underline"
-                >
-                  Show fewer sessions
-                </button>
-              ) : null}
+              <SessionFolderDndScope
+                scopeKey={folderScopeKey}
+                hasFolders={allFoldersForGroup.length > 0}
+                onSessionDroppedOnFolder={(sessionId, folderId) => {
+                  if (folderScopeKey) addSessionToFolder(folderScopeKey, folderId, sessionId);
+                }}
+              >
+                {renderFolderItems()}
+                {visibleSessions.map((node) => renderSessionNode(node, 0, group.directory, projectId))}
+                {totalSessions === 0 && scopeFolders.length === 0 ? (
+                  <div className="py-1 text-left typography-micro text-muted-foreground">
+                    No sessions in this workspace yet.
+                  </div>
+                ) : null}
+                {remainingCount > 0 && !isExpanded ? (
+                  <button
+                    type="button"
+                    onClick={() => toggleGroupSessionLimit(groupKey)}
+                    className="mt-0.5 flex items-center justify-start rounded-md px-1.5 py-0.5 text-left text-xs text-muted-foreground/70 leading-tight hover:text-foreground hover:underline"
+                  >
+                    Show {remainingCount} more {remainingCount === 1 ? 'session' : 'sessions'}
+                  </button>
+                ) : null}
+                {isExpanded && totalSessions > maxVisible ? (
+                  <button
+                    type="button"
+                    onClick={() => toggleGroupSessionLimit(groupKey)}
+                    className="mt-0.5 flex items-center justify-start rounded-md px-1.5 py-0.5 text-left text-xs text-muted-foreground/70 leading-tight hover:text-foreground hover:underline"
+                  >
+                    Show fewer sessions
+                  </button>
+                ) : null}
+              </SessionFolderDndScope>
             </div>
           ) : null}
         </div>
@@ -2293,11 +3007,22 @@ export const SessionSidebar: React.FC<SessionSidebarProps> = ({
       renderSessionNode,
       toggleGroupSessionLimit,
       activeProjectId,
-      setActiveProject,
+      setActiveProjectIdOnly,
       setActiveMainTab,
       mobileVariant,
       setSessionSwitcherOpen,
       openNewSessionDraft,
+      getFoldersForScope,
+      collapsedFolderIds,
+      toggleFolderCollapse,
+      createFolderAndStartRename,
+      renameFolder,
+      deleteFolder,
+      showDeletionDialog,
+      addSessionToFolder,
+      renamingFolderId,
+      renameFolderDraft,
+      pinnedSessionIds,
     ]
   );
 
@@ -2317,11 +3042,11 @@ export const SessionSidebar: React.FC<SessionSidebarProps> = ({
     <div
       className={cn(
         'flex h-full flex-col text-foreground overflow-x-hidden',
-        mobileVariant ? '' : 'bg-sidebar',
+        mobileVariant ? '' : 'bg-transparent',
       )}
     >
       {!hideDirectoryControls && (
-        <div className="select-none pl-3.5 pr-2 py-1.5 flex-shrink-0 border-b border-border/60">
+        <div className={cn('select-none pl-3.5 pr-2 flex-shrink-0 border-b border-border/60', hideProjectSelector ? 'py-1' : 'py-1.5')}>
           {showMobileInstanceSwitcher ? (
             <div className="mb-1 flex h-8 items-center justify-between gap-2">
               <DropdownMenu>
@@ -2366,6 +3091,7 @@ export const SessionSidebar: React.FC<SessionSidebarProps> = ({
               </button>
             </div>
           ) : null}
+          {!hideProjectSelector && (
           <div className="flex h-8 items-center justify-between gap-2">
             <DropdownMenu
               onOpenChange={(open) => {
@@ -2401,7 +3127,7 @@ export const SessionSidebar: React.FC<SessionSidebarProps> = ({
                   return (
                     <DropdownMenuItem
                       key={project.id}
-                      onClick={() => setActiveProject(project.id)}
+                      onClick={() => setActiveProjectIdOnly(project.id)}
                       className={cn('truncate', project.id === activeProjectId && 'text-primary')}
                     >
                       <span className="truncate">{label}</span>
@@ -2476,21 +3202,19 @@ export const SessionSidebar: React.FC<SessionSidebarProps> = ({
             <button
               type="button"
               onClick={handleOpenDirectoryDialog}
-              className={cn(
-                'inline-flex h-8 w-8 items-center justify-center rounded-md text-muted-foreground hover:text-foreground hover:bg-interactive-hover/50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/50',
-                    !isDesktopShellRuntime && 'bg-sidebar/60 hover:bg-sidebar',
-              )}
+              className={addProjectButtonClass}
               aria-label="Add project"
               title="Add project"
             >
-              <RiFolderAddLine className="h-4.5 w-4.5" />
+              <RiFolderAddLine className={headerActionIconClass} />
             </button>
           </div>
+          )}
           {reserveHeaderActionsSpace ? (
-            <div className="mt-1 h-8 pl-1">
+            <div className="-ml-1 flex h-8 items-center">
               {activeProjectForHeader ? (
-              <div className="inline-flex h-8 items-center gap-1.5 rounded-md pl-0 pr-1">
-              {activeProjectIsRepo ? (
+              <div className="flex h-8 -translate-y-px items-center gap-1.5 rounded-md pl-0 pr-1">
+              {stableActiveProjectIsRepo ? (
                 <>
               <Tooltip>
                 <TooltipTrigger asChild>
@@ -2501,7 +3225,7 @@ export const SessionSidebar: React.FC<SessionSidebarProps> = ({
                         return;
                       }
                       if (activeProjectForHeader.id !== activeProjectId) {
-                        setActiveProject(activeProjectForHeader.id);
+                        setActiveProjectIdOnly(activeProjectForHeader.id);
                       }
                       const newWorktreePath = await createWorktreeOnly();
                       if (!newWorktreePath) {
@@ -2516,7 +3240,7 @@ export const SessionSidebar: React.FC<SessionSidebarProps> = ({
                     className={headerActionButtonClass}
                     aria-label="New worktree"
                   >
-                    <RiGitBranchLine className="h-4.5 w-4.5" />
+                    <RiNodeTree className={headerActionIconClass} />
                   </button>
                 </TooltipTrigger>
                 <TooltipContent side="bottom" sideOffset={4}><p>New worktree</p></TooltipContent>
@@ -2529,7 +3253,7 @@ export const SessionSidebar: React.FC<SessionSidebarProps> = ({
                     className={headerActionButtonClass}
                     aria-label="New from issue"
                   >
-                    <RiGithubLine className="h-4.5 w-4.5" />
+                    <RiGithubLine className={headerActionIconClass} />
                   </button>
                 </TooltipTrigger>
                 <TooltipContent side="bottom" sideOffset={4}><p>New from issue</p></TooltipContent>
@@ -2542,7 +3266,7 @@ export const SessionSidebar: React.FC<SessionSidebarProps> = ({
                     className={headerActionButtonClass}
                     aria-label="New from PR"
                   >
-                    <RiGitPullRequestLine className="h-4.5 w-4.5" />
+                    <RiGitPullRequestLine className={headerActionIconClass} />
                   </button>
                 </TooltipTrigger>
                 <TooltipContent side="bottom" sideOffset={4}><p>New from PR</p></TooltipContent>
@@ -2555,12 +3279,27 @@ export const SessionSidebar: React.FC<SessionSidebarProps> = ({
                     className={headerActionButtonClass}
                     aria-label="New multi-run"
                   >
-                    <ArrowsMerge className="h-4.5 w-4.5" />
+                    <ArrowsMerge className={headerActionIconClass} />
                   </button>
                 </TooltipTrigger>
                 <TooltipContent side="bottom" sideOffset={4}><p>New multi-run</p></TooltipContent>
               </Tooltip>
                 </>
+              ) : null}
+              {stableActiveProjectIsRepo && branchPickerProject ? (
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <button
+                      type="button"
+                      onClick={() => setIsBranchPickerOpen(true)}
+                      className={headerActionButtonClass}
+                      aria-label="Manage branches"
+                    >
+                      <RiGitRepositoryLine className={headerActionIconClass} />
+                    </button>
+                  </TooltipTrigger>
+                  <TooltipContent side="bottom" sideOffset={4}><p>Manage branches</p></TooltipContent>
+                </Tooltip>
               ) : null}
               {useMobileNotesPanel ? (
                 <Tooltip>
@@ -2571,7 +3310,7 @@ export const SessionSidebar: React.FC<SessionSidebarProps> = ({
                       className={headerActionButtonClass}
                       aria-label="Project notes and todos"
                     >
-                      <RiStickyNoteLine className="h-4.5 w-4.5" />
+                      <RiStickyNoteLine className={headerActionIconClass} />
                     </button>
                   </TooltipTrigger>
                   <TooltipContent side="bottom" sideOffset={4}><p>Project notes</p></TooltipContent>
@@ -2586,7 +3325,7 @@ export const SessionSidebar: React.FC<SessionSidebarProps> = ({
                           className={headerActionButtonClass}
                           aria-label="Project notes and todos"
                         >
-                          <RiStickyNoteLine className="h-4.5 w-4.5" />
+                          <RiStickyNoteLine className={headerActionIconClass} />
                         </button>
                       </DropdownMenuTrigger>
                     </TooltipTrigger>
@@ -2595,7 +3334,7 @@ export const SessionSidebar: React.FC<SessionSidebarProps> = ({
                   <DropdownMenuContent align="start" className="w-[340px] p-0">
                     <ProjectNotesTodoPanel
                       projectRef={activeProjectRefForHeader}
-                      canCreateWorktree={activeProjectIsRepo}
+                      canCreateWorktree={stableActiveProjectIsRepo}
                       onActionComplete={() => setProjectNotesPanelOpen(false)}
                     />
                   </DropdownMenuContent>
@@ -2676,7 +3415,7 @@ export const SessionSidebar: React.FC<SessionSidebarProps> = ({
                     onHoverChange={(hovered) => setHoveredProjectId(hovered ? projectKey : null)}
                     onNewSession={() => {
                       if (projectKey !== activeProjectId) {
-                        setActiveProject(projectKey);
+                        setActiveProjectIdOnly(projectKey);
                       }
                       setActiveMainTab('chat');
                       if (mobileVariant) {
@@ -2686,7 +3425,7 @@ export const SessionSidebar: React.FC<SessionSidebarProps> = ({
                     }}
                     onNewWorktreeSession={() => {
                       if (projectKey !== activeProjectId) {
-                        setActiveProject(projectKey);
+                        setActiveProjectIdOnly(projectKey);
                       }
                       setActiveMainTab('chat');
                       if (mobileVariant) {
@@ -2696,19 +3435,19 @@ export const SessionSidebar: React.FC<SessionSidebarProps> = ({
                     }}
                     onNewSessionFromGitHubIssue={() => {
                       if (projectKey !== activeProjectId) {
-                        setActiveProject(projectKey);
+                        setActiveProjectIdOnly(projectKey);
                       }
                       setIssuePickerOpen(true);
                     }}
                     onNewSessionFromGitHubPR={() => {
                       if (projectKey !== activeProjectId) {
-                        setActiveProject(projectKey);
+                        setActiveProjectIdOnly(projectKey);
                       }
                       setPullRequestPickerOpen(true);
                     }}
                     onOpenMultiRunLauncher={() => {
                       if (projectKey !== activeProjectId) {
-                        setActiveProject(projectKey);
+                        setActiveProjectIdOnly(projectKey);
                       }
                       openMultiRunLauncher();
                     }}
@@ -2733,19 +3472,8 @@ export const SessionSidebar: React.FC<SessionSidebarProps> = ({
                           <DndContext
                             sensors={sensors}
                             collisionDetection={closestCenter}
-                            onDragStart={(event) => {
-                              setActiveDraggedGroupId(String(event.active.id));
-                              const width = (event.active.rect.current.initial?.width ?? null);
-                              setActiveDraggedGroupWidth(typeof width === 'number' ? width : null);
-                            }}
-                            onDragCancel={() => {
-                              setActiveDraggedGroupId(null);
-                              setActiveDraggedGroupWidth(null);
-                            }}
                             onDragEnd={(event) => {
                               const { active, over } = event;
-                              setActiveDraggedGroupId(null);
-                              setActiveDraggedGroupWidth(null);
                               if (!over || active.id === over.id) {
                                 return;
                               }
@@ -2775,18 +3503,7 @@ export const SessionSidebar: React.FC<SessionSidebarProps> = ({
                                 );
                               })}
                             </SortableContext>
-                            <DragOverlay modifiers={[centerDragOverlayUnderPointer]} dropAnimation={null}>
-                              {activeDraggedGroupId ? (
-                                (() => {
-                                  const dragGroup = orderedGroups.find((group) => group.id === activeDraggedGroupId);
-                                  if (!dragGroup) {
-                                    return null;
-                                  }
-                                  const showBranchIcon = !dragGroup.isMain || Boolean(isRepo);
-                                  return <GroupDragOverlay label={dragGroup.label} showBranchIcon={showBranchIcon} width={activeDraggedGroupWidth ?? undefined} />;
-                                })()
-                              ) : null}
-                            </DragOverlay>
+                            <DragOverlay dropAnimation={null} />
                           </DndContext>
                         ) : (
                           <div className="py-1 text-left typography-micro text-muted-foreground">
@@ -2824,6 +3541,12 @@ export const SessionSidebar: React.FC<SessionSidebarProps> = ({
         }}
       />
 
+      <BranchPickerDialog
+        open={isBranchPickerOpen}
+        onOpenChange={setIsBranchPickerOpen}
+        project={branchPickerProject}
+      />
+
       {useMobileNotesPanel ? (
         <MobileOverlayPanel
           open={projectNotesPanelOpen}
@@ -2832,12 +3555,83 @@ export const SessionSidebar: React.FC<SessionSidebarProps> = ({
         >
           <ProjectNotesTodoPanel
             projectRef={activeProjectRefForHeader}
-            canCreateWorktree={activeProjectIsRepo}
+            canCreateWorktree={stableActiveProjectIsRepo}
             onActionComplete={() => setProjectNotesPanelOpen(false)}
             className="p-0"
           />
         </MobileOverlayPanel>
       ) : null}
+
+      {/* Confirm delete session dialog */}
+      <Dialog open={Boolean(deleteSessionConfirm)} onOpenChange={(open) => { if (!open) setDeleteSessionConfirm(null); }}>
+        <DialogContent showCloseButton={false} className="max-w-sm gap-5">
+          <DialogHeader>
+            <DialogTitle>Delete session?</DialogTitle>
+            <DialogDescription>
+              {deleteSessionConfirm && deleteSessionConfirm.descendantCount > 0
+                ? `"${deleteSessionConfirm.session.title || 'Untitled Session'}" and its ${deleteSessionConfirm.descendantCount} sub-task${deleteSessionConfirm.descendantCount === 1 ? '' : 's'} will be permanently deleted.`
+                : `"${deleteSessionConfirm?.session.title || 'Untitled Session'}" will be permanently deleted.`}
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter className="w-full sm:items-center sm:justify-between">
+            <button
+              type="button"
+              onClick={() => setShowDeletionDialog(!showDeletionDialog)}
+              className="inline-flex items-center gap-1.5 typography-ui-label text-muted-foreground transition-colors hover:text-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-primary/50"
+              aria-pressed={!showDeletionDialog}
+            >
+              {!showDeletionDialog ? <RiCheckboxLine className="h-4 w-4 text-primary" /> : <RiCheckboxBlankLine className="h-4 w-4" />}
+              Never ask
+            </button>
+            <div className="flex items-center gap-2">
+              <button
+                type="button"
+                onClick={() => setDeleteSessionConfirm(null)}
+                className="inline-flex h-8 items-center justify-center rounded-md border border-border px-3 typography-ui-label text-foreground hover:bg-interactive-hover/50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/50"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                onClick={() => void confirmDeleteSession()}
+                className="inline-flex h-8 items-center justify-center rounded-md bg-destructive px-3 typography-ui-label text-destructive-foreground hover:bg-destructive/90 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-destructive/50"
+              >
+                Delete
+              </button>
+            </div>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* Confirm delete folder dialog */}
+      <Dialog open={Boolean(deleteFolderConfirm)} onOpenChange={(open) => { if (!open) setDeleteFolderConfirm(null); }}>
+        <DialogContent showCloseButton={false} className="max-w-sm gap-5">
+          <DialogHeader>
+            <DialogTitle>Delete folder?</DialogTitle>
+            <DialogDescription>
+              {deleteFolderConfirm && (deleteFolderConfirm.subFolderCount > 0 || deleteFolderConfirm.sessionCount > 0)
+                ? `"${deleteFolderConfirm.folderName}" will be deleted${deleteFolderConfirm.subFolderCount > 0 ? ` along with ${deleteFolderConfirm.subFolderCount} sub-folder${deleteFolderConfirm.subFolderCount === 1 ? '' : 's'}` : ''}. Sessions inside will not be deleted.`
+                : `"${deleteFolderConfirm?.folderName}" will be permanently deleted.`}
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter>
+            <button
+              type="button"
+              onClick={() => setDeleteFolderConfirm(null)}
+              className="inline-flex h-8 items-center justify-center rounded-md border border-border px-3 typography-ui-label text-foreground hover:bg-interactive-hover/50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/50"
+            >
+              Cancel
+            </button>
+            <button
+              type="button"
+              onClick={confirmDeleteFolder}
+              className="inline-flex h-8 items-center justify-center rounded-md bg-destructive px-3 typography-ui-label text-destructive-foreground hover:bg-destructive/90 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-destructive/50"
+            >
+              Delete
+            </button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </div>
   );
 };

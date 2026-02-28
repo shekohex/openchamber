@@ -12,6 +12,8 @@ import { xml } from '@codemirror/lang-xml';
 import { yaml as yamlLanguage } from '@codemirror/lang-yaml';
 import { rust } from '@codemirror/lang-rust';
 import { elixir } from 'codemirror-lang-elixir';
+import { cpp } from '@codemirror/lang-cpp';
+import { go } from '@codemirror/lang-go';
 
 import { Language, LanguageDescription, StreamLanguage, HighlightStyle, syntaxHighlighting } from '@codemirror/language';
 import { tags as t } from '@lezer/highlight';
@@ -81,6 +83,13 @@ function codeBlockLanguageResolver(info: string): Language | LanguageDescription
     case 'rs':
     case 'rust':
       return rust().language;
+    case 'c':
+    case 'cpp':
+    case 'h':
+    case 'hpp':
+      return cpp().language;
+    case 'go':
+      return go().language;
     case 'ex':
     case 'exs':
     case 'elixir':
@@ -99,6 +108,14 @@ function codeBlockLanguageResolver(info: string): Language | LanguageDescription
 }
 
 const normalizeFileName = (filePath: string) => filePath.split('/').pop()?.toLowerCase() ?? '';
+
+const matchLanguageDescriptionForFile = (filePath: string): LanguageDescription | null => {
+  const filename = normalizeFileName(filePath);
+  if (!filename) {
+    return null;
+  }
+  return LanguageDescription.matchFilename(languages, filename);
+};
 
 const markdownHighlight = () => syntaxHighlighting(HighlightStyle.define([
   { tag: [t.heading1, t.heading2, t.heading3, t.heading4, t.heading5, t.heading6], fontWeight: '600' },
@@ -210,6 +227,13 @@ export function languageByExtension(filePath: string): Extension | null {
       return xml();
     case 'rs':
       return rust();
+    case 'c':
+    case 'cpp':
+    case 'h':
+    case 'hpp':
+      return cpp();
+    case 'go':
+      return go();
 
     // Legacy modes
     case 'rb':
@@ -232,5 +256,22 @@ export function languageByExtension(filePath: string): Extension | null {
 
     default:
       return null;
+  }
+}
+
+export async function loadLanguageByExtension(filePath: string): Promise<Extension | null> {
+  const description = matchLanguageDescriptionForFile(filePath);
+  if (!description) {
+    return null;
+  }
+
+  if (description.support) {
+    return description.support;
+  }
+
+  try {
+    return await description.load();
+  } catch {
+    return null;
   }
 }

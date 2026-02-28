@@ -1,3 +1,77 @@
+## [1.8.1] - 2026-02-28
+
+- No notable changes.
+
+## [1.8.0] - 2026-02-28
+
+- Chat: improved long-session performance with virtualized message rendering, smoother scrolling, and more stable behavior in large histories (thanks to @shekohex).
+- Chat: added drag-and-drop file attachments, so dropping files from Explorer into chat is now a first-class flow (thanks to @Asuta).
+- Chat: enabled markdown rendering in user messages for clearer formatted prompts and notes (thanks to @haofeng0705).
+- Chat: pasted absolute paths are now treated as normal messages, reducing accidental command-like sends.
+- Chat: fixed queued send behavior for inactive sessions to reduce accidental sends to the wrong conversation.
+- Chat: enabled bueatiful diffs for edit tools in chat (thanks to @shekohex).
+- UI: improved long filename handling in file-mention autocomplete so results stay readable while typing (thanks to @haofeng0705).
+- Usage: added MiniMax coding-plan quota provider support for broader usage tracking coverage (thanks to @nzlov).
+- Usage: added Ollama Cloud quota provider support for broader usage tracking coverage (thanks to @iamhenry).
+
+## [1.7.5] - 2026-02-25
+
+- Sessions: improved switching performance so moving between chats feels more immediate.
+- Chat: fixed cases where messages could duplicate or disappear during active conversations.
+
+## [1.7.4] - 2026-02-24
+
+- Settings: redesigned the settings workspace with flatter, more consistent layouts so key options are easier to find.
+- Settings: grouped agents/skills navigation by subfolder to make larger setups easier to manage (thanks to @nguyenngothuong).
+- Chat: improved streaming smoothness and runtime stability with buffered updates and reliability fixes, reducing lag, stuck spinners, memory growth, and timeout-related interruptions in long runs (thanks to @nguyenngothuong).
+- Chat: draft text now persists per session, and the input supports an expanded focus mode for longer prompts (thanks to @nguyenngothuong).
+- Chat: added fullscreen Mermaid preview, improved default thinking-variant persistence, and hardened file-preview safety checks for a more predictable message experience (thanks to @yulia-ivashko).
+- Sessions: expanded folder management with subfolders, cleaner organization controls, and clearer delete confirmations (thanks to @nguyenngothuong).
+- Settings: added an MCP config manager UI to simplify editing and validating MCP server configuration (thanks to @nguyenngothuong).
+- Chat Activity: improved Structured Output tool rendering with dedicated title/icon, clearer result descriptions, and more reliable detailed expansion defaults.
+- Chat: added C, C++, and Go language support for syntax-aware rendering in code-heavy workflows (thanks to @fomenks).
+- Reliability: aligned file read/raw endpoint safety checks with other runtimes for more consistent extension behavior (thanks to @yulia-ivashko).
+
+## [1.7.3] - 2026-02-21
+
+- Sessions: added custom folders to group chat sessions, with move/rename/delete flows and persisted collapse state per project (thanks to @nguyenngothuong).
+- Notifications: improved agent progress notifications and permission handling to reduce noisy prompts during active runs (thanks to @nguyenngothuong).
+- Settings: added customizable keyboard shortcuts for chat actions, panel toggles, and services, so you can better match the extension to your workflow (thanks to @nelsonPires5).
+- UI: unified clipboard copy behavior for more consistent copy actions and feedback across extension surfaces.
+- Reliability: improved startup environment detection by capturing login-shell environment snapshots, reducing missing PATH/tool issues on launch.
+- Reliability: refactored OpenCode config/auth integration into domain modules for steadier provider auth and command loading flows (thanks to @nelsonPires5).
+
+## [1.7.2] - 2026-02-20
+
+- Chat: question prompts now guide you to unanswered items before submit, making tool-question flows faster.
+- Chat: fixed auto-send queue to wait for the active session to be idle before sending, reducing misfires during agent messages.
+- Chat: improved streaming activity rendering and session attention indicators, so active progress and unread signals stay more consistent.
+- UI: added Plan view in the context sidebar panel for quicker access to plan content while you work (thanks to @nelsonPires5).
+- Settings: model variant options now refresh correctly in draft/new-session flows, avoiding stale selections.
+- Reliability: provider auth failures now show clearer re-auth guidance when tokens expire, making recovery faster (thanks to @yulia-ivashko).
+
+## [1.7.1] - 2026-02-18
+
+- Chat: slash commands now follow server command semantics (including multiline arguments), so command behavior is more consistent with OpenCode CLI.
+- Chat: added a shell mode triggered by leading `!`, with inline output visibility/copy.
+- Chat: improved delegated-task clarity with richer subtask bubbles, better task-detail rendering, and parent-chat surfacing for child permission/question requests.
+- Chat: improved `@` mention autocomplete by prioritizing agents and cleaning up ordering for faster picks.
+- Skills: discovery now uses OpenCode API as the source of truth with safer fallback scanning, improving installed-state accuracy.
+- Skills: upgraded editing/install UX with better code editing, syntax-aware related files, and clearer location targeting across user/project .opencode and .agents scopes.
+
+## [1.7.0] - 2026-02-17
+
+- Chat: improved live streaming responsiveness with part-delta updates and smarter auto-follow scrolling during generation.
+- Chat: Mermaid diagrams now render directly in messages, with quick copy/download actions for easier reuse.
+**- Reliability: managed runtime startup now rotates secure auth credentials and hardens API proxy auth forwarding for safer local connections (thanks to @yulia-ivashko).**
+**- Reliability: extension startup/shutdown handling is more predictable, reducing stuck states during reconnects.**
+
+## [1.6.9] - 2026-02-16
+
+- Agent Manager / Worktrees: switched to an upstream-first worktree flow with stronger branch tracking, making worktree sessions more predictable (thanks to @yulia-ivashko).
+- Usage: added NanoGPT quota provider support and improved provider wiring for steadier usage reporting (thanks to @nelsonPires5).
+- UI: compact model info in selection (price + capabilities), making model selection faster and more cost-aware (thanks to @nelsonPires5).
+
 ## [1.6.8] - 2026-02-12
 
 - Chat: added drag-and-drop attachments with inline image previews, so sending screenshots and files from the editor is faster and much more reliable.

@@ -32,6 +32,7 @@ function DropdownMenuTrigger({
 function DropdownMenuContent({
   className,
   sideOffset = 4,
+  style,
   ...props
 }: React.ComponentProps<typeof DropdownMenuPrimitive.Content>) {
   return (
@@ -42,9 +43,10 @@ function DropdownMenuContent({
         style={{
           backgroundColor: 'var(--surface-elevated)',
           color: 'var(--surface-elevated-foreground)',
+          ...style,
         }}
         className={cn(
-          "data-[state=open]:animate-in data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0 data-[state=closed]:zoom-out-95 data-[state=open]:zoom-in-95 data-[side=bottom]:slide-in-from-top-2 data-[side=left]:slide-in-from-right-2 data-[side=right]:slide-in-from-left-2 data-[side=top]:slide-in-from-bottom-2 z-50 max-h-(--radix-dropdown-menu-content-available-height) min-w-[8rem] origin-(--radix-dropdown-menu-content-transform-origin) overflow-visible rounded-xl border-2 border-border/60 p-1 shadow-md",
+          "data-[state=open]:animate-in data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0 data-[state=closed]:zoom-out-95 data-[state=open]:zoom-in-95 data-[side=bottom]:slide-in-from-top-2 data-[side=left]:slide-in-from-right-2 data-[side=right]:slide-in-from-left-2 data-[side=top]:slide-in-from-bottom-2 z-50 max-h-(--radix-dropdown-menu-content-available-height) min-w-[8rem] origin-(--radix-dropdown-menu-content-transform-origin) overflow-visible rounded-xl border-2 border-border/60 p-1 shadow-none",
           className
         )}
         {...props}
@@ -209,15 +211,15 @@ function DropdownMenuSubTrigger({
   inset?: boolean
 }) {
   return (
-    <DropdownMenuPrimitive.SubTrigger
-      data-slot="dropdown-menu-sub-trigger"
-      data-inset={inset}
-      className={cn(
-        "data-[highlighted]:bg-interactive-hover hover:bg-interactive-hover flex cursor-default items-center rounded-lg px-2 py-1 typography-ui-label outline-hidden select-none data-[inset]:pl-8",
-        className
-      )}
-      {...props}
-    >
+      <DropdownMenuPrimitive.SubTrigger
+        data-slot="dropdown-menu-sub-trigger"
+        data-inset={inset}
+        className={cn(
+          "data-[highlighted]:bg-interactive-hover hover:bg-interactive-hover [&_svg:not([class*='text-'])]:text-muted-foreground relative flex cursor-default items-center gap-2 rounded-lg px-2 py-1 typography-ui-label outline-hidden select-none data-[inset]:pl-8 [&_svg]:pointer-events-none [&_svg]:shrink-0 [&_svg:not([class*='size-'])]:size-3.5",
+          className
+        )}
+        {...props}
+      >
       {children}
       <RiArrowRightSLine className="ml-auto size-3.5" />
     </DropdownMenuPrimitive.SubTrigger>
@@ -236,7 +238,7 @@ function DropdownMenuSubContent({
           color: 'var(--surface-elevated-foreground)',
         }}
         className={cn(
-          "data-[state=open]:animate-in data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0 data-[state=closed]:zoom-out-95 data-[state=open]:zoom-in-95 data-[side=bottom]:slide-in-from-top-2 data-[side=left]:slide-in-from-right-2 data-[side=right]:slide-in-from-left-2 data-[side=top]:slide-in-from-bottom-2 z-50 min-w-[8rem] origin-(--radix-dropdown-menu-content-transform-origin) overflow-visible rounded-xl border-2 border-border/60 p-1 shadow-md",
+          "data-[state=open]:animate-in data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0 data-[state=closed]:zoom-out-95 data-[state=open]:zoom-in-95 data-[side=bottom]:slide-in-from-top-2 data-[side=left]:slide-in-from-right-2 data-[side=right]:slide-in-from-left-2 data-[side=top]:slide-in-from-bottom-2 z-50 min-w-[8rem] origin-(--radix-dropdown-menu-content-transform-origin) overflow-visible rounded-xl border-2 border-border/60 p-1 shadow-none",
           className
         )}
         {...props}

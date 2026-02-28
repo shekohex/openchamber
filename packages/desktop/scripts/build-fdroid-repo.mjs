@@ -13,7 +13,7 @@ const metadataDir = path.join(fdroidRoot, 'metadata');
 const androidArtifactsDir = path.join(buildRoot, 'mobile-artifacts', 'android');
 const fallbackAndroidOutputsDir = path.join(desktopRoot, 'src-tauri', 'gen', 'android', 'app', 'build', 'outputs', 'apk');
 
-const appId = process.env.FDROID_APP_ID || 'ai.opencode.openchamber';
+const appId = process.env.FDROID_APP_ID || 'ai.fedaykin.openchamber';
 const appName = process.env.FDROID_APP_NAME || 'OpenChamber';
 const appLicense = process.env.FDROID_APP_LICENSE || 'MIT';
 const appSummary = process.env.FDROID_APP_SUMMARY || 'OpenChamber mobile release';

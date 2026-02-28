@@ -6,6 +6,7 @@ import {
     RiAttachment2,
     RiCommandLine,
     RiFileUploadLine,
+    RiFullscreenLine,
     RiSendPlane2Line,
 } from '@remixicon/react';
 import { BrowserVoiceButton } from '@/components/voice';
@@ -20,9 +21,8 @@ import { AttachedFilesList } from './FileAttachment';
 import { QueuedMessageChips } from './QueuedMessageChips';
 import { FileMentionAutocomplete, type FileMentionHandle } from './FileMentionAutocomplete';
 import { CommandAutocomplete, type CommandAutocompleteHandle } from './CommandAutocomplete';
-import { AgentMentionAutocomplete, type AgentMentionAutocompleteHandle } from './AgentMentionAutocomplete';
 import { SkillAutocomplete, type SkillAutocompleteHandle } from './SkillAutocomplete';
-import { cn } from '@/lib/utils';
+import { cn, isMacOS } from '@/lib/utils';
 import { ServerFilePicker } from './ServerFilePicker';
 import { ModelControls } from './ModelControls';
 import { UnifiedControlsDrawer } from './UnifiedControlsDrawer';
@@ -39,6 +39,7 @@ import { useMessageStore } from '@/stores/messageStore';
 import { isDesktopLocalOriginActive, isNativeMobileApp, isTauriShell, isVSCodeRuntime, pickFilesFromNativeDialog } from '@/lib/desktop';
 import { isIMECompositionEvent } from '@/lib/ime';
 import { StopIcon } from '@/components/icons/StopIcon';
+import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
 import type { MobileControlsPanel } from './mobileControlsUtils';
 import {
     DropdownMenu,
@@ -56,34 +57,60 @@ interface ChatInputProps {
     scrollToBottom?: (options?: { instant?: boolean; force?: boolean }) => void;
 }
 
-const CHAT_INPUT_DRAFT_KEY = 'openchamber_chat_input_draft';
+type AutocompleteOverlayPosition = {
+    top: number;
+    left: number;
+    place: 'above' | 'below';
+    maxHeight: number;
+};
 
-// Helper to safely read from localStorage
-const getStoredDraft = (): string => {
+// Per-session draft key — preserves in-progress messages across project switches
+const getDraftKey = (sessionId: string | null): string =>
+    `openchamber_chat_input_draft_${sessionId ?? 'new'}`;
+
+// Helper to safely read from localStorage for a given session
+const getStoredDraft = (sessionId: string | null): string => {
     try {
-        return localStorage.getItem(CHAT_INPUT_DRAFT_KEY) ?? '';
+        return localStorage.getItem(getDraftKey(sessionId)) ?? '';
     } catch {
         return '';
+    }
+};
+
+// Helper to safely write/clear a per-session draft
+const saveStoredDraft = (sessionId: string | null, draft: string): void => {
+    try {
+        if (draft) {
+            localStorage.setItem(getDraftKey(sessionId), draft);
+        } else {
+            localStorage.removeItem(getDraftKey(sessionId));
+        }
+    } catch {
+        // Ignore localStorage errors
     }
 };
 
 export const ChatInput: React.FC<ChatInputProps> = ({ onOpenSettings, scrollToBottom }) => {
     // Track if we restored a draft on mount (for text selection)
     const initialDraftRef = React.useRef<string | null>(null);
+    // Track initial session ID (captured at mount time for draft restoration)
+    const initialSessionIdRef = React.useRef<string | null>(null);
     const [message, setMessage] = React.useState(() => {
-        const draft = getStoredDraft();
+        // Read per-session draft at mount time using the current session from the store
+        const sessionId = useSessionStore.getState().currentSessionId;
+        initialSessionIdRef.current = sessionId;
+        const draft = getStoredDraft(sessionId);
         if (draft) {
             initialDraftRef.current = draft;
         }
         return draft;
     });
+    const [inputMode, setInputMode] = React.useState<'normal' | 'shell'>('normal');
     const [isDragging, setIsDragging] = React.useState(false);
     const [showFileMention, setShowFileMention] = React.useState(false);
     const [mentionQuery, setMentionQuery] = React.useState('');
     const [showCommandAutocomplete, setShowCommandAutocomplete] = React.useState(false);
     const [commandQuery, setCommandQuery] = React.useState('');
-    const [showAgentAutocomplete, setShowAgentAutocomplete] = React.useState(false);
-    const [agentQuery, setAgentQuery] = React.useState('');
     const [autocompleteTab, setAutocompleteTab] = React.useState<'commands' | 'agents' | 'files'>('commands');
     const [showSkillAutocomplete, setShowSkillAutocomplete] = React.useState(false);
     const [skillQuery, setSkillQuery] = React.useState('');
@@ -98,8 +125,9 @@ export const ChatInput: React.FC<ChatInputProps> = ({ onOpenSettings, scrollToBo
     const canAcceptDropRef = React.useRef(false);
     const mentionRef = React.useRef<FileMentionHandle>(null);
     const commandRef = React.useRef<CommandAutocompleteHandle>(null);
-    const agentRef = React.useRef<AgentMentionAutocompleteHandle>(null);
     const skillRef = React.useRef<SkillAutocompleteHandle>(null);
+    // Ref to track current message value without triggering re-renders in effects
+    const messageRef = React.useRef(message);
 
     const sendMessage = useSessionStore((state) => state.sendMessage);
     const currentSessionId = useSessionStore((state) => state.currentSessionId);
@@ -108,7 +136,6 @@ export const ChatInput: React.FC<ChatInputProps> = ({ onOpenSettings, scrollToBo
     const acknowledgeSessionAbort = useSessionStore((state) => state.acknowledgeSessionAbort);
     const abortPromptSessionId = useSessionStore((state) => state.abortPromptSessionId);
     const clearAbortPrompt = useSessionStore((state) => state.clearAbortPrompt);
-    const sessionAbortFlags = useSessionStore((state) => state.sessionAbortFlags);
     const attachedFiles = useSessionStore((state) => state.attachedFiles);
     const addAttachedFile = useSessionStore((state) => state.addAttachedFile);
     const addServerFile = useSessionStore((state) => state.addServerFile);
@@ -121,13 +148,14 @@ export const ChatInput: React.FC<ChatInputProps> = ({ onOpenSettings, scrollToBo
     const { currentProviderId, currentModelId, currentVariant, currentAgentName, setAgent, getVisibleAgents } = useConfigStore();
     const agents = getVisibleAgents();
     const primaryAgents = React.useMemo(() => agents.filter((agent) => agent.mode === 'primary'), [agents]);
-    const { isMobile, inputBarOffset, isKeyboardOpen, setTimelineDialogOpen, cornerRadius, persistChatDraft } = useUIStore();
+    const { isMobile, inputBarOffset, isKeyboardOpen, setTimelineDialogOpen, cornerRadius, persistChatDraft, isExpandedInput, setExpandedInput } = useUIStore();
     const { working } = useAssistantStatus();
     const { currentTheme } = useThemeSystem();
     const [showAbortStatus, setShowAbortStatus] = React.useState(false);
+    const isDesktopExpanded = isExpandedInput && !isMobile;
+    const [autocompleteOverlayPosition, setAutocompleteOverlayPosition] = React.useState<AutocompleteOverlayPosition | null>(null);
     const abortTimeoutRef = React.useRef<ReturnType<typeof setTimeout> | null>(null);
     const prevWasAbortedRef = React.useRef(false);
-    const sendTriggeredByPointerDownRef = React.useRef(false);
 
     // Message queue
     const queueModeEnabled = useMessageQueueStore((state) => state.queueModeEnabled);
@@ -181,6 +209,11 @@ export const ChatInput: React.FC<ChatInputProps> = ({ onOpenSettings, scrollToBo
             .reverse(); // Most recent first
     }, [sessionMessages]);
 
+    // Keep messageRef in sync with message state
+    React.useEffect(() => {
+        messageRef.current = message;
+    }, [message]);
+
     // Handle initial draft restoration and text selection
     const hasHandledInitialDraftRef = React.useRef(false);
     React.useEffect(() => {
@@ -194,7 +227,7 @@ export const ChatInput: React.FC<ChatInputProps> = ({ onOpenSettings, scrollToBo
             // Setting disabled - clear the restored draft
             setMessage('');
             try {
-                localStorage.removeItem(CHAT_INPUT_DRAFT_KEY);
+                localStorage.removeItem(getDraftKey(initialSessionIdRef.current));
             } catch {
                 // Ignore
             }
@@ -206,23 +239,31 @@ export const ChatInput: React.FC<ChatInputProps> = ({ onOpenSettings, scrollToBo
         }
     }, [persistChatDraft]);
 
-    // Handle session switching: clear draft if persist disabled, select if enabled
+    // Handle session switching: save draft for old session, restore draft for new session
     const prevSessionIdRef = React.useRef(currentSessionId);
     React.useEffect(() => {
         if (prevSessionIdRef.current !== currentSessionId) {
+            const oldSessionId = prevSessionIdRef.current;
             prevSessionIdRef.current = currentSessionId;
-            
-            if (!persistChatDraft) {
-                // Clear draft when switching sessions if persist is disabled
+            setInputMode('normal');
+
+            if (persistChatDraft) {
+                // Save current draft for the session we're leaving
+                saveStoredDraft(oldSessionId, messageRef.current);
+                // Restore draft for the session we're entering
+                const newDraft = getStoredDraft(currentSessionId);
+                setMessage(newDraft);
+                if (newDraft) {
+                    requestAnimationFrame(() => {
+                        textareaRef.current?.select();
+                    });
+                }
+            } else {
+                // Persist disabled: clear input without saving
                 setMessage('');
-            } else if (message) {
-                // Select text if there's any draft when switching sessions
-                requestAnimationFrame(() => {
-                    textareaRef.current?.select();
-                });
             }
         }
-    }, [currentSessionId, persistChatDraft, message]);
+    }, [currentSessionId, persistChatDraft]);
 
     // Focus textarea when new session draft is opened
     const prevNewSessionDraftOpenRef = React.useRef(newSessionDraftOpen);
@@ -241,32 +282,22 @@ export const ChatInput: React.FC<ChatInputProps> = ({ onOpenSettings, scrollToBo
         prevNewSessionDraftOpenRef.current = newSessionDraftOpen;
     }, [newSessionDraftOpen, isMobile]);
 
-    // Persist chat input draft to localStorage (only if setting enabled)
+    // Persist chat input draft to localStorage per session (only if setting enabled)
     React.useEffect(() => {
         if (!persistChatDraft) {
-            // Clear stored draft when setting is disabled
+            // Clear stored draft for current session when setting is disabled
             try {
-                localStorage.removeItem(CHAT_INPUT_DRAFT_KEY);
+                localStorage.removeItem(getDraftKey(currentSessionId));
             } catch {
                 // Ignore
             }
             return;
         }
-        try {
-            if (message) {
-                localStorage.setItem(CHAT_INPUT_DRAFT_KEY, message);
-            } else {
-                localStorage.removeItem(CHAT_INPUT_DRAFT_KEY);
-            }
-        } catch {
-            // Ignore localStorage errors
-        }
-    }, [message, persistChatDraft]);
+        saveStoredDraft(currentSessionId, message);
+    }, [message, persistChatDraft, currentSessionId]);
 
-    // Session activity for auto-send on idle
+    // Session activity for queue availability and controls
     const { phase: sessionPhase } = useCurrentSessionActivity();
-    const prevSessionPhaseRef = React.useRef(sessionPhase);
-    const autoSendTriggeredRef = React.useRef(false);
 
     const handleTextareaPointerDownCapture = React.useCallback((event: React.PointerEvent<HTMLTextAreaElement>) => {
         if (!isMobile) {
@@ -531,21 +562,25 @@ export const ChatInput: React.FC<ChatInputProps> = ({ onOpenSettings, scrollToBo
         }
         if (!queuedOnly) {
             setMessage('');
+            // Clear per-session draft on submit
+            saveStoredDraft(currentSessionId, '');
             // Reset message history navigation state
             setHistoryIndex(-1);
             setDraftMessage('');
             if (attachedFiles.length > 0) {
                 clearAttachedFiles();
             }
+            // Close expanded input overlay when submitting
+            setExpandedInput(false);
         }
 
         if (isMobile) {
             textareaRef.current?.blur();
         }
 
-        // Handle slash commands locally before sending
+        // Handle local slash commands only in normal mode
         const normalizedCommand = primaryText.trimStart();
-        if (normalizedCommand.startsWith('/')) {
+        if (inputMode === 'normal' && normalizedCommand.startsWith('/')) {
             const commandName = normalizedCommand
                 .slice(1)
                 .trim()
@@ -572,28 +607,6 @@ export const ChatInput: React.FC<ChatInputProps> = ({ onOpenSettings, scrollToBo
                 setMessage('');
                 return; // Don't send to assistant
             }
-            // /compact - call SDK summarize endpoint
-            else if (commandName === 'compact' && currentSessionId) {
-                try {
-                    const { opencodeClient } = await import('@/lib/opencode/client');
-                    const directory = opencodeClient.getDirectory();
-                    const response = await opencodeClient.getApiClient().session.summarize({
-                        sessionID: currentSessionId,
-                        directory: directory || undefined,
-                        providerID: currentProviderId,
-                        modelID: currentModelId,
-                    });
-                    if (response.error) {
-                        throw new Error('Failed to compact session');
-                    }
-                    scrollToBottom?.({ instant: true, force: true });
-                } catch (error) {
-                    console.error('Failed to compact session:', error);
-                    toast.error('Failed to compact session');
-                }
-                setMessage('');
-                return; // Don't send to assistant
-            }
         }
 
         // Collect all attachments for error recovery
@@ -610,7 +623,8 @@ export const ChatInput: React.FC<ChatInputProps> = ({ onOpenSettings, scrollToBo
             primaryAttachments,
             agentMentionName,
             additionalParts.length > 0 ? additionalParts : undefined,
-            currentVariant
+            currentVariant,
+            inputMode
         ).catch((error: unknown) => {
             const rawMessage =
                 error instanceof Error
@@ -664,61 +678,35 @@ export const ChatInput: React.FC<ChatInputProps> = ({ onOpenSettings, scrollToBo
 
     // Primary action for send button - respects queue mode setting
     const handlePrimaryAction = React.useCallback(() => {
-        const canQueue = hasContent && currentSessionId && sessionPhase !== 'idle';
+        const canQueue = inputMode === 'normal' && hasContent && currentSessionId && sessionPhase !== 'idle';
         if (queueModeEnabled && canQueue) {
             handleQueueMessage();
         } else {
             void handleSubmitRef.current();
         }
-    }, [hasContent, currentSessionId, sessionPhase, queueModeEnabled, handleQueueMessage]);
-
-    // Auto-send queued messages when session becomes idle (but not after abort)
-    React.useEffect(() => {
-        const wasWorking = prevSessionPhaseRef.current === 'busy' || prevSessionPhaseRef.current === 'retry';
-        const isNowIdle = sessionPhase === 'idle';
-
-        // Check if session was recently aborted (within last 2 seconds)
-        const wasRecentlyAborted = currentSessionId && sessionAbortFlags.has(currentSessionId) && (() => {
-            const abortRecord = sessionAbortFlags.get(currentSessionId);
-            if (!abortRecord) return false;
-            const timeSinceAbort = Date.now() - abortRecord.timestamp;
-            return timeSinceAbort < 2000;
-        })();
-
-        // Detect transition from working to idle, but skip if aborted
-        if (wasWorking && isNowIdle && queuedMessages.length > 0 && !autoSendTriggeredRef.current && !wasRecentlyAborted) {
-            // Prevent double-triggering
-            autoSendTriggeredRef.current = true;
-
-            // Use setTimeout to avoid calling during render
-            setTimeout(() => {
-                if (currentSessionId && currentProviderId && currentModelId) {
-                    void handleSubmitRef.current({ queuedOnly: true });
-                }
-                autoSendTriggeredRef.current = false;
-            }, 100);
-        }
-
-        prevSessionPhaseRef.current = sessionPhase;
-    }, [sessionPhase, queuedMessages.length, currentSessionId, currentProviderId, currentModelId, sessionAbortFlags]);
+    }, [inputMode, hasContent, currentSessionId, sessionPhase, queueModeEnabled, handleQueueMessage]);
 
     const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
         // Early return during IME composition to prevent interference with autocomplete.
         // Uses keyCode === 229 fallback for WebKit where compositionend fires before keydown.
         if (isIMECompositionEvent(e)) return;
 
+        if (inputMode === 'shell' && e.key === 'Escape') {
+            e.preventDefault();
+            setInputMode('normal');
+            return;
+        }
+
+        if (inputMode === 'shell' && e.key === 'Backspace' && message.length === 0) {
+            e.preventDefault();
+            setInputMode('normal');
+            return;
+        }
+
         if (showCommandAutocomplete && commandRef.current) {
             if (e.key === 'Enter' || e.key === 'ArrowUp' || e.key === 'ArrowDown' || e.key === 'Escape' || e.key === 'Tab') {
                 e.preventDefault();
                 commandRef.current.handleKeyDown(e.key);
-                return;
-            }
-        }
-
-        if (showAgentAutocomplete && agentRef.current) {
-            if (e.key === 'Enter' || e.key === 'ArrowUp' || e.key === 'ArrowDown' || e.key === 'Escape' || e.key === 'Tab') {
-                e.preventDefault();
-                agentRef.current.handleKeyDown(e.key);
                 return;
             }
         }
@@ -739,7 +727,13 @@ export const ChatInput: React.FC<ChatInputProps> = ({ onOpenSettings, scrollToBo
             }
         }
 
-        if (e.key === 'Tab' && !showCommandAutocomplete && !showAgentAutocomplete && !showFileMention) {
+        if (isDesktopExpanded && e.key === 'Escape') {
+            e.preventDefault();
+            setExpandedInput(false);
+            return;
+        }
+
+        if (e.key === 'Tab' && !showCommandAutocomplete && !showFileMention) {
             e.preventDefault();
             handleCycleAgent();
             return;
@@ -748,7 +742,7 @@ export const ChatInput: React.FC<ChatInputProps> = ({ onOpenSettings, scrollToBo
         // Handle ArrowUp/ArrowDown for message history navigation
         // ArrowUp: only when cursor at start (position 0) or input is empty
         // ArrowDown: also works when cursor at end (to cycle forward through history)
-        const isAnyAutocompleteOpen = showCommandAutocomplete || showAgentAutocomplete || showSkillAutocomplete || showFileMention;
+        const isAnyAutocompleteOpen = showCommandAutocomplete || showSkillAutocomplete || showFileMention;
         const cursorAtStart = textareaRef.current?.selectionStart === 0 && textareaRef.current?.selectionEnd === 0;
         const cursorAtEnd = textareaRef.current?.selectionStart === message.length && textareaRef.current?.selectionEnd === message.length;
         const canNavigateHistoryUp = !isAnyAutocompleteOpen && (message.length === 0 || cursorAtStart);
@@ -801,7 +795,7 @@ export const ChatInput: React.FC<ChatInputProps> = ({ onOpenSettings, scrollToBo
             // Normal mode: Enter sends, Ctrl+Enter queues
             // Note: Queueing only works when there's an existing session (currentSessionId)
             // For new sessions (draft), always send immediately
-            const canQueue = hasContent && currentSessionId && sessionPhase !== 'idle';
+            const canQueue = inputMode === 'normal' && hasContent && currentSessionId && sessionPhase !== 'idle';
 
             if (queueModeEnabled) {
                 if (isCtrlEnter || !canQueue) {
@@ -822,6 +816,127 @@ export const ChatInput: React.FC<ChatInputProps> = ({ onOpenSettings, scrollToBo
             }
         }
     };
+
+    const measureCaretInTextarea = React.useCallback((textarea: HTMLTextAreaElement, cursorPosition: number) => {
+        const doc = textarea.ownerDocument;
+        const win = doc.defaultView;
+        if (!win) return null;
+
+        const style = win.getComputedStyle(textarea);
+        const mirror = doc.createElement('div');
+        const mirrorStyle = mirror.style;
+
+        mirrorStyle.position = 'absolute';
+        mirrorStyle.visibility = 'hidden';
+        mirrorStyle.pointerEvents = 'none';
+        mirrorStyle.whiteSpace = 'pre-wrap';
+        mirrorStyle.wordWrap = 'break-word';
+        mirrorStyle.overflow = 'hidden';
+        mirrorStyle.left = '-9999px';
+        mirrorStyle.top = '0';
+
+        mirrorStyle.width = `${textarea.clientWidth}px`;
+        mirrorStyle.font = style.font;
+        mirrorStyle.fontSize = style.fontSize;
+        mirrorStyle.fontFamily = style.fontFamily;
+        mirrorStyle.fontWeight = style.fontWeight;
+        mirrorStyle.fontStyle = style.fontStyle;
+        mirrorStyle.fontVariant = style.fontVariant;
+        mirrorStyle.letterSpacing = style.letterSpacing;
+        mirrorStyle.textTransform = style.textTransform;
+        mirrorStyle.textIndent = style.textIndent;
+        mirrorStyle.padding = style.padding;
+        mirrorStyle.border = style.border;
+        mirrorStyle.boxSizing = style.boxSizing;
+        mirrorStyle.lineHeight = style.lineHeight;
+        mirrorStyle.tabSize = style.tabSize;
+
+        mirror.textContent = textarea.value.slice(0, cursorPosition);
+        const marker = doc.createElement('span');
+        marker.textContent = textarea.value.slice(cursorPosition, cursorPosition + 1) || ' ';
+        mirror.appendChild(marker);
+
+        doc.body.appendChild(mirror);
+        const top = marker.offsetTop;
+        const left = marker.offsetLeft;
+        doc.body.removeChild(mirror);
+
+        return { top, left };
+    }, []);
+
+    const updateAutocompleteOverlayPosition = React.useCallback(() => {
+        if (!isDesktopExpanded) {
+            setAutocompleteOverlayPosition(null);
+            return;
+        }
+
+        if (!showCommandAutocomplete && !showSkillAutocomplete && !showFileMention) {
+            setAutocompleteOverlayPosition(null);
+            return;
+        }
+
+        const textarea = textareaRef.current;
+        const container = dropZoneRef.current;
+        if (!textarea || !container) return;
+
+        const cursor = textarea.selectionStart ?? message.length;
+        const caret = measureCaretInTextarea(textarea, cursor);
+        if (!caret) return;
+
+        const textareaRect = textarea.getBoundingClientRect();
+        const containerRect = container.getBoundingClientRect();
+
+        const caretY = textareaRect.top - containerRect.top + (caret.top - textarea.scrollTop);
+        const caretX = textareaRect.left - containerRect.left + (caret.left - textarea.scrollLeft);
+
+        const popupMargin = 8;
+        const estimatedPopupHeight = 260;
+        const spaceAbove = caretY - popupMargin;
+        const spaceBelow = containerRect.height - caretY - popupMargin;
+        const place: 'above' | 'below' = spaceBelow >= estimatedPopupHeight || spaceBelow >= spaceAbove ? 'below' : 'above';
+
+        const desiredWidth = showFileMention ? 520 : showCommandAutocomplete ? 450 : 360;
+        const clampedLeft = Math.max(
+            popupMargin,
+            Math.min(caretX - 24, containerRect.width - desiredWidth - popupMargin)
+        );
+
+        const maxHeight = Math.max(120, Math.min(estimatedPopupHeight, place === 'below' ? spaceBelow : spaceAbove));
+
+        setAutocompleteOverlayPosition({
+            top: place === 'below' ? caretY + 22 : caretY - 6,
+            left: clampedLeft,
+            place,
+            maxHeight,
+        });
+    }, [
+        isDesktopExpanded,
+        measureCaretInTextarea,
+        message.length,
+        showCommandAutocomplete,
+        showFileMention,
+        showSkillAutocomplete,
+    ]);
+
+    React.useLayoutEffect(() => {
+        updateAutocompleteOverlayPosition();
+    }, [
+        updateAutocompleteOverlayPosition,
+        message,
+        showCommandAutocomplete,
+        showSkillAutocomplete,
+        showFileMention,
+        isDesktopExpanded,
+    ]);
+
+    React.useEffect(() => {
+        if (!isDesktopExpanded) return;
+        const onResize = () => updateAutocompleteOverlayPosition();
+        window.addEventListener('resize', onResize);
+        return () => {
+            window.removeEventListener('resize', onResize);
+        };
+    }, [isDesktopExpanded, updateAutocompleteOverlayPosition]);
 
     const startAbortIndicator = React.useCallback(() => {
         if (abortTimeoutRef.current) {
@@ -864,6 +979,13 @@ export const ChatInput: React.FC<ChatInputProps> = ({ onOpenSettings, scrollToBo
             return;
         }
 
+        if (isDesktopExpanded) {
+            textarea.style.height = '100%';
+            textarea.style.maxHeight = 'none';
+            setTextareaSize(null);
+            return;
+        }
+
         textarea.style.height = 'auto';
 
         const view = textarea.ownerDocument?.defaultView;
@@ -890,13 +1012,20 @@ export const ChatInput: React.FC<ChatInputProps> = ({ onOpenSettings, scrollToBo
             }
             return { height: nextHeight, maxHeight };
         });
-    }, []);
+    }, [isDesktopExpanded]);
 
     React.useLayoutEffect(() => {
         adjustTextareaHeight();
     }, [adjustTextareaHeight, message, isMobile]);
 
     const updateAutocompleteState = React.useCallback((value: string, cursorPosition: number) => {
+        if (inputMode === 'shell') {
+            setShowCommandAutocomplete(false);
+            setShowFileMention(false);
+            setShowSkillAutocomplete(false);
+            return;
+        }
+
         if (value.startsWith('/')) {
             const firstSpace = value.indexOf(' ');
             const firstNewline = value.indexOf('\n');
@@ -911,7 +1040,6 @@ export const ChatInput: React.FC<ChatInputProps> = ({ onOpenSettings, scrollToBo
                 setAutocompleteTab('commands');
                 setShowCommandAutocomplete(true);
                 setShowFileMention(false);
-                setShowAgentAutocomplete(false);
                 setShowSkillAutocomplete(false);
                 return;
             }
@@ -920,25 +1048,6 @@ export const ChatInput: React.FC<ChatInputProps> = ({ onOpenSettings, scrollToBo
         setShowCommandAutocomplete(false);
 
         const textBeforeCursor = value.substring(0, cursorPosition);
-
-        const lastHashSymbol = textBeforeCursor.lastIndexOf('#');
-        if (lastHashSymbol !== -1) {
-            const charBefore = lastHashSymbol > 0 ? textBeforeCursor[lastHashSymbol - 1] : null;
-            const textAfterHash = textBeforeCursor.substring(lastHashSymbol + 1);
-            const hasSeparator = textAfterHash.includes(' ') || textAfterHash.includes('\n');
-            const isWordBoundary = !charBefore || /\s/.test(charBefore);
-
-            if (isWordBoundary && !hasSeparator) {
-                setAgentQuery(textAfterHash);
-                setAutocompleteTab('agents');
-                setShowAgentAutocomplete(true);
-                setShowFileMention(false);
-                return;
-            }
-        }
-
-        setShowAgentAutocomplete(false);
-        setAgentQuery('');
 
         const lastSlashSymbol = textBeforeCursor.lastIndexOf('/');
         if (lastSlashSymbol !== -1) {
@@ -951,7 +1060,6 @@ export const ChatInput: React.FC<ChatInputProps> = ({ onOpenSettings, scrollToBo
                 setSkillQuery(textAfterSlash);
                 setShowSkillAutocomplete(true);
                 setShowFileMention(false);
-                setShowAgentAutocomplete(false);
                 return;
             }
         }
@@ -961,10 +1069,12 @@ export const ChatInput: React.FC<ChatInputProps> = ({ onOpenSettings, scrollToBo
 
         const lastAtSymbol = textBeforeCursor.lastIndexOf('@');
         if (lastAtSymbol !== -1) {
+            const charBefore = lastAtSymbol > 0 ? textBeforeCursor[lastAtSymbol - 1] : null;
             const textAfterAt = textBeforeCursor.substring(lastAtSymbol + 1);
-            if (!textAfterAt.includes(' ') && !textAfterAt.includes('\n')) {
+            const isWordBoundary = !charBefore || /\s/.test(charBefore);
+            if (isWordBoundary && !textAfterAt.includes(' ') && !textAfterAt.includes('\n')) {
                 setMentionQuery(textAfterAt);
-                setAutocompleteTab('files');
+                setAutocompleteTab('agents');
                 setShowFileMention(true);
             } else {
                 setShowFileMention(false);
@@ -972,12 +1082,12 @@ export const ChatInput: React.FC<ChatInputProps> = ({ onOpenSettings, scrollToBo
         } else {
             setShowFileMention(false);
         }
-    }, [setAgentQuery, setAutocompleteTab, setCommandQuery, setMentionQuery, setShowAgentAutocomplete, setShowCommandAutocomplete, setShowFileMention, setShowSkillAutocomplete, setSkillQuery]);
+    }, [inputMode, setAutocompleteTab, setCommandQuery, setMentionQuery, setShowCommandAutocomplete, setShowFileMention, setShowSkillAutocomplete, setSkillQuery]);
 
-    const applyAutocompletePrefix = React.useCallback((prefix: '/' | '#' | '@') => {
+    const applyAutocompletePrefix = React.useCallback((prefix: '/' | '@') => {
         const nextMessage = message.length === 0
             ? prefix
-            : (message[0] === '/' || message[0] === '#' || message[0] === '@')
+            : (message[0] === '/' || message[0] === '@')
                 ? `${prefix}${message.slice(1)}`
                 : `${prefix}${message}`;
         setMessage(nextMessage);
@@ -1009,22 +1119,20 @@ export const ChatInput: React.FC<ChatInputProps> = ({ onOpenSettings, scrollToBo
         }
         setAutocompleteTab(tab);
         setCommandQuery('');
-        setAgentQuery('');
         setMentionQuery('');
         if (tab === 'commands') {
             applyAutocompletePrefix('/');
         }
         if (tab === 'agents') {
-            applyAutocompletePrefix('#');
+            applyAutocompletePrefix('@');
         }
         if (tab === 'files') {
             applyAutocompletePrefix('@');
         }
         setShowSkillAutocomplete(false);
         setShowCommandAutocomplete(tab === 'commands');
-        setShowAgentAutocomplete(tab === 'agents');
-        setShowFileMention(tab === 'files');
-    }, [applyAutocompletePrefix, isMobile, setAgentQuery, setAutocompleteTab, setCommandQuery, setMentionQuery, setShowAgentAutocomplete, setShowCommandAutocomplete, setShowFileMention, setShowSkillAutocomplete]);
+        setShowFileMention(tab === 'agents' || tab === 'files');
+    }, [applyAutocompletePrefix, isMobile, setAutocompleteTab, setCommandQuery, setMentionQuery, setShowCommandAutocomplete, setShowFileMention, setShowSkillAutocomplete]);
 
     const handleOpenCommandMenu = React.useCallback(() => {
         if (!isMobile) {
@@ -1048,10 +1156,9 @@ export const ChatInput: React.FC<ChatInputProps> = ({ onOpenSettings, scrollToBo
         setCommandQuery('');
         setAutocompleteTab('commands');
         setShowCommandAutocomplete(true);
-        setShowAgentAutocomplete(false);
         setShowFileMention(false);
         setShowSkillAutocomplete(false);
-    }, [applyAutocompletePrefix, isMobile, setAutocompleteTab, setCommandQuery, setShowAgentAutocomplete, setShowCommandAutocomplete, setShowFileMention, setShowSkillAutocomplete]);
+    }, [applyAutocompletePrefix, isMobile, setAutocompleteTab, setCommandQuery, setShowCommandAutocomplete, setShowFileMention, setShowSkillAutocomplete]);
 
     const insertTextAtSelection = React.useCallback((text: string) => {
         if (!text) {
@@ -1088,6 +1195,25 @@ export const ChatInput: React.FC<ChatInputProps> = ({ onOpenSettings, scrollToBo
     const handleTextChange = (e: React.ChangeEvent<HTMLTextAreaElement>) => {
         const value = e.target.value;
         const cursorPosition = e.target.selectionStart ?? value.length;
+
+        if (inputMode === 'normal' && value.startsWith('!')) {
+            const shellCommand = value.slice(1);
+            const nextCursor = Math.max(0, cursorPosition - 1);
+            setInputMode('shell');
+            setMessage(shellCommand);
+            adjustTextareaHeight();
+            setShowCommandAutocomplete(false);
+            setShowSkillAutocomplete(false);
+            setShowFileMention(false);
+            requestAnimationFrame(() => {
+                if (textareaRef.current) {
+                    textareaRef.current.selectionStart = nextCursor;
+                    textareaRef.current.selectionEnd = nextCursor;
+                }
+            });
+            return;
+        }
+
         setMessage(value);
         adjustTextareaHeight();
         updateAutocompleteState(value, cursorPosition);
@@ -1187,16 +1313,16 @@ export const ChatInput: React.FC<ChatInputProps> = ({ onOpenSettings, scrollToBo
         const textarea = textareaRef.current;
         const cursorPosition = textarea?.selectionStart ?? message.length;
         const textBeforeCursor = message.substring(0, cursorPosition);
-        const lastHashSymbol = textBeforeCursor.lastIndexOf('#');
+        const lastAtSymbol = textBeforeCursor.lastIndexOf('@');
 
-        if (lastHashSymbol !== -1) {
+        if (lastAtSymbol !== -1) {
             const newMessage =
-                message.substring(0, lastHashSymbol) +
-                `#${agentName} ` +
+                message.substring(0, lastAtSymbol) +
+                `@${agentName} ` +
                 message.substring(cursorPosition);
             setMessage(newMessage);
 
-            const nextCursor = lastHashSymbol + agentName.length + 2;
+            const nextCursor = lastAtSymbol + agentName.length + 2;
             requestAnimationFrame(() => {
                 if (textareaRef.current) {
                     textareaRef.current.selectionStart = nextCursor;
@@ -1208,7 +1334,7 @@ export const ChatInput: React.FC<ChatInputProps> = ({ onOpenSettings, scrollToBo
         } else if (textareaRef.current) {
             const newMessage =
                 message.substring(0, cursorPosition) +
-                `#${agentName} ` +
+                `@${agentName} ` +
                 message.substring(cursorPosition);
             setMessage(newMessage);
 
@@ -1223,8 +1349,8 @@ export const ChatInput: React.FC<ChatInputProps> = ({ onOpenSettings, scrollToBo
             });
         }
 
-        setShowAgentAutocomplete(false);
-        setAgentQuery('');
+        setShowFileMention(false);
+        setMentionQuery('');
 
         textareaRef.current?.focus();
     };
@@ -1238,11 +1364,11 @@ export const ChatInput: React.FC<ChatInputProps> = ({ onOpenSettings, scrollToBo
         if (lastSlashSymbol !== -1) {
             const newMessage =
                 message.substring(0, lastSlashSymbol) +
-                `${skillName} ` +
+                `/${skillName} ` +
                 message.substring(cursorPosition);
             setMessage(newMessage);
 
-            const nextCursor = lastSlashSymbol + skillName.length + 1;
+            const nextCursor = lastSlashSymbol + skillName.length + 2;
             requestAnimationFrame(() => {
                 if (textareaRef.current) {
                     textareaRef.current.selectionStart = nextCursor;
@@ -1316,8 +1442,14 @@ export const ChatInput: React.FC<ChatInputProps> = ({ onOpenSettings, scrollToBo
     const hasDraggedFiles = React.useCallback((dataTransfer: DataTransfer | null | undefined): boolean => {
         if (!dataTransfer) return false;
         if (dataTransfer.files && dataTransfer.files.length > 0) return true;
-        if (!dataTransfer.types) return false;
-        return Array.from(dataTransfer.types).includes('Files');
+        if (dataTransfer.types) {
+            const types = Array.from(dataTransfer.types);
+            if (types.includes('Files')) return true;
+            if (types.includes('text/uri-list')) return true;
+        }
+
+        const uriList = dataTransfer.getData('text/uri-list') || dataTransfer.getData('text/plain');
+        return typeof uriList === 'string' && uriList.toLowerCase().includes('file://');
     }, []);
 
     const collectDroppedFiles = React.useCallback((dataTransfer: DataTransfer | null | undefined): File[] => {
@@ -1335,6 +1467,87 @@ export const ChatInput: React.FC<ChatInputProps> = ({ onOpenSettings, scrollToBo
 
         return fromItems;
     }, []);
+
+    const collectDroppedFileUris = React.useCallback((dataTransfer: DataTransfer | null | undefined): string[] => {
+        if (!dataTransfer || typeof dataTransfer.getData !== 'function') return [];
+
+        const rawUriList = dataTransfer.getData('text/uri-list') || dataTransfer.getData('text/plain');
+        if (!rawUriList) return [];
+
+        const candidates = rawUriList
+            .split(/\r?\n/)
+            .map((value) => value.trim())
+            .filter((value) => value.length > 0 && !value.startsWith('#'))
+            .filter((value) => value.toLowerCase().startsWith('file://'));
+
+        return Array.from(new Set(candidates));
+    }, []);
+
+    const attachVSCodeDroppedUris = React.useCallback(async (uris: string[]) => {
+        if (uris.length === 0) return;
+
+        try {
+            const response = await fetch('/api/vscode/drop-files', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                },
+                body: JSON.stringify({ uris }),
+            });
+
+            if (!response.ok) {
+                throw new Error(`Failed to attach dropped files (${response.status})`);
+            }
+
+            const data = await response.json();
+            const picked = Array.isArray(data?.files) ? data.files : [];
+            const skipped = Array.isArray(data?.skipped) ? data.skipped : [];
+
+            if (skipped.length > 0) {
+                const summary = skipped
+                    .map((entry: { name?: string; reason?: string }) => `${entry?.name || 'file'}: ${entry?.reason || 'skipped'}`)
+                    .join('\n');
+                toast.error(`Some dropped files were skipped:\n${summary}`);
+            }
+
+            let attachedCount = 0;
+            for (const file of picked as Array<{ name: string; mimeType?: string; dataUrl?: string }>) {
+                if (!file?.dataUrl) continue;
+
+                const sizeBefore = useSessionStore.getState().attachedFiles.length;
+                try {
+                    const [meta, base64] = file.dataUrl.split(',');
+                    const mime = file.mimeType || (meta?.match(/data:(.*);base64/)?.[1] || 'application/octet-stream');
+                    if (!base64) continue;
+
+                    const binary = atob(base64);
+                    const bytes = new Uint8Array(binary.length);
+                    for (let i = 0; i < binary.length; i++) {
+                        bytes[i] = binary.charCodeAt(i);
+                    }
+
+                    const blob = new Blob([bytes], { type: mime });
+                    const localFile = new File([blob], file.name || 'file', { type: mime });
+                    await addAttachedFile(localFile);
+
+                    const sizeAfter = useSessionStore.getState().attachedFiles.length;
+                    if (sizeAfter > sizeBefore) {
+                        attachedCount += 1;
+                    }
+                } catch (error) {
+                    console.error('Dropped file attach failed', error);
+                    toast.error(error instanceof Error ? error.message : 'Failed to attach dropped file');
+                }
+            }
+
+            if (attachedCount > 0) {
+                toast.success(`Attached ${attachedCount} file${attachedCount > 1 ? 's' : ''}`);
+            }
+        } catch (error) {
+            console.error('VS Code dropped file attach failed', error);
+            toast.error(error instanceof Error ? error.message : 'Failed to attach dropped files');
+        }
+    }, [addAttachedFile]);
 
     const normalizeDroppedPath = React.useCallback((rawPath: string): string => {
         const input = rawPath.trim();
@@ -1400,6 +1613,15 @@ export const ChatInput: React.FC<ChatInputProps> = ({ onOpenSettings, scrollToBo
         if (!currentSessionId && !newSessionDraftOpen) return;
 
         const files = collectDroppedFiles(e.dataTransfer);
+
+        if (files.length === 0 && isVSCodeRuntime()) {
+            const droppedUris = collectDroppedFileUris(e.dataTransfer);
+            if (droppedUris.length > 0) {
+                await attachVSCodeDroppedUris(droppedUris);
+            }
+            return;
+        }
+
         let attachedCount = 0;
 
         if (files.length > 0) {
@@ -1665,7 +1887,7 @@ export const ChatInput: React.FC<ChatInputProps> = ({ onOpenSettings, scrollToBo
     const stopIconSizeClass = isMobile ? 'h-6 w-6' : (isVSCode ? 'h-4 w-4' : 'h-5 w-5');
     const iconSizeClass = isMobile ? 'h-[18px] w-[18px]' : (isVSCode ? 'h-4 w-4' : 'h-[18px] w-[18px]');
 
-    const iconButtonBaseClass = 'flex items-center justify-center text-muted-foreground transition-none outline-none focus:outline-none flex-shrink-0';
+    const iconButtonBaseClass = 'flex items-center justify-center text-foreground transition-none outline-none focus:outline-none flex-shrink-0';
     const footerIconButtonClass = cn(iconButtonBaseClass, buttonSizeClass);
 
     // Send button - respects queue mode setting
@@ -1673,27 +1895,8 @@ export const ChatInput: React.FC<ChatInputProps> = ({ onOpenSettings, scrollToBo
         <button
             type={isMobile ? 'button' : 'submit'}
             disabled={!canSend || (!currentSessionId && !newSessionDraftOpen)}
-            onPointerDownCapture={(event) => {
-                if (!isMobile || event.pointerType !== 'touch') {
-                    return;
-                }
-
-                if (!canSend || (!currentSessionId && !newSessionDraftOpen)) {
-                    return;
-                }
-
-                sendTriggeredByPointerDownRef.current = true;
-                event.preventDefault();
-                event.stopPropagation();
-                handlePrimaryAction();
-            }}
             onClick={(event) => {
                 if (!isMobile) {
-                    return;
-                }
-
-                if (sendTriggeredByPointerDownRef.current) {
-                    sendTriggeredByPointerDownRef.current = false;
                     return;
                 }
 
@@ -1717,26 +1920,8 @@ export const ChatInput: React.FC<ChatInputProps> = ({ onOpenSettings, scrollToBo
         <button
             type="button"
             disabled={!hasContent || !currentSessionId}
-            onPointerDownCapture={(event) => {
-                if (!isMobile || event.pointerType !== 'touch') {
-                    return;
-                }
-
-                if (!hasContent || !currentSessionId) {
-                    return;
-                }
-
-                sendTriggeredByPointerDownRef.current = true;
-                event.preventDefault();
-                event.stopPropagation();
-                handleQueueMessage();
-            }}
             onClick={(event) => {
                 if (isMobile) {
-                    if (sendTriggeredByPointerDownRef.current) {
-                        sendTriggeredByPointerDownRef.current = false;
-                        return;
-                    }
                     event.preventDefault();
                 }
                 handleQueueMessage();
@@ -1863,8 +2048,8 @@ export const ChatInput: React.FC<ChatInputProps> = ({ onOpenSettings, scrollToBo
                     type="button"
                     className={cn(
                         footerIconButtonClass,
-                        'rounded-md text-muted-foreground',
-                        'hover:bg-interactive-hover/40 hover:text-foreground'
+                        'rounded-md',
+                        'hover:bg-interactive-hover/40'
                     )}
                     onPointerDownCapture={(event) => {
                         if (event.pointerType === 'touch') {
@@ -1913,12 +2098,13 @@ export const ChatInput: React.FC<ChatInputProps> = ({ onOpenSettings, scrollToBo
     }, []);
 
     return (
-
+        <>
         <form
             onSubmit={(e) => { e.preventDefault(); handlePrimaryAction(); }}
             className={cn(
                 "relative pt-0",
                 isMobile ? "pb-2" : "pb-4",
+                isDesktopExpanded && 'flex h-full min-h-0 flex-col pt-4',
                 isMobile && isKeyboardOpen ? "ios-keyboard-safe-area" : "bottom-safe-area"
             )}
             data-keyboard-avoid="true"
@@ -1933,10 +2119,11 @@ export const ChatInput: React.FC<ChatInputProps> = ({ onOpenSettings, scrollToBo
                     isWaitingForPermission={working.isWaitingForPermission}
                     wasAborted={working.wasAborted}
                     abortActive={working.abortActive}
+                    retryInfo={working.retryInfo}
                     showAbortStatus={showAbortStatus}
                 />
             </div>
-            <div className="chat-column relative overflow-visible">
+            <div className={cn('chat-column relative overflow-visible', isDesktopExpanded && 'flex flex-1 min-h-0 flex-col')}>
                 <AttachedFilesList />
                 <QueuedMessageChips
                     onEditMessage={(content) => {
@@ -1965,8 +2152,12 @@ export const ChatInput: React.FC<ChatInputProps> = ({ onOpenSettings, scrollToBo
                 <div
                     className={cn(
                         "flex flex-col relative overflow-visible",
+                        isDesktopExpanded && 'flex-1 min-h-0',
                         "border border-border/80",
-                        "focus-within:ring-1 focus-within:ring-primary/50",
+                        "focus-within:ring-1",
+                        inputMode === 'shell'
+                            ? 'focus-within:ring-[var(--status-info)]'
+                            : 'focus-within:ring-primary/50',
                         isDragging && "ring-2 ring-primary ring-offset-2"
                     )}
                     style={{
@@ -2007,27 +2198,35 @@ export const ChatInput: React.FC<ChatInputProps> = ({ onOpenSettings, scrollToBo
                             activeTab={autocompleteTab}
                             onTabSelect={handleAutocompleteTabSelect}
                             onClose={() => setShowCommandAutocomplete(false)}
+                            style={isDesktopExpanded && autocompleteOverlayPosition
+                                ? {
+                                    left: `${autocompleteOverlayPosition.left}px`,
+                                    top: `${autocompleteOverlayPosition.top}px`,
+                                    bottom: 'auto',
+                                    width: `min(450px, calc(100% - ${autocompleteOverlayPosition.left + 8}px))`,
+                                    maxHeight: `${autocompleteOverlayPosition.maxHeight}px`,
+                                    transform: autocompleteOverlayPosition.place === 'above' ? 'translateY(-100%)' : undefined,
+                                }
+                                : undefined}
                         />
                     )}
                     { }
-                    {showAgentAutocomplete && (
-                        <AgentMentionAutocomplete
-                            ref={agentRef}
-                            searchQuery={agentQuery}
-                            onAgentSelect={handleAgentSelect}
-                            showTabs={isMobile}
-                            activeTab={autocompleteTab}
-                            onTabSelect={handleAutocompleteTabSelect}
-                            onClose={() => setShowAgentAutocomplete(false)}
-                        />
-                    )}
-
                     {showSkillAutocomplete && (
                         <SkillAutocomplete
                             ref={skillRef}
                             searchQuery={skillQuery}
                             onSkillSelect={handleSkillSelect}
                             onClose={() => setShowSkillAutocomplete(false)}
+                            style={isDesktopExpanded && autocompleteOverlayPosition
+                                ? {
+                                    left: `${autocompleteOverlayPosition.left}px`,
+                                    top: `${autocompleteOverlayPosition.top}px`,
+                                    bottom: 'auto',
+                                    width: `min(360px, calc(100% - ${autocompleteOverlayPosition.left + 8}px))`,
+                                    maxHeight: `${autocompleteOverlayPosition.maxHeight}px`,
+                                    transform: autocompleteOverlayPosition.place === 'above' ? 'translateY(-100%)' : undefined,
+                                }
+                                : undefined}
                         />
                     )}
 
@@ -2037,10 +2236,21 @@ export const ChatInput: React.FC<ChatInputProps> = ({ onOpenSettings, scrollToBo
                             ref={mentionRef}
                             searchQuery={mentionQuery}
                             onFileSelect={handleFileSelect}
+                            onAgentSelect={handleAgentSelect}
                             showTabs={isMobile}
                             activeTab={autocompleteTab}
                             onTabSelect={handleAutocompleteTabSelect}
                             onClose={() => setShowFileMention(false)}
+                            style={isDesktopExpanded && autocompleteOverlayPosition
+                                ? {
+                                    left: `${autocompleteOverlayPosition.left}px`,
+                                    top: `${autocompleteOverlayPosition.top}px`,
+                                    bottom: 'auto',
+                                    width: `min(520px, calc(100% - ${autocompleteOverlayPosition.left + 8}px))`,
+                                    maxHeight: `${autocompleteOverlayPosition.maxHeight}px`,
+                                    transform: autocompleteOverlayPosition.place === 'above' ? 'translateY(-100%)' : undefined,
+                                }
+                                : undefined}
                         />
                     )}
                     <Textarea
@@ -2054,22 +2264,33 @@ export const ChatInput: React.FC<ChatInputProps> = ({ onOpenSettings, scrollToBo
                         onDragOver={handleDragOver}
                         onDrop={handleDrop}
                         onPointerDownCapture={handleTextareaPointerDownCapture}
+                        onKeyUp={updateAutocompleteOverlayPosition}
+                        onClick={updateAutocompleteOverlayPosition}
+                        onScroll={updateAutocompleteOverlayPosition}
+                        onSelect={updateAutocompleteOverlayPosition}
                         placeholder={currentSessionId || newSessionDraftOpen
-                            ? "# for agents; @ for files; / for commands"
+                            ? inputMode === 'shell'
+                                ? "Enter shell command..."
+                                : "@ for files/agents; / for commands; ! for shell"
                             : "Select or create a session to start chatting"}
                         disabled={!currentSessionId && !newSessionDraftOpen}
                         autoCorrect={isMobile ? "on" : "off"}
                         autoCapitalize={isMobile ? "sentences" : "off"}
                         spellCheck={isMobile}
-                        outerClassName="focus-within:ring-0"
+                        outerClassName={cn('focus-within:ring-0', isDesktopExpanded && 'flex-1 min-h-0')}
                         className={cn(
                             'min-h-[52px] resize-none border-0 px-3 rounded-b-none appearance-none hover:border-transparent bg-transparent',
-                            isMobile ? "py-2.5" : "pt-4 pb-2"
+                            isDesktopExpanded
+                                ? 'h-full min-h-0 py-4'
+                                : isMobile
+                                    ? 'py-2.5'
+                                    : 'pt-4 pb-2',
+                            inputMode === 'shell' && 'font-mono',
                         )}
                         style={{
-                            flex: 'none',
-                            height: textareaSize ? `${textareaSize.height}px` : undefined,
-                            maxHeight: textareaSize ? `${textareaSize.maxHeight}px` : undefined,
+                            flex: isDesktopExpanded ? '1 1 auto' : 'none',
+                            height: !isDesktopExpanded && textareaSize ? `${textareaSize.height}px` : undefined,
+                            maxHeight: !isDesktopExpanded && textareaSize ? `${textareaSize.maxHeight}px` : undefined,
                             borderTopLeftRadius: cornerRadius,
                             borderTopRightRadius: cornerRadius,
                         }}
@@ -2096,7 +2317,11 @@ export const ChatInput: React.FC<ChatInputProps> = ({ onOpenSettings, scrollToBo
                                     <div className="flex items-center min-w-0 gap-x-1 justify-end">
                                         <div className="flex items-center gap-x-1 min-w-0 max-w-[60vw] flex-shrink">
                                             <MobileModelButton onOpenModel={handleOpenMobileControls} className="min-w-0 flex-shrink" />
-                                            <MobileAgentButton onOpenAgentPanel={() => setMobileControlsPanel('agent')} className="min-w-0 flex-shrink" />
+                                            <MobileAgentButton
+                                                onOpenAgentPanel={() => setMobileControlsPanel('agent')}
+                                                onCycleAgent={handleCycleAgent}
+                                                className="min-w-0 flex-shrink"
+                                            />
                                         </div>
                                         <div className="flex items-center gap-x-1 flex-shrink-0">
                                             <BrowserVoiceButton />
@@ -2122,6 +2347,36 @@ export const ChatInput: React.FC<ChatInputProps> = ({ onOpenSettings, scrollToBo
                             <>
                                 <div className={cn("flex items-center flex-shrink-0", footerGapClass)}>
                                     {attachmentsControls}
+                                    <Tooltip delayDuration={600}>
+                                        <TooltipTrigger asChild>
+                                            <button
+                                                type="button"
+                                                className={cn(
+                                                    footerIconButtonClass,
+                                                    'rounded-md',
+                                                    isExpandedInput
+                                                        ? 'text-primary'
+                                                        : 'text-foreground hover:bg-[var(--interactive-hover)]/40'
+                                                )}
+                                                onMouseDown={(event) => {
+                                                    event.preventDefault();
+                                                }}
+                                                onClick={() => setExpandedInput(!isExpandedInput)}
+                                                aria-label="Toggle focus mode"
+                                                aria-pressed={isExpandedInput}
+                                            >
+                                                <RiFullscreenLine className={cn(iconSizeClass)} />
+                                            </button>
+                                        </TooltipTrigger>
+                                        <TooltipContent side="top" sideOffset={8}>
+                                            <div className="flex flex-col gap-0.5 text-center">
+                                                <span>Focus mode</span>
+                                                <span className="font-mono opacity-60">
+                                                    {isMacOS() ? '⌘⇧E' : 'Ctrl+Shift+E'}
+                                                </span>
+                                            </div>
+                                        </TooltipContent>
+                                    </Tooltip>
                                 </div>
                                 <div className={cn('flex items-center flex-1 justify-end', footerGapClass, 'md:gap-x-3')}>
                                     <ModelControls className={cn('flex-1 min-w-0 justify-end')} />
@@ -2132,10 +2387,11 @@ export const ChatInput: React.FC<ChatInputProps> = ({ onOpenSettings, scrollToBo
                         )}
                     </div>
 
-                    {/* Mobile Session Status Bar - 在输入框上方 */}
+                    {/* Mobile Session Status Bar - above input */}
                     {isMobile && <MobileSessionStatusBar cornerRadius={cornerRadius} />}
                 </div>
             </div>
         </form>
+        </>
     );
 };

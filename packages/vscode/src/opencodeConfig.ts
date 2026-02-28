@@ -61,14 +61,104 @@ const getProjectAgentPath = (workingDirectory: string, agentName: string): strin
   return pluralPath;
 };
 
-const getUserAgentPath = (agentName: string): string => {
+type AgentLookupCache = {
+  userAgentIndexByName: Map<string, string>;
+  userAgentLookupByName: Map<string, string | null>;
+  userAgentIndexReady: boolean;
+  userAgentIndexBuiltAt: number;
+};
+
+const AGENT_LOOKUP_CACHE_TTL_MS = 1000;
+
+const createAgentLookupCache = (): AgentLookupCache => ({
+  userAgentIndexByName: new Map<string, string>(),
+  userAgentLookupByName: new Map<string, string | null>(),
+  userAgentIndexReady: false,
+  userAgentIndexBuiltAt: 0,
+});
+
+const globalAgentLookupCache = createAgentLookupCache();
+
+const resetAgentLookupCache = (cache: AgentLookupCache): void => {
+  cache.userAgentIndexByName.clear();
+  cache.userAgentLookupByName.clear();
+  cache.userAgentIndexReady = false;
+  cache.userAgentIndexBuiltAt = 0;
+};
+
+const buildUserAgentIndex = (cache: AgentLookupCache): void => {
+  if (cache.userAgentIndexReady && Date.now() - cache.userAgentIndexBuiltAt < AGENT_LOOKUP_CACHE_TTL_MS) {
+    return;
+  }
+
+  cache.userAgentIndexByName.clear();
+  cache.userAgentLookupByName.clear();
+  cache.userAgentIndexReady = true;
+  cache.userAgentIndexBuiltAt = Date.now();
+
+  if (!fs.existsSync(AGENT_DIR)) return;
+
+  const dirsToVisit: string[] = [AGENT_DIR];
+  while (dirsToVisit.length > 0) {
+    const dir = dirsToVisit.pop();
+    if (!dir) continue;
+
+    let entries: fs.Dirent[];
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+
+    entries.sort((a, b) => a.name.localeCompare(b.name));
+
+    for (const entry of entries) {
+      if (!entry.isFile() || !entry.name.endsWith('.md')) continue;
+      const discoveredAgentName = entry.name.slice(0, -3);
+      if (!cache.userAgentIndexByName.has(discoveredAgentName)) {
+        cache.userAgentIndexByName.set(discoveredAgentName, path.join(dir, entry.name));
+      }
+    }
+
+    for (let i = entries.length - 1; i >= 0; i -= 1) {
+      const entry = entries[i];
+      if (entry?.isDirectory()) {
+        dirsToVisit.push(path.join(dir, entry.name));
+      }
+    }
+  }
+};
+
+const getIndexedUserAgentPath = (agentName: string, cache: AgentLookupCache): string | null => {
+  if (cache.userAgentLookupByName.has(agentName)) {
+    return cache.userAgentLookupByName.get(agentName) || null;
+  }
+
+  buildUserAgentIndex(cache);
+  const found = cache.userAgentIndexByName.get(agentName) || null;
+  cache.userAgentLookupByName.set(agentName, found);
+  return found;
+};
+
+const getUserAgentPath = (agentName: string, lookupCache: AgentLookupCache = globalAgentLookupCache): string => {
   const pluralPath = path.join(AGENT_DIR, `${agentName}.md`);
+
+  if (fs.existsSync(pluralPath)) return pluralPath;
+
   const legacyPath = path.join(OPENCODE_CONFIG_DIR, 'agent', `${agentName}.md`);
-  if (fs.existsSync(legacyPath) && !fs.existsSync(pluralPath)) return legacyPath;
+  if (fs.existsSync(legacyPath)) return legacyPath;
+
+  const found = getIndexedUserAgentPath(agentName, lookupCache);
+  if (found) return found;
+
   return pluralPath;
 };
 
-export const getAgentScope = (agentName: string, workingDirectory?: string): { scope: AgentScope | null; path: string | null } => {
+export const getAgentScope = (
+  agentName: string,
+  workingDirectory?: string,
+  lookupCache: AgentLookupCache = globalAgentLookupCache
+): { scope: AgentScope | null; path: string | null } => {
   if (workingDirectory) {
     const projectPath = getProjectAgentPath(workingDirectory, agentName);
     if (fs.existsSync(projectPath)) {
@@ -76,7 +166,7 @@ export const getAgentScope = (agentName: string, workingDirectory?: string): { s
     }
   }
   
-  const userPath = getUserAgentPath(agentName);
+  const userPath = getUserAgentPath(agentName, lookupCache);
   if (fs.existsSync(userPath)) {
     return { scope: AGENT_SCOPE.USER, path: userPath };
   }
@@ -84,8 +174,13 @@ export const getAgentScope = (agentName: string, workingDirectory?: string): { s
   return { scope: null, path: null };
 };
 
-const getAgentWritePath = (agentName: string, workingDirectory?: string, requestedScope?: AgentScope): { scope: AgentScope; path: string } => {
-  const existing = getAgentScope(agentName, workingDirectory);
+const getAgentWritePath = (
+  agentName: string,
+  workingDirectory?: string,
+  requestedScope?: AgentScope,
+  lookupCache: AgentLookupCache = globalAgentLookupCache
+): { scope: AgentScope; path: string } => {
+  const existing = getAgentScope(agentName, workingDirectory, lookupCache);
   if (existing.path) {
     return { scope: existing.scope!, path: existing.path };
   }
@@ -100,7 +195,7 @@ const getAgentWritePath = (agentName: string, workingDirectory?: string, request
   
   return { 
     scope: AGENT_SCOPE.USER, 
-    path: getUserAgentPath(agentName) 
+    path: getUserAgentPath(agentName, lookupCache) 
   };
 };
 
@@ -275,9 +370,92 @@ const readConfigLayers = (workingDirectory?: string) => {
   };
 };
 
-// eslint-disable-next-line @typescript-eslint/no-unused-vars -- kept for potential future use or debugging
 const readConfig = (workingDirectory?: string): Record<string, unknown> =>
   readConfigLayers(workingDirectory).mergedConfig;
+
+const getAncestors = (startDir?: string, stopDir?: string): string[] => {
+  if (!startDir) return [];
+  const result: string[] = [];
+  let current = path.resolve(startDir);
+  const resolvedStop = stopDir ? path.resolve(stopDir) : null;
+
+  while (true) {
+    result.push(current);
+    if (resolvedStop && current === resolvedStop) break;
+    const parent = path.dirname(current);
+    if (parent === current) break;
+    current = parent;
+  }
+
+  return result;
+};
+
+const findWorktreeRoot = (startDir?: string): string | null => {
+  if (!startDir) return null;
+  let current = path.resolve(startDir);
+
+  while (true) {
+    if (fs.existsSync(path.join(current, '.git'))) {
+      return current;
+    }
+    const parent = path.dirname(current);
+    if (parent === current) return null;
+    current = parent;
+  }
+};
+
+const walkSkillMdFiles = (rootDir?: string | null): string[] => {
+  if (!rootDir || !fs.existsSync(rootDir)) return [];
+
+  const results: string[] = [];
+  const walkDir = (dir: string) => {
+    let entries: fs.Dirent[] = [];
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+
+    for (const entry of entries) {
+      const fullPath = path.join(dir, entry.name);
+      if (entry.isDirectory()) {
+        walkDir(fullPath);
+        continue;
+      }
+      if (entry.isFile() && entry.name === 'SKILL.md') {
+        results.push(fullPath);
+      }
+    }
+  };
+
+  walkDir(rootDir);
+  return results;
+};
+
+const resolveSkillSearchDirectories = (workingDirectory?: string): string[] => {
+  const directories: string[] = [];
+  const pushDir = (dir?: string | null) => {
+    if (!dir) return;
+    const resolved = path.resolve(dir);
+    if (!directories.includes(resolved)) {
+      directories.push(resolved);
+    }
+  };
+
+  pushDir(OPENCODE_CONFIG_DIR);
+
+  if (workingDirectory) {
+    const worktreeRoot = findWorktreeRoot(workingDirectory) || path.resolve(workingDirectory);
+    const projectDirs = getAncestors(workingDirectory, worktreeRoot)
+      .map((dir) => path.join(dir, '.opencode'));
+    projectDirs.forEach(pushDir);
+  }
+
+  pushDir(path.join(os.homedir(), '.opencode'));
+  pushDir(process.env.OPENCODE_CONFIG_DIR ? path.resolve(process.env.OPENCODE_CONFIG_DIR) : null);
+
+  return directories;
+};
 
 const getConfigForPath = (layers: ReturnType<typeof readConfigLayers>, targetPath?: string | null) => {
   if (!targetPath) return layers.userConfig;
@@ -299,9 +477,192 @@ const writeConfig = (config: Record<string, unknown>, filePath: string = CONFIG_
   fs.writeFileSync(filePath, JSON.stringify(config, null, 2), 'utf8');
 };
 
+export type McpLocalConfig = {
+  type: 'local';
+  command?: string[];
+  environment?: Record<string, string>;
+  enabled?: boolean;
+};
+
+export type McpRemoteConfig = {
+  type: 'remote';
+  url?: string;
+  environment?: Record<string, string>;
+  enabled?: boolean;
+};
+
+export type McpConfigPayload = McpLocalConfig | McpRemoteConfig;
+
+export type McpConfigEntry = {
+  name: string;
+  scope?: AgentScope | null;
+  type: 'local' | 'remote';
+  command?: string[];
+  url?: string;
+  environment?: Record<string, string>;
+  enabled: boolean;
+};
+
+const resolveMcpScopeFromPath = (layers: ReturnType<typeof readConfigLayers>, sourcePath?: string | null): AgentScope | null => {
+  if (!sourcePath) return null;
+  return sourcePath === layers.paths.projectPath ? AGENT_SCOPE.PROJECT : AGENT_SCOPE.USER;
+};
+
+const ensureProjectMcpConfigPath = (workingDirectory: string): string => {
+  const projectConfigDir = path.join(workingDirectory, '.opencode');
+  if (!fs.existsSync(projectConfigDir)) {
+    fs.mkdirSync(projectConfigDir, { recursive: true });
+  }
+  return path.join(projectConfigDir, 'opencode.json');
+};
+
+const validateMcpName = (name: string): void => {
+  if (!name || typeof name !== 'string') {
+    throw new Error('MCP server name is required');
+  }
+  if (!/^[a-z0-9][a-z0-9_-]*[a-z0-9]$|^[a-z0-9]$/.test(name)) {
+    throw new Error('MCP server name must be lowercase alphanumeric with hyphens/underscores');
+  }
+};
+
+const buildMcpEntry = (data: Record<string, unknown>): Omit<McpConfigEntry, 'name'> => {
+  const entry: Omit<McpConfigEntry, 'name'> = {
+    type: data.type === 'remote' ? 'remote' : 'local',
+    enabled: data.enabled !== false,
+  };
+
+  if (entry.type === 'local') {
+    if (Array.isArray(data.command) && data.command.length > 0) {
+      entry.command = data.command.map((value) => String(value));
+    }
+  } else if (typeof data.url === 'string' && data.url.trim()) {
+    entry.url = data.url.trim();
+  }
+
+  if (isPlainObject(data.environment)) {
+    const cleaned: Record<string, string> = {};
+    for (const [key, value] of Object.entries(data.environment)) {
+      if (key && value != null) {
+        cleaned[key] = String(value);
+      }
+    }
+    if (Object.keys(cleaned).length > 0) {
+      entry.environment = cleaned;
+    }
+  }
+
+  return entry;
+};
+
+export const listMcpConfigs = (workingDirectory?: string): McpConfigEntry[] => {
+  const layers = readConfigLayers(workingDirectory);
+  const merged = (layers.mergedConfig as Record<string, unknown>) || {};
+  const mcp = isPlainObject(merged.mcp) ? merged.mcp : {};
+  return Object.entries(mcp)
+    .filter(([, value]) => isPlainObject(value))
+    .map(([name, value]) => {
+      const source = getJsonEntrySource(layers, 'mcp', name);
+      return {
+        name,
+        ...buildMcpEntry(value as Record<string, unknown>),
+        scope: resolveMcpScopeFromPath(layers, source.path),
+      };
+    });
+};
+
+export const getMcpConfig = (name: string, workingDirectory?: string): McpConfigEntry | null => {
+  const layers = readConfigLayers(workingDirectory);
+  const merged = (layers.mergedConfig as Record<string, unknown>) || {};
+  const mcp = isPlainObject(merged.mcp) ? merged.mcp : {};
+  const entry = mcp[name];
+  if (!isPlainObject(entry)) {
+    return null;
+  }
+  const source = getJsonEntrySource(layers, 'mcp', name);
+  return {
+    name,
+    ...buildMcpEntry(entry as Record<string, unknown>),
+    scope: resolveMcpScopeFromPath(layers, source.path),
+  };
+};
+
+export const createMcpConfig = (
+  name: string,
+  mcpConfig: Record<string, unknown>,
+  workingDirectory?: string,
+  scope?: AgentScope,
+): void => {
+  validateMcpName(name);
+
+  const layers = readConfigLayers(workingDirectory);
+  const source = getJsonEntrySource(layers, 'mcp', name);
+  if (source.exists) {
+    throw new Error(`MCP server "${name}" already exists`);
+  }
+
+  let targetPath = CONFIG_FILE;
+  let config: Record<string, unknown> = {};
+
+  if (scope === AGENT_SCOPE.PROJECT) {
+    if (!workingDirectory) {
+      throw new Error('Project scope requires working directory');
+    }
+    targetPath = ensureProjectMcpConfigPath(workingDirectory);
+    config = readConfigFile(targetPath);
+  } else {
+    const jsonTarget = getJsonWriteTarget(layers, AGENT_SCOPE.USER);
+    targetPath = jsonTarget.path || CONFIG_FILE;
+    config = (jsonTarget.config || {}) as Record<string, unknown>;
+  }
+
+  const mcp = isPlainObject(config.mcp) ? { ...config.mcp } : {};
+
+  const { name: _ignoredName, ...entryData } = mcpConfig;
+  void _ignoredName;
+  mcp[name] = buildMcpEntry(entryData);
+  config.mcp = mcp;
+  writeConfig(config, targetPath);
+};
+
+export const updateMcpConfig = (name: string, updates: Record<string, unknown>, workingDirectory?: string): void => {
+  const layers = readConfigLayers(workingDirectory);
+  const source = getJsonEntrySource(layers, 'mcp', name);
+  const targetPath = source.path || CONFIG_FILE;
+  const config = (source.config || readConfigFile(targetPath)) as Record<string, unknown>;
+  const mcp = isPlainObject(config.mcp) ? { ...config.mcp } : {};
+  const existing = isPlainObject(mcp[name]) ? mcp[name] : {};
+
+  const { name: _ignoredName, ...updateData } = updates;
+  void _ignoredName;
+  mcp[name] = buildMcpEntry({ ...(existing as Record<string, unknown>), ...updateData });
+  config.mcp = mcp;
+  writeConfig(config, targetPath);
+};
+
+export const deleteMcpConfig = (name: string, workingDirectory?: string): void => {
+  const layers = readConfigLayers(workingDirectory);
+  const source = getJsonEntrySource(layers, 'mcp', name);
+  const targetPath = source.path || CONFIG_FILE;
+  const config = (source.config || readConfigFile(targetPath)) as Record<string, unknown>;
+  const mcp = isPlainObject(config.mcp) ? { ...config.mcp } : {};
+
+  if (mcp[name] === undefined) {
+    throw new Error(`MCP server "${name}" not found`);
+  }
+
+  delete mcp[name];
+  if (Object.keys(mcp).length === 0) {
+    delete config.mcp;
+  } else {
+    config.mcp = mcp;
+  }
+
+  writeConfig(config, targetPath);
+};
+
 const getJsonEntrySource = (
   layers: ReturnType<typeof readConfigLayers>,
-  sectionKey: 'agent' | 'command',
+  sectionKey: 'agent' | 'command' | 'mcp',
   entryName: string
 ) => {
   const { userConfig, projectConfig, customConfig, paths } = layers;
@@ -437,6 +798,7 @@ export const createAgent = (agentName: string, config: Record<string, unknown>, 
   const { prompt, scope: _ignored, ...frontmatter } = config as Record<string, unknown> & { prompt?: unknown; scope?: unknown };
   void _ignored; // Scope is only used for path determination
   writeMdFile(targetPath, frontmatter, typeof prompt === 'string' ? prompt : '');
+  resetAgentLookupCache(globalAgentLookupCache);
 };
 
 export const updateAgent = (agentName: string, updates: Record<string, unknown>, workingDirectory?: string) => {
@@ -541,6 +903,10 @@ export const updateAgent = (agentName: string, updates: Record<string, unknown>,
   if (jsonModified) {
     writeConfig(config, jsonTarget.path || CONFIG_FILE);
   }
+
+  if (mdModified || isBuiltinOverride) {
+    resetAgentLookupCache(globalAgentLookupCache);
+  }
 };
 
 export const deleteAgent = (agentName: string, workingDirectory?: string) => {
@@ -583,6 +949,8 @@ export const deleteAgent = (agentName: string, workingDirectory?: string) => {
     targetConfig.agent = agentMap;
     writeConfig(targetConfig, jsonTarget.path || CONFIG_FILE);
   }
+
+  resetAgentLookupCache(globalAgentLookupCache);
 };
 
 export const getCommandSources = (commandName: string, workingDirectory?: string): ConfigSources => {
@@ -898,7 +1266,7 @@ export const SKILL_SCOPE = {
 } as const;
 
 export type SkillScope = typeof SKILL_SCOPE[keyof typeof SKILL_SCOPE];
-export type SkillSource = 'opencode' | 'claude';
+export type SkillSource = 'opencode' | 'claude' | 'agents';
 
 export type SupportingFile = {
   name: string;
@@ -926,6 +1294,38 @@ export type DiscoveredSkill = {
   path: string;
   scope: SkillScope;
   source: SkillSource;
+  description?: string;
+};
+
+const addSkillFromMdFile = (
+  skillsMap: Map<string, DiscoveredSkill>,
+  skillMdPath: string,
+  scope: SkillScope,
+  source: SkillSource
+) => {
+  try {
+    const parsed = parseMdFile(skillMdPath);
+    const name = typeof parsed.frontmatter?.name === 'string'
+      ? parsed.frontmatter.name.trim()
+      : '';
+    const description = typeof parsed.frontmatter?.description === 'string'
+      ? parsed.frontmatter.description
+      : '';
+
+    if (!name) {
+      return;
+    }
+
+    skillsMap.set(name, {
+      name,
+      path: skillMdPath,
+      scope,
+      source,
+      description,
+    });
+  } catch {
+    // Ignore invalid SKILL.md entries.
+  }
 };
 
 const ensureSkillDirs = () => {
@@ -970,11 +1370,24 @@ const getClaudeSkillPath = (workingDirectory: string, skillName: string): string
   return path.join(getClaudeSkillDir(workingDirectory, skillName), 'SKILL.md');
 };
 
+const getUserAgentsSkillDir = (skillName: string): string => {
+  return path.join(os.homedir(), '.agents', 'skills', skillName);
+};
+
+const getProjectAgentsSkillDir = (workingDirectory: string, skillName: string): string => {
+  return path.join(workingDirectory, '.agents', 'skills', skillName);
+};
+
 export const getSkillScope = (skillName: string, workingDirectory?: string): { 
   scope: SkillScope | null; 
   path: string | null; 
   source: SkillSource | null;
 } => {
+  const discovered = discoverSkills(workingDirectory).find((skill) => skill.name === skillName);
+  if (discovered?.path) {
+    return { scope: discovered.scope, path: discovered.path, source: discovered.source };
+  }
+
   if (workingDirectory) {
     // Check .opencode/skill first
     const projectPath = getProjectSkillPath(workingDirectory, skillName);
@@ -1026,86 +1439,100 @@ const listSupportingFiles = (skillDir: string): SupportingFile[] => {
 
 export const discoverSkills = (workingDirectory?: string): DiscoveredSkill[] => {
   const skills = new Map<string, DiscoveredSkill>();
-  
-  const addSkill = (name: string, skillPath: string, scope: SkillScope, source: SkillSource) => {
-    if (!skills.has(name)) {
-      skills.set(name, { name, path: skillPath, scope, source });
+
+  // 1) External global (.claude, .agents)
+  for (const externalRootName of ['.claude', '.agents']) {
+    const source: SkillSource = externalRootName === '.agents' ? 'agents' : 'claude';
+    const homeRoot = path.join(os.homedir(), externalRootName, 'skills');
+    for (const skillMdPath of walkSkillMdFiles(homeRoot)) {
+      addSkillFromMdFile(skills, skillMdPath, SKILL_SCOPE.USER, source);
     }
-  };
-  
-  // 1. Project level .opencode/skills/ (highest priority)
+  }
+
+  // 2) External project ancestors (.claude, .agents)
   if (workingDirectory) {
-    const projectSkillDir = path.join(workingDirectory, '.opencode', 'skills');
-    if (fs.existsSync(projectSkillDir)) {
-      const entries = fs.readdirSync(projectSkillDir, { withFileTypes: true });
-      for (const entry of entries) {
-        if (entry.isDirectory()) {
-          const skillMdPath = path.join(projectSkillDir, entry.name, 'SKILL.md');
-          if (fs.existsSync(skillMdPath)) {
-            addSkill(entry.name, skillMdPath, SKILL_SCOPE.PROJECT, 'opencode');
-          }
-        }
-      }
-    }
-
-    const legacyProjectSkillDir = path.join(workingDirectory, '.opencode', 'skill');
-    if (fs.existsSync(legacyProjectSkillDir)) {
-      const entries = fs.readdirSync(legacyProjectSkillDir, { withFileTypes: true });
-      for (const entry of entries) {
-        if (entry.isDirectory()) {
-          const skillMdPath = path.join(legacyProjectSkillDir, entry.name, 'SKILL.md');
-          if (fs.existsSync(skillMdPath)) {
-            addSkill(entry.name, skillMdPath, SKILL_SCOPE.PROJECT, 'opencode');
-          }
-        }
-      }
-    }
-    
-    // 2. Claude-compatible .claude/skills/
-    const claudeSkillDir = path.join(workingDirectory, '.claude', 'skills');
-    if (fs.existsSync(claudeSkillDir)) {
-      const entries = fs.readdirSync(claudeSkillDir, { withFileTypes: true });
-      for (const entry of entries) {
-        if (entry.isDirectory()) {
-          const skillMdPath = path.join(claudeSkillDir, entry.name, 'SKILL.md');
-          if (fs.existsSync(skillMdPath)) {
-            addSkill(entry.name, skillMdPath, SKILL_SCOPE.PROJECT, 'claude');
-          }
-        }
-      }
-    }
-  }
-  
-  // 3. User level ~/.config/opencode/skills/
-  if (fs.existsSync(SKILL_DIR)) {
-    const entries = fs.readdirSync(SKILL_DIR, { withFileTypes: true });
-    for (const entry of entries) {
-      if (entry.isDirectory()) {
-        const skillMdPath = path.join(SKILL_DIR, entry.name, 'SKILL.md');
-        if (fs.existsSync(skillMdPath)) {
-          addSkill(entry.name, skillMdPath, SKILL_SCOPE.USER, 'opencode');
+    const worktreeRoot = findWorktreeRoot(workingDirectory) || path.resolve(workingDirectory);
+    const ancestors = getAncestors(workingDirectory, worktreeRoot);
+    for (const ancestor of ancestors) {
+      for (const externalRootName of ['.claude', '.agents']) {
+        const source: SkillSource = externalRootName === '.agents' ? 'agents' : 'claude';
+        const externalSkillsRoot = path.join(ancestor, externalRootName, 'skills');
+        for (const skillMdPath of walkSkillMdFiles(externalSkillsRoot)) {
+          addSkillFromMdFile(skills, skillMdPath, SKILL_SCOPE.PROJECT, source);
         }
       }
     }
   }
 
-  const legacyUserSkillDir = path.join(OPENCODE_CONFIG_DIR, 'skill');
-  if (fs.existsSync(legacyUserSkillDir)) {
-    const entries = fs.readdirSync(legacyUserSkillDir, { withFileTypes: true });
-    for (const entry of entries) {
-      if (entry.isDirectory()) {
-        const skillMdPath = path.join(legacyUserSkillDir, entry.name, 'SKILL.md');
-        if (fs.existsSync(skillMdPath)) {
-          addSkill(entry.name, skillMdPath, SKILL_SCOPE.USER, 'opencode');
-        }
+  // 3) Config directories: {skill,skills}/**/SKILL.md
+  const configDirectories = resolveSkillSearchDirectories(workingDirectory);
+  const homeOpencodeDir = path.resolve(path.join(os.homedir(), '.opencode'));
+  const customConfigDir = process.env.OPENCODE_CONFIG_DIR
+    ? path.resolve(process.env.OPENCODE_CONFIG_DIR)
+    : null;
+  for (const dir of configDirectories) {
+    for (const subDir of ['skill', 'skills']) {
+      const root = path.join(dir, subDir);
+      for (const skillMdPath of walkSkillMdFiles(root)) {
+        const isUserConfigDir = dir === OPENCODE_CONFIG_DIR
+          || dir === homeOpencodeDir
+          || (customConfigDir && dir === customConfigDir);
+        const scope = isUserConfigDir ? SKILL_SCOPE.USER : SKILL_SCOPE.PROJECT;
+        addSkillFromMdFile(skills, skillMdPath, scope, 'opencode');
       }
     }
   }
-  
+
+  // 4) Additional config.skills.paths
+  let configuredPaths: unknown[] = [];
+  try {
+    const config = readConfig(workingDirectory);
+    const skillsConfig = isPlainObject(config.skills) ? config.skills : null;
+    configuredPaths = Array.isArray(skillsConfig?.paths) ? skillsConfig.paths : [];
+  } catch {
+    configuredPaths = [];
+  }
+  for (const skillPath of configuredPaths) {
+    if (typeof skillPath !== 'string' || !skillPath.trim()) continue;
+    const expanded = skillPath.startsWith('~/')
+      ? path.join(os.homedir(), skillPath.slice(2))
+      : skillPath;
+    const resolved = path.isAbsolute(expanded)
+      ? path.resolve(expanded)
+      : path.resolve(workingDirectory || process.cwd(), expanded);
+    for (const skillMdPath of walkSkillMdFiles(resolved)) {
+      addSkillFromMdFile(skills, skillMdPath, SKILL_SCOPE.PROJECT, 'opencode');
+    }
+  }
+
+  // 5) Cached skills from config.skills.urls pulls (best-effort, no network)
+  const cacheCandidates: string[] = [];
+  if (process.env.XDG_CACHE_HOME) {
+    cacheCandidates.push(path.join(process.env.XDG_CACHE_HOME, 'opencode', 'skills'));
+  }
+  cacheCandidates.push(path.join(os.homedir(), '.cache', 'opencode', 'skills'));
+  cacheCandidates.push(path.join(os.homedir(), 'Library', 'Caches', 'opencode', 'skills'));
+
+  for (const cacheRoot of cacheCandidates) {
+    if (!fs.existsSync(cacheRoot)) continue;
+    const entries = fs.readdirSync(cacheRoot, { withFileTypes: true });
+    for (const entry of entries) {
+      if (!entry.isDirectory()) continue;
+      const skillRoot = path.join(cacheRoot, entry.name);
+      for (const skillMdPath of walkSkillMdFiles(skillRoot)) {
+        addSkillFromMdFile(skills, skillMdPath, SKILL_SCOPE.USER, 'opencode');
+      }
+    }
+  }
+
   return Array.from(skills.values());
 };
 
-export const getSkillSources = (skillName: string, workingDirectory?: string): SkillConfigSources => {
+export const getSkillSources = (
+  skillName: string,
+  workingDirectory?: string,
+  discoveredSkill?: DiscoveredSkill | null
+): SkillConfigSources => {
   ensureSkillDirs();
   
   // Check all possible locations
@@ -1120,6 +1547,10 @@ export const getSkillSources = (skillName: string, workingDirectory?: string): S
   const userPath = getUserSkillPath(skillName);
   const userExists = fs.existsSync(userPath);
   const userDir = userExists ? getUserSkillDir(skillName) : null;
+
+  const matchedDiscovered = discoveredSkill?.name === skillName
+    ? discoveredSkill
+    : discoverSkills(workingDirectory).find((skill) => skill.name === skillName);
   
   // Determine which md file to use (priority: project > claude > user)
   let mdPath: string | null = null;
@@ -1142,6 +1573,11 @@ export const getSkillSources = (skillName: string, workingDirectory?: string): S
     mdScope = SKILL_SCOPE.USER;
     mdSource = 'opencode';
     mdDir = userDir;
+  } else if (matchedDiscovered?.path) {
+    mdPath = matchedDiscovered.path;
+    mdScope = matchedDiscovered.scope;
+    mdSource = matchedDiscovered.source;
+    mdDir = path.dirname(matchedDiscovered.path);
   }
   
   const mdExists = !!mdPath;
@@ -1226,22 +1662,31 @@ export const createSkill = (skillName: string, config: Record<string, unknown>, 
   // Determine target directory
   let targetDir: string;
   
-  if (scope === SKILL_SCOPE.PROJECT && workingDirectory) {
-    targetDir = getProjectSkillDir(workingDirectory, skillName);
+  const requestedScope = scope === SKILL_SCOPE.PROJECT ? SKILL_SCOPE.PROJECT : SKILL_SCOPE.USER;
+  const requestedSource: SkillSource = config.source === 'agents' ? 'agents' : 'opencode';
+
+  if (requestedScope === SKILL_SCOPE.PROJECT && workingDirectory) {
+    targetDir = requestedSource === 'agents'
+      ? getProjectAgentsSkillDir(workingDirectory, skillName)
+      : getProjectSkillDir(workingDirectory, skillName);
   } else {
-    targetDir = getUserSkillDir(skillName);
+    targetDir = requestedSource === 'agents'
+      ? getUserAgentsSkillDir(skillName)
+      : getUserSkillDir(skillName);
   }
   
   fs.mkdirSync(targetDir, { recursive: true });
   const targetPath = path.join(targetDir, 'SKILL.md');
   
   // Extract fields
-  const { instructions, scope: _ignored, supportingFiles: supportingFilesData, ...frontmatter } = config as Record<string, unknown> & { 
+  const { instructions, scope: _ignored, source: _sourceIgnored, supportingFiles: supportingFilesData, ...frontmatter } = config as Record<string, unknown> & { 
     instructions?: unknown; 
     scope?: unknown; 
+    source?: unknown;
     supportingFiles?: Array<{ path: string; content: string }>;
   };
   void _ignored;
+  void _sourceIgnored;
   
   // Ensure required fields
   if (!frontmatter.name) {
@@ -1322,12 +1767,24 @@ export const deleteSkill = (skillName: string, workingDirectory?: string): void 
       fs.rmSync(claudeDir, { recursive: true, force: true });
       deleted = true;
     }
+
+    const projectAgentsDir = getProjectAgentsSkillDir(workingDirectory, skillName);
+    if (fs.existsSync(projectAgentsDir)) {
+      fs.rmSync(projectAgentsDir, { recursive: true, force: true });
+      deleted = true;
+    }
   }
   
   // User level
   const userDir = getUserSkillDir(skillName);
   if (fs.existsSync(userDir)) {
     fs.rmSync(userDir, { recursive: true, force: true });
+    deleted = true;
+  }
+
+  const userAgentsDir = getUserAgentsSkillDir(skillName);
+  if (fs.existsSync(userAgentsDir)) {
+    fs.rmSync(userAgentsDir, { recursive: true, force: true });
     deleted = true;
   }
   

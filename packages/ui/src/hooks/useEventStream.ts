@@ -3,7 +3,7 @@ import { opencodeClient, type RoutedOpencodeEvent } from '@/lib/opencode/client'
 import { saveSessionCursor } from '@/lib/messageCursorPersistence';
 import { useSessionStore } from '@/stores/useSessionStore';
 import { useMessageStore } from '@/stores/messageStore';
-import { getMessageLimit } from '@/stores/types/sessionTypes';
+import { getMessageLimit, STUCK_SESSION_TIMEOUT_MS } from '@/stores/types/sessionTypes';
 import { useConfigStore } from '@/stores/useConfigStore';
 import { useUIStore, type EventStreamStatus } from '@/stores/useUIStore';
 import { useDirectoryStore } from '@/stores/useDirectoryStore';
@@ -42,9 +42,10 @@ declare global {
   }
 }
 
-const ENABLE_EMPTY_RESPONSE_DETECTION = false;
 const TEXT_SHRINK_TOLERANCE = 50;
 const RESYNC_DEBOUNCE_MS = 750;
+const QUESTION_RECONCILE_COOLDOWN_MS = 1500;
+const PERMISSION_RECONCILE_COOLDOWN_MS = 1500;
 
 const textLengthCache = new WeakMap<Part[], number>();
 const computeTextLength = (parts: Part[] | undefined | null): number => {
@@ -85,6 +86,8 @@ const isIdNewer = (id: string, referenceId: string): boolean => {
   return currentSortable > referenceSortable;
 };
 
+const MAX_MESSAGE_CACHE_SIZE = 500;
+const MESSAGE_CACHE_EVICT_COUNT = 100;
 const messageCache = new Map<string, { sessionId: string; message: { info: Message; parts: Part[] } | null }>();
 const getMessageFromStore = (sessionId: string, messageId: string): { info: Message; parts: Part[] } | null => {
   const cacheKey = `${sessionId}:${messageId}`;
@@ -96,7 +99,16 @@ const getMessageFromStore = (sessionId: string, messageId: string): { info: Mess
   const storeState = useSessionStore.getState();
   const sessionMessages = storeState.messages.get(sessionId) || [];
   const message = sessionMessages.find(m => m.info.id === messageId) || null;
-  
+
+  if (messageCache.size >= MAX_MESSAGE_CACHE_SIZE) {
+    // Evict oldest entries (Map preserves insertion order)
+    let count = 0;
+    for (const key of messageCache.keys()) {
+      if (count++ >= MESSAGE_CACHE_EVICT_COUNT) break;
+      messageCache.delete(key);
+    }
+  }
+
   messageCache.set(cacheKey, { sessionId, message });
   return message;
 };
@@ -108,6 +120,7 @@ export const useEventStream = () => {
     updateMessageInfo,
     updateSessionCompaction,
     addPermission,
+    dismissPermission,
     addQuestion,
     dismissQuestion,
     currentSessionId,
@@ -120,8 +133,6 @@ export const useEventStream = () => {
   } = useSessionStore();
 
   const { checkConnection } = useConfigStore();
-  const nativeNotificationsEnabled = useUIStore((state) => state.nativeNotificationsEnabled);
-  const mobileHapticsEnabled = useUIStore((state) => state.mobileHapticsEnabled);
   const fallbackDirectory = useDirectoryStore((state) => state.currentDirectory);
 
   const activeSessionDirectory = React.useMemo(() => {
@@ -154,54 +165,79 @@ export const useEventStream = () => {
     return undefined;
   }, [activeSessionDirectory, fallbackDirectory]);
 
-  React.useEffect(() => {
-    let cancelled = false;
+  const bootstrapPendingQuestions = React.useCallback(async () => {
+    try {
+      const projects = useProjectsStore.getState().projects;
+      const projectDirs = projects.map((project) => project.path);
+      // Use getState() to avoid sessions dependency which causes cascading updates
+      const currentSessions = useSessionStore.getState().sessions;
+      const sessionDirs = currentSessions.map((session) => (session as { directory?: string | null }).directory);
 
-    const bootstrapPendingPermissions = async () => {
-      try {
-        const pending = await opencodeClient.listPendingPermissions();
-        if (cancelled || pending.length === 0) {
-          return;
-        }
-
-        for (const request of pending) {
-          addPermission(request as unknown as PermissionRequest);
-        }
-      } catch {
-        // ignored
+      const directories = [effectiveDirectory, ...projectDirs, ...sessionDirs];
+      const pending = await opencodeClient.listPendingQuestions({ directories });
+      if (pending.length === 0) {
+        return;
       }
-    };
 
-    const bootstrapPendingQuestions = async () => {
-      try {
-        const projects = useProjectsStore.getState().projects;
-        const projectDirs = projects.map((project) => project.path);
-        // Use getState() to avoid sessions dependency which causes cascading updates
-        const currentSessions = useSessionStore.getState().sessions;
-        const sessionDirs = currentSessions.map((session) => (session as { directory?: string | null }).directory);
-
-        const directories = [effectiveDirectory, ...projectDirs, ...sessionDirs];
-
-        const pending = await opencodeClient.listPendingQuestions({ directories });
-        if (cancelled || pending.length === 0) {
-          return;
-        }
-
-        for (const request of pending) {
-          addQuestion(request as unknown as QuestionRequest);
-        }
-      } catch {
-        // ignored
+      for (const request of pending) {
+        addQuestion(request as unknown as QuestionRequest);
       }
-    };
+    } catch {
+      // ignored
+    }
+  }, [addQuestion, effectiveDirectory]);
 
-    void bootstrapPendingPermissions();
+  const lastQuestionRefreshAtRef = React.useRef(0);
+  const requestPendingQuestionsRefresh = React.useCallback((force = false) => {
+    const now = Date.now();
+    if (!force && now - lastQuestionRefreshAtRef.current < QUESTION_RECONCILE_COOLDOWN_MS) {
+      return;
+    }
+    lastQuestionRefreshAtRef.current = now;
     void bootstrapPendingQuestions();
+  }, [bootstrapPendingQuestions]);
 
-    return () => {
-      cancelled = true;
-    };
-  }, [addPermission, addQuestion, effectiveDirectory]);
+  const bootstrapPendingPermissions = React.useCallback(async () => {
+    try {
+      const projects = useProjectsStore.getState().projects;
+      const projectDirs = projects.map((project) => project.path);
+      // Use getState() to avoid sessions dependency which causes cascading updates
+      const currentSessions = useSessionStore.getState().sessions;
+      const sessionDirs = currentSessions.map((session) => (session as { directory?: string | null }).directory);
+
+      const directories = [effectiveDirectory, ...projectDirs, ...sessionDirs];
+      const pending = await opencodeClient.listPendingPermissions({ directories });
+      if (pending.length === 0) {
+        return;
+      }
+
+      for (const request of pending) {
+        addPermission(request as unknown as PermissionRequest);
+      }
+    } catch {
+      // ignored
+    }
+  }, [addPermission, effectiveDirectory]);
+
+  const lastPermissionRefreshAtRef = React.useRef(0);
+  const requestPendingPermissionsRefresh = React.useCallback((force = false) => {
+    const now = Date.now();
+    if (!force && now - lastPermissionRefreshAtRef.current < PERMISSION_RECONCILE_COOLDOWN_MS) {
+      return;
+    }
+    lastPermissionRefreshAtRef.current = now;
+    void bootstrapPendingPermissions();
+  }, [bootstrapPendingPermissions]);
+
+  const requestPendingPermissionsRefreshRef = React.useRef(requestPendingPermissionsRefresh);
+  React.useEffect(() => {
+    requestPendingPermissionsRefreshRef.current = requestPendingPermissionsRefresh;
+  }, [requestPendingPermissionsRefresh]);
+
+  React.useEffect(() => {
+    requestPendingPermissionsRefresh(true);
+    requestPendingQuestionsRefresh(true);
+  }, [requestPendingPermissionsRefresh, requestPendingQuestionsRefresh]);
 
   const normalizeDirectory = React.useCallback((value: string | null | undefined): string | null => {
     if (typeof value !== 'string') return null;
@@ -348,7 +384,6 @@ export const useEventStream = () => {
   const unsubscribeRef = React.useRef<(() => void) | null>(null);
   const reconnectTimeoutRef = React.useRef<NodeJS.Timeout | null>(null);
   const reconnectAttemptsRef = React.useRef(0);
-  const emptyResponseToastShownRef = React.useRef<Set<string>>(new Set());
   const missingMessageHydrationRef = React.useRef<Set<string>>(new Set());
   const metadataRefreshTimestampsRef = React.useRef<Map<string, number>>(new Map());
   const sessionRefreshTimeoutRef = React.useRef<NodeJS.Timeout | null>(null);
@@ -359,6 +394,7 @@ export const useEventStream = () => {
   const questionToastShownRef = React.useRef<Set<string>>(new Set());
   const notifiedMessagesRef = React.useRef<Set<string>>(new Set());
   const notifiedQuestionsRef = React.useRef<Set<string>>(new Set());
+  const serverNotificationEventSeenRef = React.useRef(false);
   const modeSwitchToastShownRef = React.useRef<Set<string>>(new Set());
   const lastUserAgentSelectionRef = React.useRef<Map<string, { created: number; messageId: string }>>(new Map());
 
@@ -383,6 +419,50 @@ export const useEventStream = () => {
     (sessionId: string, reason: string, limit?: number) => Promise<void>
   >(() => Promise.resolve());
   const scheduleReconnectRef = React.useRef<(hint?: string) => void>(() => {});
+
+  const isNotificationContextHidden = React.useCallback((isVSCodeRuntime: boolean): boolean => {
+    if (visibilityStateRef.current === 'hidden') {
+      return true;
+    }
+    if (isVSCodeRuntime && typeof document !== 'undefined') {
+      return !document.hasFocus();
+    }
+    return false;
+  }, []);
+
+  const dispatchRuntimeNotification = React.useCallback((payload: {
+    title: string;
+    body?: string;
+    tag?: string;
+    requireHidden?: boolean;
+  }) => {
+    const runtimeAPIs = getRegisteredRuntimeAPIs();
+    if (!runtimeAPIs?.notifications) {
+      return;
+    }
+
+    const title = typeof payload.title === 'string' ? payload.title.trim() : '';
+    if (!title) {
+      return;
+    }
+
+    const settings = useUIStore.getState();
+    if (!settings.nativeNotificationsEnabled) {
+      return;
+    }
+
+    const isVSCodeRuntime = Boolean(runtimeAPIs.runtime?.isVSCode);
+    const shouldRequireHidden = Boolean(payload.requireHidden) || settings.notificationMode === 'hidden-only';
+    if (shouldRequireHidden && !isNotificationContextHidden(isVSCodeRuntime)) {
+      return;
+    }
+
+    void runtimeAPIs.notifications.notifyAgentCompletion({
+      title,
+      body: typeof payload.body === 'string' ? payload.body : '',
+      tag: typeof payload.tag === 'string' ? payload.tag : undefined,
+    });
+  }, [isNotificationContextHidden]);
 
   const maybeBootstrapIfStale = React.useCallback(
     (reason: string) => {
@@ -487,7 +567,7 @@ export const useEventStream = () => {
     // Note: needs_attention logic is now handled by the server
     // Server maintains authoritative state based on view tracking and message events
 
-    if (prevType !== nextType) {
+    if (process.env.NODE_ENV === 'development' && prevType !== nextType) {
       try {
         console.info('[SESSION-STATUS]', {
           sessionId,
@@ -573,6 +653,9 @@ export const useEventStream = () => {
     const prevDirectory = previousSessionDirectoryRef.current;
 
     if (prevSessionId && nextSessionId && prevSessionId !== nextSessionId) {
+      // Clear the message cache on session switch to free memory
+      messageCache.clear();
+
       if (prevDirectory && nextDirectory && prevDirectory !== nextDirectory) {
         // Removed: void refreshSessionStatus();
       }
@@ -641,19 +724,56 @@ export const useEventStream = () => {
       case 'session.status':
         {
           const sessionId = readStringProp(props, ['sessionID', 'sessionId']);
-          const statusObj = (typeof props.status === 'object' && props.status !== null) ? props.status as Record<string, unknown> : null;
-          const statusType = typeof statusObj?.type === 'string' ? statusObj.type : null;
-          const statusInfo = statusObj ?? {};
+          const statusRaw = (props as { status?: unknown }).status;
+          const statusObj = (typeof statusRaw === 'object' && statusRaw !== null) ? statusRaw as Record<string, unknown> : null;
+          const statusType =
+            typeof statusRaw === 'string'
+              ? statusRaw
+              : typeof statusObj?.type === 'string'
+                ? statusObj.type
+                : typeof statusObj?.status === 'string'
+                  ? statusObj.status
+                  : typeof (props as { type?: unknown }).type === 'string'
+                    ? ((props as { type: string }).type)
+                    : typeof (props as { phase?: unknown }).phase === 'string'
+                      ? ((props as { phase: string }).phase)
+                      : typeof (props as { state?: unknown }).state === 'string'
+                        ? ((props as { state: string }).state)
+                        : null;
+          const statusInfo = statusObj ?? ({} as Record<string, unknown>);
+          const metadata = (props as { metadata?: unknown }).metadata;
+          const metadataObj = (typeof metadata === 'object' && metadata !== null) ? metadata as Record<string, unknown> : null;
 
           if (sessionId && statusType) {
             if (statusType === 'busy') {
-            updateSessionStatus(sessionId, { type: 'busy' }, 'sse:session.status');
+             updateSessionStatus(sessionId, { type: 'busy' }, 'sse:session.status');
             } else if (statusType === 'retry') {
               updateSessionStatus(sessionId, {
                 type: 'retry',
-                attempt: typeof statusInfo.attempt === 'number' ? statusInfo.attempt : undefined,
-                message: typeof statusInfo.message === 'string' ? statusInfo.message : undefined,
-                next: typeof statusInfo.next === 'number' ? statusInfo.next : undefined,
+                attempt:
+                  typeof statusInfo.attempt === 'number'
+                    ? statusInfo.attempt
+                    : typeof (props as { attempt?: unknown }).attempt === 'number'
+                      ? (props as { attempt: number }).attempt
+                      : typeof metadataObj?.attempt === 'number'
+                        ? metadataObj.attempt
+                      : undefined,
+                message:
+                  typeof statusInfo.message === 'string'
+                    ? statusInfo.message
+                    : typeof (props as { message?: unknown }).message === 'string'
+                      ? (props as { message: string }).message
+                      : typeof metadataObj?.message === 'string'
+                        ? metadataObj.message
+                      : undefined,
+                next:
+                  typeof statusInfo.next === 'number'
+                    ? statusInfo.next
+                    : typeof (props as { next?: unknown }).next === 'number'
+                      ? (props as { next: number }).next
+                      : typeof metadataObj?.next === 'number'
+                        ? metadataObj.next
+                      : undefined,
               }, 'sse:session.status');
             } else {
               updateSessionStatus(sessionId, { type: 'idle' }, 'sse:session.status');
@@ -757,6 +877,28 @@ export const useEventStream = () => {
           break;
         }
 
+        const shouldKeepSyntheticUserText = (value: unknown): boolean => {
+          const text = typeof value === 'string' ? value.trim() : '';
+          if (!text) return false;
+          return (
+            text.startsWith('User has requested to enter plan mode') ||
+            text.startsWith('The plan at ') ||
+            text.startsWith('The following tool was executed by the user')
+          );
+        };
+
+        const inferUserRoleFromPart = (): boolean => {
+          const partType = typeof partExt.type === 'string' ? partExt.type : '';
+          if (partType === 'subtask' || partType === 'agent' || partType === 'file') {
+            return true;
+          }
+          if (partType === 'text' && partExt.synthetic === true) {
+            const text = (partExt as { text?: unknown }).text;
+            return shouldKeepSyntheticUserText(text);
+          }
+          return false;
+        };
+
         let roleInfo = 'assistant';
         if (messageInfo && typeof (messageInfo as { role?: unknown }).role === 'string') {
           roleInfo = (messageInfo as { role?: string }).role as string;
@@ -770,11 +912,18 @@ export const useEventStream = () => {
           }
         }
 
+        if (roleInfo !== 'user' && inferUserRoleFromPart()) {
+          roleInfo = 'user';
+        }
+
         trackMessage(messageId, 'part_received', { role: roleInfo });
 
         if (roleInfo === 'user' && partExt.synthetic === true) {
-          trackMessage(messageId, 'skipped_synthetic_user_part');
-          break;
+          const text = (partExt as { text?: unknown }).text;
+          if (!shouldKeepSyntheticUserText(text)) {
+            trackMessage(messageId, 'skipped_synthetic_user_part');
+            break;
+          }
         }
 
         const messagePart: Part = {
@@ -782,13 +931,19 @@ export const useEventStream = () => {
           type: part.type || 'text',
         } as Part;
 
-        // Fallback: if we see assistant parts but session.status hasn't arrived yet, mark busy.
         if (roleInfo === 'assistant') {
           const partType = (messagePart as { type?: unknown }).type;
           const partTime = (messagePart as { time?: { end?: unknown } }).time;
           const partHasEnded = typeof partTime?.end === 'number';
           const toolState = (messagePart as { state?: { status?: unknown } }).state?.status;
+          const toolName = typeof (messagePart as { tool?: unknown }).tool === 'string'
+            ? (messagePart as { tool: string }).tool.toLowerCase()
+            : null;
           const textContent = (messagePart as { text?: unknown }).text;
+
+          if (partType === 'tool' && toolName === 'question') {
+            requestPendingQuestionsRefresh();
+          }
 
           const isStreamingPart = (() => {
             if (partType === 'tool') {
@@ -824,6 +979,81 @@ export const useEventStream = () => {
 
         trackMessage(messageId, 'addStreamingPart_called');
         addStreamingPart(sessionId, messageId, messagePart, roleInfo);
+        break;
+      }
+
+      case 'message.part.delta': {
+        const sessionId = readStringProp(props, ['sessionID', 'sessionId']);
+        const messageId = readStringProp(props, ['messageID', 'messageId']);
+        const partId = readStringProp(props, ['partID', 'partId']);
+        const field = readStringProp(props, ['field']);
+        const delta = typeof props.delta === 'string' ? props.delta : null;
+
+        if (!sessionId || !messageId || !partId || !field || delta === null) {
+          if (streamDebugEnabled()) {
+            console.debug('[useEventStream] Skipping message.part.delta with missing payload', {
+              sessionID: props.sessionID,
+              messageID: props.messageID,
+              partID: props.partID,
+              field: props.field,
+            });
+          }
+          break;
+        }
+
+        lastMessageEventBySessionRef.current.set(sessionId, Date.now());
+        const pendingTimer = pendingMessageStallTimersRef.current.get(sessionId);
+        if (pendingTimer) {
+          clearTimeout(pendingTimer);
+          pendingMessageStallTimersRef.current.delete(sessionId);
+        }
+
+        const trimmedHeadMaxId = useSessionStore.getState().sessionMemoryState.get(sessionId)?.trimmedHeadMaxId;
+        if (trimmedHeadMaxId && !isIdNewer(messageId, trimmedHeadMaxId)) {
+          if (streamDebugEnabled()) {
+            console.debug('[useEventStream] Skipping message.part.delta for trimmed message', {
+              sessionId,
+              messageId,
+              trimmedHeadMaxId,
+            });
+          }
+          break;
+        }
+
+        const existingMessage = getMessageFromStore(sessionId, messageId);
+        const existingPart = existingMessage?.parts?.find((item) => item?.id === partId);
+        if (!existingPart) {
+          break;
+        }
+
+        const existingPartRecord = existingPart as Record<string, unknown>;
+        const existingFieldValue = existingPartRecord[field];
+        const updatedPart: Part = {
+          ...existingPart,
+          [field]: `${typeof existingFieldValue === 'string' ? existingFieldValue : ''}${delta}`,
+        } as Part;
+
+        let roleInfo = 'assistant';
+        const existingRole = (existingMessage?.info as Record<string, unknown> | undefined)?.role;
+        if (typeof existingRole === 'string') {
+          roleInfo = existingRole;
+        }
+
+        if (roleInfo === 'assistant' && delta.length > 0) {
+          const currentStatus = useSessionStore.getState().sessionStatus?.get(sessionId);
+          const recentlyConfirmedIdle =
+            currentStatus?.type === 'idle' &&
+            typeof currentStatus.confirmedAt === 'number' &&
+            Date.now() - currentStatus.confirmedAt < 1200;
+          if (!currentStatus || currentStatus.type === 'idle') {
+            if (!recentlyConfirmedIdle) {
+              updateSessionStatus(sessionId, { type: 'busy' }, 'sse:message.part.delta');
+            }
+          }
+        }
+
+        trackMessage(messageId, 'part_delta_received', { role: roleInfo, field });
+        addStreamingPart(sessionId, messageId, updatedPart, roleInfo);
         break;
       }
 
@@ -980,9 +1210,7 @@ export const useEventStream = () => {
                   const variant = typeof (messageExt as { variant?: unknown }).variant === 'string'
                     ? (messageExt as { variant: string }).variant
                     : undefined;
-                  if (variant) {
-                    context.saveAgentModelVariantForSession(sessionId, agentCandidate, providerID, modelID, variant);
-                  }
+                  context.saveAgentModelVariantForSession(sessionId, agentCandidate, providerID, modelID, variant);
 
                   if (currentSessionIdRef.current === sessionId) {
                     try {
@@ -1052,7 +1280,8 @@ export const useEventStream = () => {
                 const textStr = typeof text === 'string' ? text.trim() : '';
                 const shouldKeep =
                   textStr.startsWith('User has requested to enter plan mode') ||
-                  textStr.startsWith('The plan at ');
+                  textStr.startsWith('The plan at ') ||
+                  textStr.startsWith('The following tool was executed by the user');
                 if (!shouldKeep) continue;
               }
 
@@ -1085,10 +1314,20 @@ export const useEventStream = () => {
         const finishCandidate = (message as { finish?: unknown }).finish;
         const finish = typeof finishCandidate === 'string' ? finishCandidate : null;
         const eventHasStopFinish = finish === 'stop';
+        const eventHasErrorFinish = finish === 'error';
 
-        if (!hasParts && !completedFromServer && !hasCompletedStatus && !eventHasStopFinish) break;
+        if (!hasParts && !completedFromServer && !hasCompletedStatus && !eventHasStopFinish && !eventHasErrorFinish) break;
 
         if ((messageExt as { role?: unknown }).role === 'assistant' && hasParts) {
+          const hasQuestionTool = partsArray.some((part) => (
+            part?.type === 'tool'
+            && typeof (part as { tool?: unknown }).tool === 'string'
+            && (part as { tool: string }).tool.toLowerCase() === 'question'
+          ));
+          if (hasQuestionTool) {
+            requestPendingQuestionsRefresh();
+          }
+
           const incomingLen = computeTextLength(partsArray);
           const wouldShrink = existingLen > 0 && incomingLen + TEXT_SHRINK_TOLERANCE < existingLen;
 
@@ -1099,6 +1338,44 @@ export const useEventStream = () => {
         }
 
         updateMessageInfo(sessionId, messageId, message as unknown as Message);
+
+        const messageRole = typeof (message as { role?: unknown }).role === 'string'
+          ? (message as { role: string }).role
+          : null;
+        const runtimeAPIs = getRegisteredRuntimeAPIs();
+        const shouldSynthesizeNotifications = Boolean(runtimeAPIs?.runtime?.isVSCode) && !serverNotificationEventSeenRef.current;
+        if (shouldSynthesizeNotifications && messageRole === 'assistant') {
+          const settings = useUIStore.getState();
+          const sessionInfo = useSessionStore.getState().sessions.find((entry) => entry.id === sessionId);
+          const sessionTitle = typeof sessionInfo?.title === 'string' ? sessionInfo.title.trim() : '';
+
+          if (eventHasStopFinish && settings.notifyOnCompletion !== false) {
+            const isSubtask = Boolean(sessionInfo?.parentID);
+            if (!(settings.notifyOnSubtasks === false && isSubtask)) {
+              const notificationKey = `ready:${sessionId}:${messageId}`;
+              if (!notifiedMessagesRef.current.has(notificationKey)) {
+                notifiedMessagesRef.current.add(notificationKey);
+                dispatchRuntimeNotification({
+                  title: 'Agent is ready',
+                  body: sessionTitle || 'Task completed',
+                  tag: `ready-${sessionId}`,
+                });
+              }
+            }
+          }
+
+          if (eventHasErrorFinish && settings.notifyOnError !== false) {
+            const notificationKey = `error:${sessionId}:${messageId}`;
+            if (!notifiedMessagesRef.current.has(notificationKey)) {
+              notifiedMessagesRef.current.add(notificationKey);
+              dispatchRuntimeNotification({
+                title: 'Tool error',
+                body: sessionTitle || 'An error occurred',
+                tag: `error-${sessionId}`,
+              });
+            }
+          }
+        }
 
         if (hasParts && (messageExt as { role?: unknown }).role !== 'user') {
           const storeState = useSessionStore.getState();
@@ -1172,77 +1449,7 @@ export const useEventStream = () => {
 
           void saveSessionCursor(sessionId, messageId, timeCompleted);
 
-          if (ENABLE_EMPTY_RESPONSE_DETECTION) {
-            const completedMessage = getMessageFromStore(sessionId, messageId);
-            if (completedMessage) {
-              const storedParts = Array.isArray(completedMessage.parts) ? completedMessage.parts : [];
-              const eventParts = partsArray;
-
-              const combinedParts: Part[] = [...storedParts];
-              for (let i = 0; i < eventParts.length; i++) {
-                const rawPart = eventParts[i];
-                if (!rawPart) continue;
-
-                const normalized: Part = {
-                  ...rawPart,
-                  type: (rawPart as { type?: string }).type || 'text',
-                } as Part;
-
-                const alreadyPresent = combinedParts.some(
-                  (existing) =>
-                    existing.id === normalized.id &&
-                    existing.type === normalized.type &&
-                    (existing as { callID?: string }).callID === (normalized as { callID?: string }).callID
-                );
-
-                if (!alreadyPresent) {
-                  combinedParts.push(normalized);
-                }
-              }
-
-              let hasStepMarkers = false;
-              let hasTextContent = false;
-              let hasTools = false;
-              let hasReasoning = false;
-              let hasFiles = false;
-
-              for (let i = 0; i < combinedParts.length; i++) {
-                const part = combinedParts[i];
-                if (!part) continue;
-
-                if (part.type === 'step-start' || part.type === 'step-finish') {
-                  hasStepMarkers = true;
-                } else if (part.type === 'text') {
-                  const text = (part as { text?: string }).text;
-                  if (typeof text === 'string' && text.trim().length > 0) {
-                    hasTextContent = true;
-                  }
-                } else if (part.type === 'tool') {
-                  hasTools = true;
-                } else if (part.type === 'reasoning') {
-                  hasReasoning = true;
-                } else if (part.type === 'file') {
-                  hasFiles = true;
-                }
-              }
-
-              const hasMeaningfulContent = hasTextContent || hasTools || hasReasoning || hasFiles;
-              const isEmptyResponse = !hasMeaningfulContent && !hasStepMarkers;
-
-              if (isEmptyResponse && !emptyResponseToastShownRef.current.has(messageId)) {
-                emptyResponseToastShownRef.current.add(messageId);
-                import('sonner').then(({ toast }) => {
-                  toast.info('Assistant response was empty', {
-                    description: 'Try sending your message again or rephrase it.',
-                    duration: 5000,
-                  });
-                });
-              }
-            }
-          }
-
 	          completeStreamingMessage(sessionId, messageId);
-	          updateSessionStatus(sessionId, { type: 'idle' }, 'sse:message.updated.completed');
 	          // Removed: void refreshSessionStatus();
 
 	          const rawMessageSessionId = (message as { sessionID?: string }).sessionID;
@@ -1338,12 +1545,36 @@ export const useEventStream = () => {
 
         addPermission(request);
 
+        const runtimeAPIs = getRegisteredRuntimeAPIs();
+        if (runtimeAPIs?.runtime?.isVSCode && !serverNotificationEventSeenRef.current) {
+          const settings = useUIStore.getState();
+          if (settings.notifyOnQuestion !== false) {
+            const notificationKey = `permission:${request.sessionID}:${request.id}`;
+            if (!notifiedQuestionsRef.current.has(notificationKey)) {
+              notifiedQuestionsRef.current.add(notificationKey);
+              const sessionTitle =
+                useSessionStore.getState().sessions.find((s) => s.id === request.sessionID)?.title ||
+                'Agent is waiting for your approval';
+              dispatchRuntimeNotification({
+                title: 'Permission required',
+                body: sessionTitle,
+                tag: `permission-${request.sessionID}:${request.id}`,
+              });
+            }
+          }
+        }
+
         // Notify if permission is for another session (common with child sessions).
         const toastKey = `${request.sessionID}:${request.id}`;
         if (!permissionToastShownRef.current.has(toastKey)) {
           setTimeout(() => {
             const current = currentSessionIdRef.current;
             if (current === request.sessionID) {
+              return;
+            }
+
+            const requestSession = useSessionStore.getState().sessions.find((session) => session.id === request.sessionID);
+            if (requestSession?.parentID && requestSession.parentID === current) {
               return;
             }
 
@@ -1365,7 +1596,9 @@ export const useEventStream = () => {
 
               import('sonner').then(({ toast }) => {
                 toast.warning('Permission required', {
+                  id: toastKey,
                   description: sessionTitle,
+                  duration: 30000,
                   action: {
                     label: 'Open',
                     onClick: () => {
@@ -1382,8 +1615,16 @@ export const useEventStream = () => {
         break;
       }
 
-      case 'permission.replied':
+      case 'permission.replied': {
+        const sessionId = typeof props.sessionID === 'string' ? props.sessionID : null;
+        const requestId =
+          typeof props.requestID === 'string' ? props.requestID :
+          typeof props.id === 'string' ? props.id : null;
+        if (sessionId && requestId) {
+          dismissPermission(sessionId, requestId);
+        }
         break;
+      }
 
       case 'question.asked': {
         if (!('sessionID' in props) || typeof props.sessionID !== 'string') {
@@ -1393,14 +1634,38 @@ export const useEventStream = () => {
         const request = props as unknown as QuestionRequest;
         addQuestion(request);
 
+        const runtimeAPIs = getRegisteredRuntimeAPIs();
+        if (runtimeAPIs?.runtime?.isVSCode && !serverNotificationEventSeenRef.current) {
+          const settings = useUIStore.getState();
+          if (settings.notifyOnQuestion !== false) {
+            const notificationKey = `question:${request.sessionID}:${request.id}`;
+            if (!notifiedQuestionsRef.current.has(notificationKey)) {
+              notifiedQuestionsRef.current.add(notificationKey);
+              const firstQuestion = Array.isArray(request.questions) ? request.questions[0] : undefined;
+              const questionHeader = typeof firstQuestion?.header === 'string' ? firstQuestion.header.trim() : '';
+              const questionText = typeof firstQuestion?.question === 'string' ? firstQuestion.question.trim() : '';
+              dispatchRuntimeNotification({
+                title: questionHeader || 'Input needed',
+                body: questionText || 'Agent is waiting for your response',
+                tag: `question-${request.sessionID}:${request.id}`,
+              });
+            }
+          }
+        }
+
         const toastKey = `${request.sessionID}:${request.id}`;
 
-	        // notifications are emitted server-side (see openchamber:notification)
+	        // web/desktop use server-emitted notifications; VS Code may synthesize locally
 
         if (!questionToastShownRef.current.has(toastKey)) {
           setTimeout(() => {
             const current = currentSessionIdRef.current;
             if (current === request.sessionID) {
+              return;
+            }
+
+            const requestSession = useSessionStore.getState().sessions.find((session) => session.id === request.sessionID);
+            if (requestSession?.parentID && requestSession.parentID === current) {
               return;
             }
 
@@ -1422,7 +1687,9 @@ export const useEventStream = () => {
 
             import('sonner').then(({ toast }) => {
               toast.info('Input needed', {
+                id: toastKey,
                 description: sessionTitle,
+                duration: 30000,
                 action: {
                   label: 'Open',
                   onClick: () => {
@@ -1457,14 +1724,11 @@ export const useEventStream = () => {
       }
 
       case 'openchamber:notification': {
+        serverNotificationEventSeenRef.current = true;
         const title = typeof (props as { title?: unknown }).title === 'string' ? (props as { title: string }).title : '';
         const body = typeof (props as { body?: unknown }).body === 'string' ? (props as { body: string }).body : '';
         const tag = typeof (props as { tag?: unknown }).tag === 'string' ? (props as { tag: string }).tag : undefined;
         const requireHidden = Boolean((props as { requireHidden?: unknown }).requireHidden);
-
-        if (requireHidden && visibilityStateRef.current !== 'hidden') {
-          break;
-        }
 
         // When the sidecar stdout notification channel is active (production desktop builds),
         // skip this SSE notification to avoid duplicating the native notification already
@@ -1474,14 +1738,10 @@ export const useEventStream = () => {
           break;
         }
 
-        if (!nativeNotificationsEnabled) {
-          break;
-        }
-
-        const runtimeAPIs = getRegisteredRuntimeAPIs();
-        if (runtimeAPIs?.notifications && title) {
-          void runtimeAPIs.notifications.notifyAgentCompletion({ title, body, tag });
-          void runHapticFeedback('success', mobileHapticsEnabled);
+        dispatchRuntimeNotification({ title, body, tag, requireHidden });
+        const settings = useUIStore.getState();
+        if (settings.nativeNotificationsEnabled) {
+          void runHapticFeedback('success', settings.mobileHapticsEnabled);
         }
 
         break;
@@ -1501,12 +1761,11 @@ export const useEventStream = () => {
     }
   }, [
     currentSessionId,
-    nativeNotificationsEnabled,
-    mobileHapticsEnabled,
     addStreamingPart,
     completeStreamingMessage,
     updateMessageInfo,
     addPermission,
+    dismissPermission,
     addQuestion,
     dismissQuestion,
     checkConnection,
@@ -1515,13 +1774,38 @@ export const useEventStream = () => {
     applySessionMetadata,
     trackMessage,
     reportMessage,
-    
+    requestPendingQuestionsRefresh,
+
     updateSession,
     removeSessionFromStore,
     bootstrapState,
     effectiveDirectory,
     updateSessionStatus,
+    dispatchRuntimeNotification,
   ]);
+
+  // --- Stable callback refs (Part A) ---
+  // Keep refs up to date with the latest version of each callback.
+  // This lets startStream use stable wrappers with empty deps so SSE connections
+  // are NOT torn down on every session switch.
+  const handleEventRef = React.useRef(handleEvent);
+  React.useEffect(() => {
+    handleEventRef.current = handleEvent;
+  }, [handleEvent]);
+
+  const bootstrapStateRef = React.useRef(bootstrapState);
+  React.useEffect(() => {
+    bootstrapStateRef.current = bootstrapState;
+  }, [bootstrapState]);
+
+  // Stable wrappers — identity never changes, so startStream deps stay minimal.
+  const stableHandleEvent = React.useCallback((event: EventData) => {
+    handleEventRef.current(event);
+  }, []); // intentionally empty deps
+
+  const stableBootstrapState = React.useCallback((reason: string) => {
+    return bootstrapStateRef.current(reason);
+  }, []); // intentionally empty deps
 
   const shouldHoldConnection = React.useCallback(() => {
     const currentVisibility = resolveVisibilityState();
@@ -1612,24 +1896,22 @@ export const useEventStream = () => {
       checkConnection();
       triggerSessionStatusPoll();
 
-      // Always refresh session status on connect to detect any
-      // already-running sessions (e.g., started via CLI before UI opened)
-      // Removed: void refreshSessionStatus();
+      requestPendingPermissionsRefreshRef.current(shouldRefresh);
 
        if (shouldRefresh) {
-         void bootstrapState('sse_reconnected');
+         void stableBootstrapState('sse_reconnected');
        } else {
          const sessionId = currentSessionIdRef.current;
          if (sessionId) {
            setTimeout(() => {
-            scheduleSoftResync(sessionId, 'sse_reconnected', getMessageLimit())
-              .then(() => requestSessionMetadataRefresh(sessionId))
-              .catch((error: unknown) => {
-                console.warn('[useEventStream] Failed to resync messages after reconnect:', error);
-              });
-            }, 0);
-          }
-        }
+           scheduleSoftResyncRef.current(sessionId, 'sse_reconnected', getMessageLimit())
+             .then(() => requestSessionMetadataRefresh(sessionId))
+             .catch((error: unknown) => {
+               console.warn('[useEventStream] Failed to resync messages after reconnect:', error);
+             });
+           }, 0);
+         }
+       }
       };
 
     if (streamDebugEnabled()) {
@@ -1661,7 +1943,7 @@ export const useEventStream = () => {
               ? { ...baseProperties, directory: event.directory }
               : baseProperties;
 
-          handleEvent({
+          stableHandleEvent({
             type: typeof (payload as { type?: unknown }).type === 'string' ? (payload as { type: string }).type : '',
             properties,
           });
@@ -1693,13 +1975,11 @@ export const useEventStream = () => {
     stopStream,
     publishStatus,
     checkConnection,
-    scheduleSoftResync,
     requestSessionMetadataRefresh,
-    handleEvent,
+    stableHandleEvent,
+    stableBootstrapState,
     effectiveDirectory,
-    
     debugConnectionState,
-    bootstrapState
   ]);
 
   const scheduleReconnect = React.useCallback((hint?: string) => {
@@ -1784,6 +2064,7 @@ export const useEventStream = () => {
           scheduleSoftResync(sessionId, 'visibility_restore', getMessageLimit());
           requestSessionMetadataRefresh(sessionId);
         }
+        requestPendingPermissionsRefreshRef.current(false);
 
         // Removed: void refreshSessionStatus();
         triggerSessionStatusPoll();
@@ -1812,18 +2093,20 @@ export const useEventStream = () => {
              requestSessionMetadataRefresh(sessionId);
              scheduleSoftResync(sessionId, 'window_focus', getMessageLimit());
            }
+           requestPendingPermissionsRefreshRef.current(false);
            // Removed: void refreshSessionStatus();
            triggerSessionStatusPoll();
 
-          publishStatus('connecting', 'Resuming stream');
-          startStream({ resetAttempts: true });
-        }
+           publishStatus('connecting', 'Resuming stream');
+           startStream({ resetAttempts: true });
+         }
       }
     };
 
       const handleOnline = () => {
         onlineStatusRef.current = true;
         maybeBootstrapIfStale('network_restored');
+        requestPendingPermissionsRefreshRef.current(false);
         if (pendingResumeRef.current || !unsubscribeRef.current) {
           triggerSessionStatusPoll();
           publishStatus('connecting', 'Network restored');
@@ -1854,6 +2137,7 @@ export const useEventStream = () => {
             void scheduleSoftResync(sessionId, 'page_show', getMessageLimit());
             requestSessionMetadataRefresh(sessionId);
           }
+          requestPendingPermissionsRefreshRef.current(false);
           // Removed: void refreshSessionStatus();
           triggerSessionStatusPoll();
           startStream({ resetAttempts: true });
@@ -1911,8 +2195,27 @@ export const useEventStream = () => {
           }
         }, 10000);
 
+    // Part B: Idle timeout recovery — scan for sessions stuck in 'busy'/'retry'
+    // with no recent SSE events and force-reset them to 'idle'.
+    const stuckCheckInterval = setInterval(() => {
+      const sessionStatus = useSessionStore.getState().sessionStatus;
+      if (!sessionStatus) return;
+      const now = Date.now();
+      sessionStatus.forEach((status, sessionId) => {
+        if (status.type !== 'busy' && status.type !== 'retry') return;
+        const lastMsgAt = lastMessageEventBySessionRef.current.get(sessionId) ?? 0;
+        const busyTooLong = now - lastMsgAt > STUCK_SESSION_TIMEOUT_MS;
+        const noRecentEvents = now - lastMsgAt > 60000;
+        if (busyTooLong && noRecentEvents) {
+          console.warn('[useEventStream] Session stuck in busy state, forcing idle:', sessionId);
+          updateSessionStatus(sessionId, { type: 'idle' }, 'timeout_recovery');
+        }
+      });
+    }, 30000); // check every 30s
+
     return () => {
       clearTimeout(startTimer);
+      clearInterval(stuckCheckInterval);
 
       void desktopActivityHandler;
 
@@ -1940,6 +2243,7 @@ export const useEventStream = () => {
       notifiedMessagesRef.current.clear();
       // eslint-disable-next-line react-hooks/exhaustive-deps -- Intentionally accessing current ref value at cleanup time
       notifiedQuestionsRef.current.clear();
+      serverNotificationEventSeenRef.current = false;
 
       pendingResumeRef.current = false;
       visibilityStateRef.current = resolveVisibilityState();
@@ -1971,5 +2275,6 @@ export const useEventStream = () => {
     maybeBootstrapIfStale,
     resyncMessages,
     scheduleSoftResync,
+    updateSessionStatus,
   ]);
 };

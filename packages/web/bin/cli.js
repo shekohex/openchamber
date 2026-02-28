@@ -4,7 +4,7 @@ import path from 'path';
 import fs from 'fs';
 import net from 'net';
 import { spawn, spawnSync } from 'child_process';
-import { fileURLToPath } from 'url';
+import { fileURLToPath, pathToFileURL } from 'url';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -177,6 +177,7 @@ OPTIONS:
 
 ENVIRONMENT:
   OPENCHAMBER_UI_PASSWORD      Alternative to --ui-password flag
+  OPENCODE_HOST               External OpenCode server base URL, e.g. http://hostname:4096 (overrides OPENCODE_PORT)
   OPENCODE_PORT               Port of external OpenCode server to connect to
   OPENCODE_SKIP_START          Skip starting OpenCode, use external server
 
@@ -450,6 +451,23 @@ function isProcessRunning(pid) {
   }
 }
 
+async function requestServerShutdown(port) {
+  if (!Number.isFinite(port) || port <= 0) return false;
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 1500);
+  try {
+    const resp = await fetch(`http://127.0.0.1:${port}/api/system/shutdown`, {
+      method: 'POST',
+      signal: controller.signal,
+    });
+    return resp.ok;
+  } catch {
+    return false;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
 const commands = {
   async serve(options) {
     options.port = await resolveAvailablePort(options.port);
@@ -607,7 +625,7 @@ const commands = {
       return;
     }
 
-    const { startWebUiServer } = await import(serverPath);
+    const { startWebUiServer } = await import(pathToFileURL(serverPath).href);
     await startWebUiServer({
       port: options.port,
       attachSignals: true,
@@ -675,6 +693,7 @@ const commands = {
       console.log(`Stopping OpenChamber (PID: ${targetInstance.pid}, Port: ${targetInstance.port})...`);
 
       try {
+        await requestServerShutdown(targetInstance.port);
         process.kill(targetInstance.pid, 'SIGTERM');
 
         let attempts = 0;
@@ -709,6 +728,7 @@ const commands = {
         console.log(`  Stopping instance on port ${instance.port} (PID: ${instance.pid})...`);
 
         try {
+          await requestServerShutdown(instance.port);
           process.kill(instance.pid, 'SIGTERM');
 
           let attempts = 0;
@@ -814,6 +834,7 @@ const commands = {
 
       // Stop the instance
       try {
+        await requestServerShutdown(instance.port);
         process.kill(instance.pid, 'SIGTERM');
         // Wait for it to stop
         let attempts = 0;
@@ -970,6 +991,7 @@ const commands = {
       console.log(`\nStopping ${runningInstances.length} running instance(s) before update...`);
       for (const instance of runningInstances) {
         try {
+          await requestServerShutdown(instance.port);
           process.kill(instance.pid, 'SIGTERM');
           let attempts = 0;
           while (isProcessRunning(instance.pid) && attempts < 20) {

@@ -53,6 +53,7 @@ interface StatusRowProps {
   isWaitingForPermission?: boolean;
   wasAborted?: boolean;
   abortActive?: boolean;
+  retryInfo?: { attempt?: number; next?: number } | null;
   // Abort state (for mobile/vscode)
   showAbort?: boolean;
   onAbort?: () => void;
@@ -67,6 +68,7 @@ export const StatusRow: React.FC<StatusRowProps> = ({
   isWaitingForPermission,
   wasAborted,
   abortActive,
+  retryInfo,
   showAbort,
   onAbort,
   showAbortStatus,
@@ -146,11 +148,6 @@ export const StatusRow: React.FC<StatusRowProps> = ({
     return () => document.removeEventListener("mousedown", handleClickOutside);
   }, [isExpanded]);
 
-  // Don't render if nothing to show
-  if (!hasContent) {
-    return null;
-  }
-
   const toggleExpanded = () => setIsExpanded((prev) => !prev);
 
   // Abort button for mobile/vscode
@@ -191,9 +188,13 @@ export const StatusRow: React.FC<StatusRowProps> = ({
     </button>
   ) : null;
 
+  // Don't render if nothing to show
+  if (!hasContent) {
+    return null;
+  }
+
   return (
     <div className="chat-column mb-1" style={{ containerType: "inline-size" }}>
-      {/* Main status row */}
       <div className="flex items-center justify-between pr-[2ch] py-0.5 gap-2 h-[1.2rem]">
         {/* Left: Abort status or Working placeholder */}
         <div className="flex-1 flex items-center overflow-hidden min-w-0">
@@ -211,6 +212,7 @@ export const StatusRow: React.FC<StatusRowProps> = ({
               statusText={statusText}
               isGenericStatus={isGenericStatus}
               isWaitingForPermission={isWaitingForPermission}
+              retryInfo={retryInfo}
             />
           ) : null}
         </div>
@@ -227,7 +229,7 @@ export const StatusRow: React.FC<StatusRowProps> = ({
               className={cn(
                 "absolute right-0 bottom-full mb-1 z-50",
                 "w-max min-w-[200px]",
-                "rounded-xl border border-border bg-background shadow-md",
+                "rounded-xl border border-border bg-background shadow-none",
                 "animate-in fade-in-0 zoom-in-95 slide-in-from-bottom-2",
                 "duration-150"
               )}

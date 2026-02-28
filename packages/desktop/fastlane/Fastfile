@@ -186,7 +186,7 @@ platform :android do
 
     aab = latest_artifact!(File.join(desktop_root, "build", "mobile-artifacts", "android", "*.aab"))
     options = {
-      package_name: ENV["ANDROID_APP_ID"] || "ai.opencode.openchamber",
+      package_name: ENV["ANDROID_APP_ID"] || "ai.fedaykin.openchamber",
       track: ENV["GOOGLE_PLAY_TRACK"] || "internal",
       release_status: ENV["GOOGLE_PLAY_RELEASE_STATUS"] || "draft",
       aab: aab,
@@ -226,7 +226,7 @@ platform :ios do
     ipa = latest_artifact!(File.join(desktop_root, "build", "mobile-artifacts", "ios", "*.ipa"))
     upload_options = {
       ipa: ipa,
-      app_identifier: ENV["IOS_APP_ID"] || "ai.opencode.openchamber",
+      app_identifier: ENV["IOS_APP_ID"] || "ai.fedaykin.openchamber",
       skip_waiting_for_build_processing: true,
       distribute_external: bool_env("TESTFLIGHT_DISTRIBUTE_EXTERNAL", false)
     }

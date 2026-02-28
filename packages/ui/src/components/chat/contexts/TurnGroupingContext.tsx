@@ -33,6 +33,7 @@ interface NeighborInfo {
 
 // Static data that only changes when messages change
 interface TurnGroupingStaticData {
+    structureKey: string;
     turns: Turn[];
     messageToTurn: Map<string, Turn>;
     turnActivityInfo: Map<string, TurnActivityInfo>;
@@ -60,8 +61,6 @@ const TurnGroupingStaticContext = React.createContext<TurnGroupingStaticData | n
 const TurnGroupingUiStateContext = React.createContext<TurnGroupingUiStateData | null>(null);
 const TurnGroupingStreamingContext = React.createContext<TurnGroupingStreamingData | null>(null);
 
-// Track staticData reference to clear cache when it changes
-let lastStaticDataRef: TurnGroupingStaticData | null = null;
 const contextCache = new Map<string, TurnGroupingContextType>();
 
 export const useTurnGroupingContextForMessage = (messageId: string): TurnGroupingContextType | undefined => {
@@ -71,13 +70,7 @@ export const useTurnGroupingContextForMessage = (messageId: string): TurnGroupin
     
     return React.useMemo(() => {
         if (!staticData || !uiStateData || !streamingData) return undefined;
-        
-        // Clear cache when staticData changes (new messages arrived)
-        if (lastStaticDataRef !== staticData) {
-            contextCache.clear();
-            lastStaticDataRef = staticData;
-        }
-        
+
         const turn = staticData.messageToTurn.get(messageId);
         if (!turn) return undefined;
         
@@ -88,7 +81,7 @@ export const useTurnGroupingContextForMessage = (messageId: string): TurnGroupin
         
         const isLastTurn = staticData.lastTurnId === turn.turnId;
         const lastTurnActivityVersion = isLastTurn
-            ? `${streamingData.lastTurnActivityInfo?.activityParts.length ?? 0}:${streamingData.lastTurnActivityInfo?.summaryBody ?? ''}`
+            ? `${streamingData.lastTurnActivityInfo?.activityParts.length ?? 0}:${streamingData.lastTurnActivityInfo?.activityGroupSegments.length ?? 0}:${streamingData.lastTurnActivityInfo?.hasTools ? 1 : 0}:${streamingData.lastTurnActivityInfo?.hasReasoning ? 1 : 0}`
             : '';
         
         // Get UI state early - needed for cache key to ensure expand/collapse updates propagate
@@ -99,9 +92,9 @@ export const useTurnGroupingContextForMessage = (messageId: string): TurnGroupin
         // - messageId: identifies the specific message
         // - isExpanded: UI state for this turn's activity group
         // - sessionIsWorking (last turn only): streaming state affects "working" indicator
-        const cacheKey = isLastTurn 
-            ? `${messageId}-${isExpanded}-${streamingData.sessionIsWorking}-${lastTurnActivityVersion}`
-            : `${messageId}-${isExpanded}`;
+        const cacheKey = isLastTurn
+            ? `${staticData.structureKey}:${messageId}-${isExpanded}-${streamingData.sessionIsWorking}-${lastTurnActivityVersion}`
+            : `${staticData.structureKey}:${messageId}-${isExpanded}`;
         
         const cached = contextCache.get(cacheKey);
         if (cached) return cached;
@@ -243,19 +236,25 @@ const isActivityStandaloneTool = (toolName: unknown): boolean => {
 };
 
 const extractFinalAssistantText = (turn: Turn): string | undefined => {
-    for (const assistantMsg of turn.assistantMessages) {
+    for (let messageIndex = turn.assistantMessages.length - 1; messageIndex >= 0; messageIndex -= 1) {
+        const assistantMsg = turn.assistantMessages[messageIndex];
+        if (!assistantMsg) continue;
+
         const infoFinish = (assistantMsg.info as { finish?: string | null | undefined }).finish;
-        if (infoFinish === 'stop') {
-            const textPart = assistantMsg.parts.find(p => p.type === 'text');
-            if (textPart) {
-                const textContent = (textPart as { text?: string | null | undefined }).text ??
-                                  (textPart as { content?: string | null | undefined }).content;
-                if (typeof textContent === 'string' && textContent.trim().length > 0) {
-                    return textContent;
-                }
+        if (infoFinish !== 'stop') continue;
+
+        for (let partIndex = assistantMsg.parts.length - 1; partIndex >= 0; partIndex -= 1) {
+            const part = assistantMsg.parts[partIndex];
+            if (!part || part.type !== 'text') continue;
+
+            const textContent = (part as { text?: string | null | undefined }).text ??
+                (part as { content?: string | null | undefined }).content;
+            if (typeof textContent === 'string' && textContent.trim().length > 0) {
+                return textContent;
             }
         }
     }
+
     return undefined;
 };
 
@@ -326,7 +325,6 @@ const getTurnActivityInfo = (turn: Turn, showTextJustificationActivity: boolean)
     }
 
     const activityParts: TurnActivityPart[] = [];
-    let syntheticIdCounter = 0;
 
     turn.assistantMessages.forEach((msg) => {
         const messageId = msg.info.id;
@@ -335,10 +333,8 @@ const getTurnActivityInfo = (turn: Turn, showTextJustificationActivity: boolean)
         // All earlier text messages are justification
         const isFinalSummaryMessage = messageId === lastTextMessageId;
 
-        msg.parts.forEach((part) => {
-            const baseId = (typeof part.id === 'string' && part.id.trim().length > 0)
-                ? part.id
-                : `${messageId}-activity-${syntheticIdCounter++}`;
+        msg.parts.forEach((part, partIndex) => {
+            const baseId = `${messageId}-part-${partIndex}-${part.type}`;
 
             if (part.type === 'tool') {
                 const state = (part as { state?: { time?: { end?: number | null | undefined } | null | undefined } | null | undefined }).state;
@@ -412,13 +408,11 @@ const getTurnActivityInfo = (turn: Turn, showTextJustificationActivity: boolean)
     turn.assistantMessages.forEach((msg) => {
         const messageId = msg.info.id;
 
-        msg.parts.forEach((part) => {
+        msg.parts.forEach((part, partIndex) => {
             if (part.type === 'tool') {
                 const toolName = (part as { tool?: unknown }).tool;
                 if (isActivityStandaloneTool(toolName)) {
-                    const toolPartId = typeof part.id === 'string' && part.id.trim().length > 0
-                        ? part.id
-                        : `${messageId}-task-${taskOrder.length + 1}`;
+                    const toolPartId = `${messageId}-part-${partIndex}-${part.type}`;
 
                     if (!taskMessageById.has(toolPartId)) {
                         taskMessageById.set(toolPartId, messageId);
@@ -522,28 +516,23 @@ export const TurnGroupingProvider: React.FC<TurnGroupingProviderProps> = ({ mess
     const showTextJustificationActivity = useUIStore((state) => state.showTextJustificationActivity);
     const defaultActivityExpanded = toolCallExpansion === 'activity' || toolCallExpansion === 'detailed';
     const structureKey = React.useMemo(() => getStructureKey(messages), [messages]);
-    const staticCacheRef = React.useRef<{
-        structureKey: string;
-        defaultActivityExpanded: boolean;
-        showTextJustificationActivity: boolean;
-        value: TurnGroupingStaticData;
-    } | null>(null);
+    const [structuredMessages, setStructuredMessages] = React.useState<ChatMessageEntry[]>(messages);
 
-    // Static data - avoid identity churn while assistant streams within existing turn structure.
+    React.useEffect(() => {
+        setStructuredMessages((previous) => {
+            if (getStructureKey(previous) === structureKey) {
+                return previous;
+            }
+            return messages;
+        });
+    }, [messages, structureKey]);
+
+    const staticStructureKey = React.useMemo(() => getStructureKey(structuredMessages), [structuredMessages]);
+
     const staticValue = React.useMemo<TurnGroupingStaticData>(() => {
-        const cached = staticCacheRef.current;
-        if (
-            cached &&
-            cached.structureKey === structureKey &&
-            cached.defaultActivityExpanded === defaultActivityExpanded &&
-            cached.showTextJustificationActivity === showTextJustificationActivity
-        ) {
-            return cached.value;
-        }
-
-        const turns = detectTurns(messages);
+        const turns = detectTurns(structuredMessages);
         const lastTurnId = turns.length > 0 ? turns[turns.length - 1]!.turnId : null;
-        
+
         const messageToTurn = new Map<string, Turn>();
         turns.forEach((turn) => {
             messageToTurn.set(turn.userMessage.info.id, turn);
@@ -558,9 +547,8 @@ export const TurnGroupingProvider: React.FC<TurnGroupingProviderProps> = ({ mess
             turnActivityInfo.set(turn.turnId, getTurnActivityInfo(turn, showTextJustificationActivity));
         });
 
-        const messageNeighbors = buildNeighborMap(messages);
+        const messageNeighbors = buildNeighborMap(structuredMessages);
 
-        // Build set of message IDs belonging to the last turn
         const lastTurnMessageIds = new Set<string>();
         if (turns.length > 0) {
             const lastTurn = turns[turns.length - 1]!;
@@ -570,7 +558,8 @@ export const TurnGroupingProvider: React.FC<TurnGroupingProviderProps> = ({ mess
             });
         }
 
-        const value: TurnGroupingStaticData = {
+        return {
+            structureKey: staticStructureKey,
             turns,
             messageToTurn,
             turnActivityInfo,
@@ -579,16 +568,7 @@ export const TurnGroupingProvider: React.FC<TurnGroupingProviderProps> = ({ mess
             defaultActivityExpanded,
             messageNeighbors,
         };
-
-        staticCacheRef.current = {
-            structureKey,
-            defaultActivityExpanded,
-            showTextJustificationActivity,
-            value,
-        };
-
-        return value;
-    }, [defaultActivityExpanded, messages, showTextJustificationActivity, structureKey]);
+    }, [defaultActivityExpanded, showTextJustificationActivity, staticStructureKey, structuredMessages]);
 
     const lastTurnActivityInfo = React.useMemo<TurnActivityInfo | undefined>(() => {
         const lastTurnId = staticValue.lastTurnId;
@@ -600,12 +580,29 @@ export const TurnGroupingProvider: React.FC<TurnGroupingProviderProps> = ({ mess
         if (!lastTurn) return undefined;
         // Re-slice assistant messages from the live `messages` array so that
         // streamed part updates are reflected without re-detecting all turns.
-        const userIdx = messages.findIndex((m) => m.info.id === lastTurn.userMessage.info.id);
-        if (userIdx < 0) return getTurnActivityInfo(lastTurn, showTextJustificationActivity);
-        const liveAssistant = messages.slice(userIdx + 1).filter((m) => {
-            const role = (m.info as { clientRole?: string | null }).clientRole ?? m.info.role;
-            return role === 'assistant';
-        });
+        const lastTurnUserId = lastTurn.userMessage.info.id;
+        const liveAssistant: ChatMessageEntry[] = [];
+        for (let index = messages.length - 1; index >= 0; index -= 1) {
+            const candidate = messages[index];
+            if (!candidate) {
+                continue;
+            }
+
+            if (candidate.info.id === lastTurnUserId) {
+                break;
+            }
+
+            const role = (candidate.info as { clientRole?: string | null }).clientRole ?? candidate.info.role;
+            if (role === 'assistant') {
+                liveAssistant.push(candidate);
+            }
+        }
+
+        if (liveAssistant.length === 0 && messages.every((message) => message.info.id !== lastTurnUserId)) {
+            return getTurnActivityInfo(lastTurn, showTextJustificationActivity);
+        }
+
+        liveAssistant.reverse();
         const liveTurn: Turn = { ...lastTurn, assistantMessages: liveAssistant };
         return getTurnActivityInfo(liveTurn, showTextJustificationActivity);
     }, [staticValue, messages, showTextJustificationActivity]);

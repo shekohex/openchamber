@@ -126,6 +126,7 @@
     user-select: text;
   }
 
+
   /* Allow system context menu only when explicitly requested via the "More" button */
   :root.mobile-pointer:not(.desktop-runtime) .message-content-text.show-system-menu {
     -webkit-touch-callout: default;
@@ -333,6 +334,12 @@
 
     :root.tauri-mobile-runtime .bottom-safe-area {
       padding-bottom: var(--oc-safe-area-bottom-visual, 0px) !important;
+    }
+
+    /* Drawer safe area - only top/bottom padding, no positioning */
+    .drawer-safe-area {
+      padding-top: var(--oc-safe-area-top);
+      padding-bottom: var(--oc-safe-area-bottom-visual);
     }
 
     /* iOS keyboard home indicator safe area - used when keyboard is open */

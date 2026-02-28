@@ -160,10 +160,56 @@ export function CodeMirrorEditor({
   const onChangeRef = React.useRef(onChange);
   const onViewReadyRef = React.useRef(onViewReady);
   const onViewDestroyRef = React.useRef(onViewDestroy);
-  const [, forceUpdate] = React.useReducer((x) => x + 1, 0);
+  const blockWidgetsRef = React.useRef(blockWidgets);
   
   // Scoped map for widget containers to avoid global collisions and memory leaks
   const widgetContainersRef = React.useRef(new Map<string, HTMLElement>());
+  const [portalWidgets, setPortalWidgets] = React.useState<Array<{ id: string; content: React.ReactNode; container: HTMLElement }>>([]);
+
+  const syncPortalWidgets = React.useCallback((widgets?: BlockWidgetDef[]) => {
+    const next = (widgets ?? [])
+      .map((widget) => {
+        const container = widgetContainersRef.current.get(widget.id);
+        if (!container) {
+          return null;
+        }
+        return {
+          id: widget.id,
+          content: widget.content,
+          container,
+        };
+      })
+      .filter((widget): widget is { id: string; content: React.ReactNode; container: HTMLElement } => widget !== null);
+
+    setPortalWidgets((prev) => {
+      if (
+        prev.length === next.length &&
+        prev.every((widget, index) => {
+          const candidate = next[index];
+          return (
+            widget.id === candidate.id &&
+            widget.content === candidate.content &&
+            widget.container === candidate.container
+          );
+        })
+      ) {
+        return prev;
+      }
+      return next;
+    });
+  }, []);
+
+  const syncEditorCssVars = React.useCallback((view?: EditorView | null) => {
+    const host = hostRef.current;
+    const resolvedView = view ?? viewRef.current;
+    if (!host || !resolvedView) {
+      return;
+    }
+
+    const gutters = resolvedView.dom.querySelector('.cm-gutters');
+    const gutterWidth = gutters instanceof HTMLElement ? gutters.getBoundingClientRect().width : 0;
+    host.style.setProperty('--oc-editor-gutter-width', `${gutterWidth}px`);
+  }, []);
 
   React.useEffect(() => {
     valueRef.current = value;
@@ -177,6 +223,11 @@ export function CodeMirrorEditor({
     onViewReadyRef.current = onViewReady;
     onViewDestroyRef.current = onViewDestroy;
   }, [onViewReady, onViewDestroy]);
+
+  React.useEffect(() => {
+    blockWidgetsRef.current = blockWidgets;
+    syncPortalWidgets(blockWidgets);
+  }, [blockWidgets, syncPortalWidgets]);
 
   React.useEffect(() => {
     if (!hostRef.current) {
@@ -201,8 +252,9 @@ export function CodeMirrorEditor({
         indentUnit.of('  '),
         keymap.of([indentWithTab, ...defaultKeymap, ...historyKeymap]),
         EditorView.updateListener.of((update) => {
-          if (update.docChanged || update.viewportChanged || update.geometryChanged) {
-            forceUpdate();
+          syncEditorCssVars(update.view);
+          if (update.viewportChanged || update.geometryChanged) {
+            syncPortalWidgets(blockWidgetsRef.current);
           }
           if (!update.docChanged) {
             return;
@@ -210,6 +262,7 @@ export function CodeMirrorEditor({
           const next = update.state.doc.toString();
           valueRef.current = next;
           onChangeRef.current(next);
+          syncPortalWidgets(blockWidgetsRef.current);
         }),
         editableCompartment.of(EditorView.editable.of(!readOnly)),
         externalExtensionsCompartment.of(extensions ?? []),
@@ -226,6 +279,10 @@ export function CodeMirrorEditor({
 
     forceParsingCompat(viewRef.current, viewRef.current.state.doc.length, 200);
     viewRef.current.requestMeasure();
+    requestAnimationFrame(() => {
+      syncEditorCssVars(viewRef.current);
+      syncPortalWidgets(blockWidgetsRef.current);
+    });
 
     if (viewRef.current) {
       onViewReadyRef.current?.(viewRef.current);
@@ -235,9 +292,10 @@ export function CodeMirrorEditor({
       onViewDestroyRef.current?.();
       viewRef.current?.destroy();
       viewRef.current = null;
+      setPortalWidgets([]);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [blockWidgetsRef, syncEditorCssVars, syncPortalWidgets]);
 
   React.useEffect(() => {
     const view = viewRef.current;
@@ -258,11 +316,11 @@ export function CodeMirrorEditor({
 
     forceParsingCompat(view, view.state.doc.length, 200);
     view.requestMeasure();
-
-    // Force a re-render to ensure Portals can find the new widget containers in the DOM
-    // The containers are created synchronously by CodeMirror during dispatch -> toDOM
-    forceUpdate();
-  }, [extensions, highlightLines, lineNumbersConfig, readOnly, blockWidgets, enableSearch]);
+    requestAnimationFrame(() => {
+      syncEditorCssVars(view);
+      syncPortalWidgets(blockWidgetsRef.current);
+    });
+  }, [extensions, highlightLines, lineNumbersConfig, readOnly, blockWidgets, enableSearch, syncEditorCssVars, syncPortalWidgets]);
 
   React.useEffect(() => {
     const view = viewRef.current;
@@ -287,8 +345,11 @@ export function CodeMirrorEditor({
       view.dispatch({
         changes: { from: 0, to: current.length, insert: value },
       });
+      forceParsingCompat(view, view.state.doc.length, 300);
+      view.requestMeasure();
+      requestAnimationFrame(() => syncEditorCssVars(view));
     }
-  }, [value]);
+  }, [value, syncEditorCssVars]);
 
   return (
     <>
@@ -302,13 +363,8 @@ export function CodeMirrorEditor({
           className,
         )}
       />
-      {blockWidgets?.map((w) => {
-        // Look for the widget container in our scoped map
-        // We prefer the map over querySelector because the container might be created but not yet attached,
-        // or detached temporarily by CM (virtual scrolling). Keeping the portal mounted preserves state.
-        const container = widgetContainersRef.current.get(w.id);
-        if (!container) return null;
-        return createPortal(w.content, container, w.id);
+      {portalWidgets.map((widget) => {
+        return createPortal(widget.content, widget.container, widget.id);
       })}
     </>
   );

@@ -1,10 +1,10 @@
 import React from 'react';
-import { Button } from '@/components/ui/button';
+import { ButtonSmall } from '@/components/ui/button-small';
 import { Input } from '@/components/ui/input';
 import { Textarea } from '@/components/ui/textarea';
 import { toast } from '@/components/ui';
 import { useSkillsStore, type SkillConfig, type SkillScope, type SupportingFile, type PendingFile } from '@/stores/useSkillsStore';
-import { RiAddLine, RiBookOpenLine, RiDeleteBinLine, RiFileLine, RiFolderLine, RiSaveLine, RiUser3Line } from '@remixicon/react';
+import { RiAddLine, RiBookOpenLine, RiDeleteBinLine, RiFileLine, RiFolderLine, RiRobot2Line, RiUser3Line } from '@remixicon/react';
 import { ScrollableOverlay } from '@/components/ui/ScrollableOverlay';
 import {
   Select,
@@ -21,10 +21,24 @@ import {
   DialogTitle,
 } from '@/components/ui/dialog';
 import { ButtonLarge } from '@/components/ui/button-large';
-import { AnimatedTabs } from '@/components/ui/animated-tabs';
 import { SkillsCatalogPage } from './catalog/SkillsCatalogPage';
+import {
+  SKILL_LOCATION_OPTIONS,
+  locationLabel,
+  locationPartsFrom,
+  locationValueFrom,
+  type SkillLocationValue,
+} from './skillLocations';
 
-export const SkillsPage: React.FC = () => {
+export interface SkillsPageProps {
+  view?: 'installed' | 'catalog';
+}
+
+const SkillsCatalogStandalone: React.FC = () => (
+  <SkillsCatalogPage mode="external" onModeChange={() => {}} showModeTabs={false} />
+);
+
+const SkillsInstalledPage: React.FC = () => {
   const { 
     selectedSkillName, 
     getSkillByName, 
@@ -41,80 +55,50 @@ export const SkillsPage: React.FC = () => {
   const isNewSkill = Boolean(skillDraft && skillDraft.name === selectedSkillName && !selectedSkill);
   const hasStaleSelection = Boolean(selectedSkillName && !selectedSkill && !skillDraft);
 
-  type SkillsMode = 'manual' | 'external';
-  const [mode, setMode] = React.useState<SkillsMode>('manual');
-
-  React.useEffect(() => {
-    if (!isNewSkill && mode !== 'manual') {
-      setMode('manual');
-    }
-  }, [isNewSkill, mode]);
-
   React.useEffect(() => {
     if (!hasStaleSelection) {
       return;
     }
 
-    // Clear persisted selection if it points to a non-existent skill.
     setSelectedSkill(null);
   }, [hasStaleSelection, setSelectedSkill]);
 
-  const modeTabs = isNewSkill ? (
-    <AnimatedTabs
-      tabs={[
-        { value: 'manual', label: 'Manual' },
-        { value: 'external', label: 'External' },
-      ]}
-      value={mode}
-      onValueChange={setMode}
-      animate={false}
-    />
-  ) : null;
-
   const [draftName, setDraftName] = React.useState('');
   const [draftScope, setDraftScope] = React.useState<SkillScope>('user');
+  const [draftSource, setDraftSource] = React.useState<'opencode' | 'agents'>('opencode');
   const [description, setDescription] = React.useState('');
   const [instructions, setInstructions] = React.useState('');
   const [supportingFiles, setSupportingFiles] = React.useState<SupportingFile[]>([]);
-  const [pendingFiles, setPendingFiles] = React.useState<PendingFile[]>([]); // For new skills
+  const [pendingFiles, setPendingFiles] = React.useState<PendingFile[]>([]);
   const [isSaving, setIsSaving] = React.useState(false);
   const [isLoading, setIsLoading] = React.useState(false);
   
-  // Track original values to detect changes
   const [originalDescription, setOriginalDescription] = React.useState('');
   const [originalInstructions, setOriginalInstructions] = React.useState('');
   
-  // File dialog state
   const [isFileDialogOpen, setIsFileDialogOpen] = React.useState(false);
   const [newFileName, setNewFileName] = React.useState('');
   const [newFileContent, setNewFileContent] = React.useState('');
-  const [editingFilePath, setEditingFilePath] = React.useState<string | null>(null); // null = adding, string = editing
+  const [editingFilePath, setEditingFilePath] = React.useState<string | null>(null);
   const [isLoadingFile, setIsLoadingFile] = React.useState(false);
-  const [originalFileContent, setOriginalFileContent] = React.useState(''); // Track original for change detection
+  const [originalFileContent, setOriginalFileContent] = React.useState('');
   const [deleteFilePath, setDeleteFilePath] = React.useState<string | null>(null);
   const [isDeletingFile, setIsDeletingFile] = React.useState(false);
   
-  // Detect if skill-level fields have changed
   const hasSkillChanges = isNewSkill 
     ? (draftName.trim() !== '' || description.trim() !== '' || instructions.trim() !== '' || pendingFiles.length > 0)
     : (description !== originalDescription || instructions !== originalInstructions);
   
-  // Detect if file content has changed
   const hasFileChanges = editingFilePath 
     ? newFileContent !== originalFileContent
-    : newFileName.trim() !== ''; // For new files, just need a name
+    : newFileName.trim() !== '';
 
-  // Load skill details when selection changes
   React.useEffect(() => {
-    if (mode === 'external') {
-      return;
-    }
-
     const loadSkillDetails = async () => {
       if (isNewSkill && skillDraft) {
-        // Prefill from draft (for new or duplicated skills)
         setDraftName(skillDraft.name || '');
         setDraftScope(skillDraft.scope || 'user');
+        setDraftSource(skillDraft.source === 'agents' ? 'agents' : 'opencode');
         setDescription(skillDraft.description || '');
         setInstructions(skillDraft.instructions || '');
         setOriginalDescription('');
@@ -126,7 +110,6 @@ export const SkillsPage: React.FC = () => {
         try {
           const detail = await getSkillDetail(selectedSkillName);
           if (detail) {
-            // Get actual content from the API response
             const md = detail.sources.md;
             setDescription(md.description || '');
             setInstructions(md.instructions || '');
@@ -143,7 +126,7 @@ export const SkillsPage: React.FC = () => {
     };
 
     loadSkillDetails();
-  }, [selectedSkill, isNewSkill, selectedSkillName, skills, skillDraft, getSkillDetail, mode]);
+  }, [selectedSkill, isNewSkill, selectedSkillName, skills, skillDraft, getSkillDetail]);
 
   const handleSave = async () => {
     const skillName = isNewSkill ? draftName.trim().replace(/\s+/g, '-').toLowerCase() : selectedSkillName?.trim();
@@ -153,7 +136,6 @@ export const SkillsPage: React.FC = () => {
       return;
     }
 
-    // Validate skill name format
     if (!/^[a-z0-9][a-z0-9-]*[a-z0-9]$|^[a-z0-9]$/.test(skillName) || skillName.length > 64) {
       toast.error('Skill name must be 1-64 lowercase alphanumeric characters with hyphens, cannot start or end with hyphen');
       return;
@@ -164,7 +146,6 @@ export const SkillsPage: React.FC = () => {
       return;
     }
 
-    // Check for duplicate name when creating new skill
     if (isNewSkill && skills.some((s) => s.name === skillName)) {
       toast.error('A skill with this name already exists');
       return;
@@ -178,7 +159,7 @@ export const SkillsPage: React.FC = () => {
         description: description.trim(),
         instructions: instructions.trim() || undefined,
         scope: isNewSkill ? draftScope : undefined,
-        // Include pending files when creating new skill
+        source: isNewSkill ? draftSource : undefined,
         supportingFiles: isNewSkill && pendingFiles.length > 0 ? pendingFiles : undefined,
       };
 
@@ -186,14 +167,13 @@ export const SkillsPage: React.FC = () => {
       if (isNewSkill) {
         success = await createSkill(config);
         if (success) {
-          setSkillDraft(null); // Clear draft after successful creation
-          setPendingFiles([]); // Clear pending files
-          setSelectedSkill(skillName); // Select the newly created skill
+          setSkillDraft(null);
+          setPendingFiles([]);
+          setSelectedSkill(skillName);
         }
       } else {
         success = await updateSkill(skillName, config);
         if (success) {
-          // Update original values to reflect saved state
           setOriginalDescription(description.trim());
           setOriginalInstructions(instructions.trim());
         }
@@ -224,7 +204,6 @@ export const SkillsPage: React.FC = () => {
     setEditingFilePath(filePath);
     setNewFileName(filePath);
     
-    // For new skills, get content from pending files
     if (isNewSkill) {
       const pendingFile = pendingFiles.find(f => f.path === filePath);
       const content = pendingFile?.content || '';
@@ -234,7 +213,6 @@ export const SkillsPage: React.FC = () => {
       return;
     }
     
-    // For existing skills, load content from server
     if (!selectedSkillName) return;
     
     setIsLoadingFile(true);
@@ -263,16 +241,13 @@ export const SkillsPage: React.FC = () => {
     const filePath = newFileName.trim();
     const isEditing = editingFilePath !== null;
 
-    // For new skills, add/update pending files
     if (isNewSkill) {
       if (isEditing) {
-        // Update existing pending file
         setPendingFiles(prev => prev.map(f => 
           f.path === editingFilePath ? { path: filePath, content: newFileContent } : f
         ));
         toast.success(`File "${filePath}" updated`);
       } else {
-        // Check for duplicate
         if (pendingFiles.some(f => f.path === filePath)) {
           toast.error('A file with this name already exists');
           return;
@@ -285,7 +260,6 @@ export const SkillsPage: React.FC = () => {
       return;
     }
 
-    // For existing skills, write directly to disk
     if (!selectedSkillName) {
       toast.error('No skill selected');
       return;
@@ -298,7 +272,6 @@ export const SkillsPage: React.FC = () => {
       toast.success(isEditing ? `File "${filePath}" updated` : `File "${filePath}" created`);
       setIsFileDialogOpen(false);
       setEditingFilePath(null);
-      // Refresh skill details to get updated file list
       const detail = await getSkillDetail(selectedSkillName);
       if (detail) {
         setSupportingFiles(detail.sources.md.supportingFiles || []);
@@ -309,14 +282,12 @@ export const SkillsPage: React.FC = () => {
   };
 
   const handleDeleteFile = (filePath: string) => {
-    // For new skills, remove from pending files
     if (isNewSkill) {
       setPendingFiles(prev => prev.filter(f => f.path !== filePath));
       toast.success(`File "${filePath}" removed`);
       return;
     }
 
-    // For existing skills, delete from disk
     if (!selectedSkillName) {
       return;
     }
@@ -347,12 +318,6 @@ export const SkillsPage: React.FC = () => {
     setIsDeletingFile(false);
   };
 
-  if (isNewSkill && mode === 'external') {
-    return <SkillsCatalogPage mode={mode} onModeChange={setMode} />;
-  }
-
-
-  // Show empty state when nothing is selected or selection is stale
   if ((!selectedSkillName && !skillDraft) || hasStaleSelection) {
     return (
       <div className="flex h-full items-center justify-center">
@@ -377,193 +342,185 @@ export const SkillsPage: React.FC = () => {
 
   return (
     <ScrollableOverlay keyboardAvoid outerClassName="h-full" className="w-full">
-      <div className="mx-auto max-w-3xl space-y-6 p-6">
-      {isNewSkill ? modeTabs : null}
+      <div className="mx-auto w-full max-w-3xl p-3 sm:p-6 sm:pt-8">
 
-      {/* Header */}
-      <div className="space-y-1">
-        <h1 className="typography-ui-header font-semibold text-lg">
-          {isNewSkill ? 'New Skill' : selectedSkillName}
-        </h1>
-        {selectedSkill && (
-          <p className="typography-meta text-muted-foreground">
-            {selectedSkill.scope === 'project' ? 'Project' : 'User'} skill
-            {selectedSkill.source === 'claude' && ' (Claude-compatible)'}
-          </p>
-        )}
-      </div>
-
-      {/* Basic Information */}
-      <div className="space-y-4">
-        <div className="space-y-1">
-          <h2 className="typography-ui-header font-semibold text-foreground">Basic Information</h2>
-          <p className="typography-meta text-muted-foreground/80">
-            Configure skill identity and description
-          </p>
-        </div>
-
-        {isNewSkill && (
-          <div className="space-y-2">
-            <label className="typography-ui-label font-medium text-foreground">
-              Skill Name & Scope
-            </label>
-            <div className="flex items-center gap-2">
-              <Input
-                value={draftName}
-                onChange={(e) => setDraftName(e.target.value.toLowerCase().replace(/\s+/g, '-'))}
-                placeholder="skill-name"
-                className="flex-1 text-foreground placeholder:text-muted-foreground"
-              />
-              <Select value={draftScope} onValueChange={(v) => setDraftScope(v as SkillScope)}>
-                <SelectTrigger className="!h-9 w-auto gap-1.5">
-                  {draftScope === 'user' ? (
-                    <RiUser3Line className="h-4 w-4" />
-                  ) : (
-                    <RiFolderLine className="h-4 w-4" />
-                  )}
-                  <span className="capitalize">{draftScope}</span>
-                </SelectTrigger>
-                <SelectContent align="end">
-                  <SelectItem value="user" className="pr-2 [&>span:first-child]:hidden">
-                    <div className="flex flex-col gap-0.5">
-                      <div className="flex items-center gap-2">
-                        <RiUser3Line className="h-4 w-4" />
-                        <span>User</span>
-                      </div>
-                      <span className="typography-micro text-muted-foreground ml-6">Available in all projects</span>
-                    </div>
-                  </SelectItem>
-                  <SelectItem value="project" className="pr-2 [&>span:first-child]:hidden">
-                    <div className="flex flex-col gap-0.5">
-                      <div className="flex items-center gap-2">
-                        <RiFolderLine className="h-4 w-4" />
-                        <span>Project</span>
-                      </div>
-                      <span className="typography-micro text-muted-foreground ml-6">Only in current project</span>
-                    </div>
-                  </SelectItem>
-                </SelectContent>
-              </Select>
-            </div>
-            <p className="typography-meta text-muted-foreground">
-              Lowercase letters, numbers, and hyphens only. Cannot start or end with hyphen.
+        {/* Header */}
+        <div className="mb-4">
+          <div className="min-w-0">
+            <h2 className="typography-ui-header font-semibold text-foreground truncate flex items-center gap-2">
+              {isNewSkill ? 'New Skill' : selectedSkillName}
+              {selectedSkill?.source === 'claude' && (
+                <span className="typography-micro font-normal bg-[var(--surface-muted)] text-muted-foreground px-1.5 py-0.5 rounded">
+                  Claude-compatible
+                </span>
+              )}
+            </h2>
+            <p className="typography-meta text-muted-foreground truncate">
+              {selectedSkill ? `${locationLabel(selectedSkill.scope, selectedSkill.source)} skill` : 'Configure a new skill'}
             </p>
           </div>
-        )}
-
-        <div className="space-y-2">
-          <label className="typography-ui-label font-medium text-foreground">
-            Description <span className="text-destructive">*</span>
-          </label>
-          <Textarea
-            value={description}
-            onChange={(e) => setDescription(e.target.value)}
-            placeholder="Brief description of what this skill does..."
-            rows={2}
-            className="max-h-32 resize-none"
-          />
-          <p className="typography-meta text-muted-foreground">
-            The agent uses this to decide when to load the skill
-          </p>
         </div>
-      </div>
 
-      {/* Instructions */}
-      <div className="space-y-4">
-        <div className="space-y-1">
-          <h2 className="typography-h2 font-semibold text-foreground">Instructions</h2>
-          <p className="typography-meta text-muted-foreground/80">
-            Detailed instructions for the agent when this skill is loaded
-          </p>
-        </div>
-        <Textarea
-          value={instructions}
-          onChange={(e) => setInstructions(e.target.value)}
-          placeholder="Step-by-step instructions, guidelines, or reference content..."
-          rows={12}
-          className="font-mono typography-meta max-h-80 resize-y"
-        />
-      </div>
-
-      {/* Supporting Files */}
-      <div className="space-y-4">
-        <div className="flex items-center justify-between">
-          <div className="space-y-1">
-            <h2 className="typography-h2 font-semibold text-foreground">Supporting Files</h2>
-            <p className="typography-meta text-muted-foreground/80">
-              Reference documentation, scripts, or templates
-            </p>
+        {/* Basic Information */}
+        <div className="mb-8">
+          <div className="mb-1 px-1">
+            <h3 className="typography-ui-header font-medium text-foreground">
+              Basic Information
+            </h3>
           </div>
-          <Button
-            variant="outline"
-            size="sm"
-            onClick={handleAddFile}
-            className="gap-1.5"
-          >
-            <RiAddLine className="h-3.5 w-3.5" />
-            Add File
-          </Button>
-        </div>
 
-        {(() => {
-          // For new skills, show pending files
-          const filesToShow = isNewSkill ? pendingFiles : supportingFiles;
-          
-          if (filesToShow.length === 0) {
-            return (
-              <p className="typography-meta text-muted-foreground py-2">
-                {isNewSkill ? 'No files yet. Use "Add File" to include reference materials.' : 'No supporting files. Use "Add File" to include reference materials.'}
-              </p>
-            );
-          }
-          
-          return (
-            <div className="space-y-2">
-              {filesToShow.map((file) => (
-                <div
-                  key={file.path}
-                  className="flex items-center justify-between px-3 py-2 rounded-lg border bg-muted/30 hover:bg-interactive-hover cursor-pointer transition-colors"
-                  onClick={() => handleEditFile(file.path)}
-                >
-                  <div className="flex items-center gap-2 min-w-0">
-                    <RiFileLine className="h-4 w-4 text-muted-foreground flex-shrink-0" />
-                    <span className="typography-ui-label truncate">{file.path}</span>
-                    {isNewSkill && (
-                      <span className="typography-micro text-muted-foreground bg-muted px-1 rounded flex-shrink-0 leading-none pb-px border border-border/50">
-                        pending
-                      </span>
-                    )}
-                  </div>
-                  <Button
-                    variant="ghost"
-                    size="icon"
-                    className="h-7 w-7 text-muted-foreground hover:text-destructive"
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      handleDeleteFile(file.path);
+          <section className="px-2 pb-2 pt-0 space-y-0">
+
+            {isNewSkill && (
+              <div className="py-1.5">
+                <span className="typography-ui-label text-foreground">Skill Name & Location</span>
+                <span className="typography-meta text-muted-foreground ml-2">Lowercase, numbers, hyphens</span>
+                <div className="flex items-center gap-2 mt-1.5">
+                  <Input
+                    value={draftName}
+                    onChange={(e) => setDraftName(e.target.value.toLowerCase().replace(/\s+/g, '-'))}
+                    placeholder="skill-name"
+                    className="h-7 w-40 px-2"
+                  />
+                  <Select
+                    value={locationValueFrom(draftScope, draftSource)}
+                    onValueChange={(v) => {
+                      const next = locationPartsFrom(v as SkillLocationValue);
+                      setDraftScope(next.scope);
+                      setDraftSource(next.source === 'agents' ? 'agents' : 'opencode');
                     }}
                   >
-                    <RiDeleteBinLine className="h-3.5 w-3.5" />
-                  </Button>
+                    <SelectTrigger className="w-fit gap-1.5">
+                      {draftScope === 'user' ? (
+                        <RiUser3Line className="h-3.5 w-3.5" />
+                      ) : (
+                        <RiFolderLine className="h-3.5 w-3.5" />
+                      )}
+                      {draftSource === 'agents' ? <RiRobot2Line className="h-3.5 w-3.5" /> : null}
+                      <span>{locationLabel(draftScope, draftSource)}</span>
+                    </SelectTrigger>
+                    <SelectContent align="start">
+                      {SKILL_LOCATION_OPTIONS.map((option) => (
+                        <SelectItem key={option.value} value={option.value}>
+                          <div className="flex flex-col gap-0.5">
+                            <div className="flex items-center gap-2">
+                              {option.scope === 'user' ? <RiUser3Line className="h-3.5 w-3.5" /> : <RiFolderLine className="h-3.5 w-3.5" />}
+                              {option.source === 'agents' ? <RiRobot2Line className="h-3.5 w-3.5" /> : null}
+                              <span>{option.label}</span>
+                            </div>
+                            <span className="typography-micro text-muted-foreground ml-6">{option.description}</span>
+                          </div>
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
                 </div>
-              ))}
-            </div>
-          );
-        })()}
-      </div>
+              </div>
+            )}
 
-      {/* Save Button */}
-      <div className="flex justify-end border-t border-border/40 pt-4">
-        <Button
-          size="sm"
-          variant="default"
-          onClick={handleSave}
-          disabled={isSaving || !hasSkillChanges}
-          className="gap-2 h-6 px-2 text-xs w-fit"
-        >
-          <RiSaveLine className="h-3 w-3" />
-          {isSaving ? 'Saving...' : isNewSkill ? 'Create Skill' : 'Save Changes'}
-        </Button>
+            <div className="py-1.5">
+              <span className="typography-ui-label text-foreground">Description <span className="text-[var(--status-error)]">*</span></span>
+              <span className="typography-meta text-muted-foreground ml-2">The agent uses this to decide when to load the skill</span>
+              <div className="mt-1.5">
+                <Textarea
+                  value={description}
+                  onChange={(e) => setDescription(e.target.value)}
+                  placeholder="Brief description of what this skill does..."
+                  rows={2}
+                  className="w-full resize-none min-h-[60px] max-h-32 bg-transparent"
+                />
+              </div>
+            </div>
+
+          </section>
+        </div>
+
+        {/* Instructions */}
+        <div className="mb-8">
+          <div className="mb-1 px-1">
+            <h3 className="typography-ui-header font-medium text-foreground">
+              Instructions
+            </h3>
+          </div>
+
+          <section className="px-2 pb-2 pt-0">
+            <Textarea
+              value={instructions}
+              onChange={(e) => setInstructions(e.target.value)}
+              placeholder="Step-by-step instructions, guidelines, or reference content..."
+              className="min-h-[220px] max-h-[60vh] font-mono typography-meta"
+            />
+          </section>
+        </div>
+
+        {/* Supporting Files */}
+        <div className="mb-2">
+          <div className="mb-1 px-1 flex items-center gap-2">
+            <h3 className="typography-ui-header font-medium text-foreground">
+              Supporting Files
+            </h3>
+            <ButtonSmall variant="outline" size="xs" className="!font-normal gap-1" onClick={handleAddFile}>
+              <RiAddLine className="h-3.5 w-3.5" /> Add File
+            </ButtonSmall>
+          </div>
+
+          <section className="px-2 pb-2 pt-0">
+            {(() => {
+              const filesToShow = isNewSkill ? pendingFiles : supportingFiles;
+
+              if (filesToShow.length === 0) {
+                return (
+                  <p className="typography-meta text-muted-foreground py-1.5">
+                    No supporting files. Use "Add File" to include reference materials.
+                  </p>
+                );
+              }
+
+              return (
+                <div className="divide-y divide-[var(--surface-subtle)]">
+                  {filesToShow.map((file) => (
+                    <div
+                      key={file.path}
+                      className="flex items-center gap-2 py-1.5 cursor-pointer group"
+                      onClick={() => handleEditFile(file.path)}
+                    >
+                      <RiFileLine className="h-3.5 w-3.5 text-muted-foreground flex-shrink-0" />
+                      <span className="typography-ui-label text-foreground truncate">{file.path}</span>
+                      {isNewSkill && (
+                        <span className="typography-micro text-[var(--status-warning)] bg-[var(--status-warning)]/10 px-1.5 py-0.5 rounded flex-shrink-0">
+                          pending
+                        </span>
+                      )}
+                      <ButtonSmall
+                        variant="ghost"
+                        className="h-5 w-5 px-0 flex-shrink-0 text-muted-foreground hover:text-[var(--status-error)] opacity-0 group-hover:opacity-100 transition-opacity"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          handleDeleteFile(file.path);
+                        }}
+                      >
+                        <RiDeleteBinLine className="h-3 w-3" />
+                      </ButtonSmall>
+                    </div>
+                  ))}
+                </div>
+              );
+            })()}
+          </section>
+        </div>
+
+        {/* Save action */}
+        <div className="px-2 py-1">
+          <ButtonSmall
+            onClick={handleSave}
+            disabled={isSaving || !hasSkillChanges}
+            size="xs"
+            className="!font-normal"
+          >
+            {isSaving ? 'Saving...' : isNewSkill ? 'Create Skill' : 'Save Changes'}
+          </ButtonSmall>
+        </div>
+
       </div>
 
       {/* Add/Edit File Dialog */}
@@ -583,15 +540,14 @@ export const SkillsPage: React.FC = () => {
             </DialogDescription>
           </DialogHeader>
           <DialogFooter>
-            <Button
+            <ButtonLarge
               variant="ghost"
               onClick={() => setDeleteFilePath(null)}
               disabled={isDeletingFile}
-              className="text-foreground hover:bg-interactive-hover hover:text-foreground"
             >
               Cancel
-            </Button>
-            <ButtonLarge onClick={handleConfirmDeleteFile} disabled={isDeletingFile}>
+            </ButtonLarge>
+            <ButtonLarge onClick={handleConfirmDeleteFile} disabled={isDeletingFile} className="bg-[var(--status-error)] hover:bg-[var(--status-error)]/90 text-white border-0">
               Delete
             </ButtonLarge>
           </DialogFooter>
@@ -602,7 +558,7 @@ export const SkillsPage: React.FC = () => {
         setIsFileDialogOpen(open);
         if (!open) setEditingFilePath(null);
       }}>
-        <DialogContent className="max-w-2xl max-h-[85vh] flex flex-col" keyboardAvoid>
+        <DialogContent className="max-w-3xl max-h-[85vh] flex flex-col" keyboardAvoid>
           <DialogHeader className="flex-shrink-0">
             <DialogTitle>{editingFilePath ? 'Edit Supporting File' : 'Add Supporting File'}</DialogTitle>
             <DialogDescription>
@@ -614,7 +570,7 @@ export const SkillsPage: React.FC = () => {
               <span className="typography-meta text-muted-foreground">Loading file content...</span>
             </div>
           ) : (
-            <div className="space-y-4 flex-1 min-h-0 flex flex-col">
+            <div className="space-y-4 flex-1 min-h-0 flex flex-col pt-2">
               <div className="space-y-2 flex-shrink-0">
                 <label className="typography-ui-label font-medium text-foreground">
                   File Path
@@ -623,7 +579,7 @@ export const SkillsPage: React.FC = () => {
                   value={newFileName}
                   onChange={(e) => setNewFileName(e.target.value)}
                   placeholder="example.md or docs/reference.txt"
-                  className="text-foreground placeholder:text-muted-foreground"
+                  className="text-foreground placeholder:text-muted-foreground focus-visible:ring-[var(--primary-base)]"
                   disabled={editingFilePath !== null}
                 />
                 {!editingFilePath && (
@@ -640,29 +596,32 @@ export const SkillsPage: React.FC = () => {
                   value={newFileContent}
                   onChange={(e) => setNewFileContent(e.target.value)}
                   placeholder="File content..."
-                  className="font-mono typography-meta flex-1 min-h-[200px] max-h-full resize-none"
+                  outerClassName="h-[45vh] min-h-[250px] max-h-[55vh]"
+                  className="h-full min-h-0 font-mono typography-meta"
                 />
               </div>
             </div>
           )}
-          <DialogFooter>
-            <Button
+          <DialogFooter className="mt-4">
+            <ButtonLarge
               variant="ghost"
               onClick={() => {
                 setIsFileDialogOpen(false);
                 setEditingFilePath(null);
               }}
-              className="text-foreground hover:bg-interactive-hover hover:text-foreground"
             >
               Cancel
-            </Button>
+            </ButtonLarge>
             <ButtonLarge onClick={handleSaveFile} disabled={isLoadingFile || !hasFileChanges}>
               {editingFilePath ? 'Save Changes' : 'Create File'}
             </ButtonLarge>
           </DialogFooter>
         </DialogContent>
       </Dialog>
-      </div>
     </ScrollableOverlay>
   );
+};
+
+export const SkillsPage: React.FC<SkillsPageProps> = ({ view = 'installed' }) => {
+  return view === 'catalog' ? <SkillsCatalogStandalone /> : <SkillsInstalledPage />;
 };
