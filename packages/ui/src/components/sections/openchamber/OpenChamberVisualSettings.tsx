@@ -11,6 +11,7 @@ import { ButtonSmall } from '@/components/ui/button-small';
 import { Checkbox } from '@/components/ui/checkbox';
 import { NumberInput } from '@/components/ui/number-input';
 import { Radio } from '@/components/ui/radio';
+import { Input } from '@/components/ui/input';
 import {
     Select,
     SelectContent,
@@ -18,8 +19,10 @@ import {
     SelectTrigger,
     SelectValue,
 } from '@/components/ui/select';
-import { isVSCodeRuntime } from '@/lib/desktop';
+import { isVSCodeRuntime, isWebRuntime } from '@/lib/desktop';
 import { useDeviceInfo } from '@/lib/device';
+import { usePwaDetection } from '@/hooks/usePwaDetection';
+import { updateDesktopSettings } from '@/lib/persistence';
 import {
     setDirectoryShowHidden,
     useDirectoryShowHidden,
@@ -96,7 +99,14 @@ const MERMAID_RENDERING_OPTIONS: Option<'svg' | 'ascii'>[] = [
     },
 ];
 
-export type VisibleSetting = 'theme' | 'fontSize' | 'terminalFontSize' | 'spacing' | 'cornerRadius' | 'inputBarOffset' | 'navRail' | 'toolOutput' | 'mermaidRendering' | 'diffLayout' | 'mobileStatusBar' | 'dotfiles' | 'reasoning' | 'queueMode' | 'textJustificationActivity' | 'terminalQuickKeys' | 'persistDraft';
+const DEFAULT_PWA_INSTALL_NAME = 'OpenChamber - AI Coding Assistant';
+
+type PwaInstallNameWindow = Window & {
+    __OPENCHAMBER_SET_PWA_INSTALL_NAME__?: (value: string) => string;
+    __OPENCHAMBER_UPDATE_PWA_MANIFEST__?: () => void;
+};
+
+export type VisibleSetting = 'theme' | 'pwaInstallName' | 'fontSize' | 'terminalFontSize' | 'spacing' | 'cornerRadius' | 'inputBarOffset' | 'navRail' | 'toolOutput' | 'mermaidRendering' | 'diffLayout' | 'mobileStatusBar' | 'dotfiles' | 'reasoning' | 'queueMode' | 'textJustificationActivity' | 'terminalQuickKeys' | 'persistDraft';
 
 interface OpenChamberVisualSettingsProps {
     /** Which settings to show. If undefined, shows all. */
@@ -105,6 +115,7 @@ interface OpenChamberVisualSettingsProps {
 
 export const OpenChamberVisualSettings: React.FC<OpenChamberVisualSettingsProps> = ({ visibleSettings }) => {
     const { isMobile } = useDeviceInfo();
+    const { browserTab } = usePwaDetection();
     const directoryShowHidden = useDirectoryShowHidden();
     const showReasoningTraces = useUIStore(state => state.showReasoningTraces);
     const setShowReasoningTraces = useUIStore(state => state.setShowReasoningTraces);
@@ -185,7 +196,7 @@ export const OpenChamberVisualSettings: React.FC<OpenChamberVisualSettingsProps>
         return visibleSettings.includes(setting);
     };
 
-    const hasAppearanceSettings = shouldShow('theme') && !isVSCodeRuntime();
+    const hasAppearanceSettings = (shouldShow('theme') || shouldShow('pwaInstallName')) && !isVSCodeRuntime();
     const hasLayoutSettings = shouldShow('fontSize') || shouldShow('terminalFontSize') || shouldShow('spacing') || shouldShow('cornerRadius') || shouldShow('inputBarOffset');
     const hasNavigationSettings = (!isMobile && shouldShow('navRail')) || (shouldShow('terminalQuickKeys') && !isMobile);
     const hasBehaviorSettings = shouldShow('toolOutput')
@@ -197,6 +208,74 @@ export const OpenChamberVisualSettings: React.FC<OpenChamberVisualSettingsProps>
         || shouldShow('queueMode')
         || shouldShow('textJustificationActivity')
         || shouldShow('persistDraft');
+
+    const showPwaInstallNameSetting = shouldShow('pwaInstallName') && isWebRuntime() && browserTab;
+    const [pwaInstallName, setPwaInstallName] = React.useState('');
+
+    const applyPwaInstallName = React.useCallback(async (value: string) => {
+        if (typeof window === 'undefined') {
+            return;
+        }
+
+        const win = window as PwaInstallNameWindow;
+        const normalized = value.trim().replace(/\s+/g, ' ').slice(0, 64);
+        const persistedValue = normalized;
+
+        await updateDesktopSettings({ pwaAppName: persistedValue });
+
+        if (typeof win.__OPENCHAMBER_SET_PWA_INSTALL_NAME__ === 'function') {
+            const resolved = win.__OPENCHAMBER_SET_PWA_INSTALL_NAME__(persistedValue);
+            setPwaInstallName(resolved);
+            return;
+        }
+
+        setPwaInstallName(persistedValue || DEFAULT_PWA_INSTALL_NAME);
+        win.__OPENCHAMBER_UPDATE_PWA_MANIFEST__?.();
+    }, []);
+
+    React.useEffect(() => {
+        if (typeof window === 'undefined' || !showPwaInstallNameSetting) {
+            return;
+        }
+
+        let cancelled = false;
+
+        const loadPwaInstallName = async () => {
+            try {
+                const response = await fetch('/api/config/settings', {
+                    method: 'GET',
+                    headers: { Accept: 'application/json' },
+                    cache: 'no-store',
+                });
+
+                if (!response.ok) {
+                    if (!cancelled) {
+                        setPwaInstallName(DEFAULT_PWA_INSTALL_NAME);
+                    }
+                    return;
+                }
+
+                const settings = await response.json().catch(() => ({}));
+                const raw = typeof settings?.pwaAppName === 'string' ? settings.pwaAppName : '';
+                const normalized = raw.trim().replace(/\s+/g, ' ').slice(0, 64);
+
+                if (!cancelled) {
+                    setPwaInstallName(normalized || DEFAULT_PWA_INSTALL_NAME);
+                }
+            } catch {
+                if (!cancelled) {
+                    setPwaInstallName(DEFAULT_PWA_INSTALL_NAME);
+                }
+            }
+        };
+
+        void loadPwaInstallName();
+
+        return () => {
+            cancelled = true;
+        };
+    }, [showPwaInstallNameSetting]);
+
     return (
         <div className="space-y-8">
 
@@ -298,6 +377,48 @@ export const OpenChamberVisualSettings: React.FC<OpenChamberVisualSettingsProps>
                                     </TooltipContent>
                                 </Tooltip>
                             </div>
+
+                            {showPwaInstallNameSetting && (
+                                <div className={cn('py-1.5', isMobile ? 'space-y-2' : 'flex items-center gap-8')}>
+                                    <div className={cn('flex min-w-0 flex-col', isMobile ? 'w-full' : 'w-56 shrink-0')}>
+                                        <span className="typography-ui-label text-foreground">Install App Name</span>
+                                        <span className="typography-meta text-muted-foreground">Used by Chrome install prompt before install.</span>
+                                    </div>
+                                    <div className={cn('flex items-center gap-2', isMobile ? 'w-full' : 'w-fit min-w-[22rem]')}>
+                                        <Input
+                                            value={pwaInstallName}
+                                            onChange={(event) => {
+                                                setPwaInstallName(event.target.value);
+                                            }}
+                                            onBlur={() => {
+                                                void applyPwaInstallName(pwaInstallName);
+                                            }}
+                                            onKeyDown={(event) => {
+                                                if (event.key === 'Enter') {
+                                                    event.preventDefault();
+                                                    void applyPwaInstallName(pwaInstallName);
+                                                }
+                                            }}
+                                            className="h-7"
+                                            maxLength={64}
+                                            aria-label="PWA install app name"
+                                        />
+                                        <ButtonSmall
+                                            type="button"
+                                            variant="ghost"
+                                            onClick={() => {
+                                                setPwaInstallName(DEFAULT_PWA_INSTALL_NAME);
+                                                void applyPwaInstallName('');
+                                            }}
+                                            className="h-7 w-7 px-0 text-muted-foreground hover:text-foreground"
+                                            aria-label="Reset install app name"
+                                            title="Reset"
+                                        >
+                                            <RiRestartLine className="h-3.5 w-3.5" />
+                                        </ButtonSmall>
+                                    </div>
+                                </div>
+                            )}
                         </section>
                     </div>
                 )}

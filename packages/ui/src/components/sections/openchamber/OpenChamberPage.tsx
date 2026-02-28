@@ -102,7 +102,7 @@ const ShortcutsSectionContent: React.FC = () => {
 
 // Visual section: Theme Mode, Font Size, Spacing, Corner Radius, Input Bar Offset (mobile), Nav Rail
 const VisualSectionContent: React.FC = () => {
-    return <OpenChamberVisualSettings visibleSettings={['theme', 'fontSize', 'terminalFontSize', 'spacing', 'cornerRadius', 'inputBarOffset', 'terminalQuickKeys', 'navRail']} />;
+    return <OpenChamberVisualSettings visibleSettings={['theme', 'pwaInstallName', 'fontSize', 'terminalFontSize', 'spacing', 'cornerRadius', 'inputBarOffset', 'terminalQuickKeys', 'navRail']} />;
 };
 
 // Chat section: Default Tool Output, Diff layout, Mobile status bar, Show reasoning traces, Queue mode, Persist draft
