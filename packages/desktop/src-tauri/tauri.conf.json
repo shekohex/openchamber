@@ -1,8 +1,8 @@
 {
   "$schema": "../node_modules/@tauri-apps/cli/schema.json",
   "productName": "OpenChamber",
-  "version": "1.8.1",
-  "identifier": "ai.fedaykin.openchamber",
+  "version": "1.8.2",
+  "identifier": "ai.opencode.openchamber",
   "build": {
     "beforeDevCommand": "node ./scripts/dev-web-server.mjs",
     "beforeBuildCommand": "bun run build:sidecar",
