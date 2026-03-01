@@ -186,11 +186,136 @@ type TauriGlobal = {
 type TauriNotificationPermission = 'granted' | 'denied' | 'default';
 type HapticFeedbackType = 'selection' | 'success' | 'warning' | 'error' | 'impact-light' | 'impact-medium' | 'impact-heavy';
 
+export type DevicePlatformMetadata = {
+  os?: string;
+  model?: string;
+  version?: string;
+  arch?: string;
+  type?: string;
+  runtime?: string;
+};
+
+export type QrScanResult =
+  | { status: 'ok'; content: string }
+  | { status: 'cancelled' | 'denied' | 'unavailable' | 'camera_unavailable' | 'error'; message?: string };
+
 const getTauriGlobal = (): TauriGlobal | null => {
   if (typeof window === 'undefined') {
     return null;
   }
   return (window as unknown as { __TAURI__?: TauriGlobal }).__TAURI__ ?? null;
+};
+
+const normalizeMetadataField = (value: unknown, maxLength = 80): string | undefined => {
+  if (typeof value !== 'string') {
+    return undefined;
+  }
+  const trimmed = value.trim();
+  if (!trimmed) {
+    return undefined;
+  }
+  return trimmed.slice(0, maxLength);
+};
+
+const inferOsFromUserAgent = (uaRaw: string): string | undefined => {
+  const ua = uaRaw.toLowerCase();
+  if (!ua) {
+    return undefined;
+  }
+  if (ua.includes('windows')) {
+    return 'windows';
+  }
+  if (ua.includes('android')) {
+    return 'android';
+  }
+  if (ua.includes('iphone') || ua.includes('ipad') || ua.includes('ios')) {
+    return 'ios';
+  }
+  if (ua.includes('mac os') || ua.includes('macintosh')) {
+    return 'macos';
+  }
+  if (ua.includes('linux')) {
+    return 'linux';
+  }
+  return undefined;
+};
+
+const inferModelFromUserAgent = (uaRaw: string): string | undefined => {
+  const ua = uaRaw.toLowerCase();
+  if (!ua) {
+    return undefined;
+  }
+  if (ua.includes('iphone')) {
+    return 'iPhone';
+  }
+  if (ua.includes('ipad')) {
+    return 'iPad';
+  }
+  if (ua.includes('android')) {
+    return 'Android';
+  }
+  if (ua.includes('windows')) {
+    return 'Windows PC';
+  }
+  if (ua.includes('macintosh') || ua.includes('mac os')) {
+    return 'Mac';
+  }
+  if (ua.includes('linux')) {
+    return 'Linux';
+  }
+  return undefined;
+};
+
+const isLikelySimulatorRuntime = (): boolean => {
+  if (typeof navigator === 'undefined') {
+    return false;
+  }
+  const ua = navigator.userAgent.toLowerCase();
+  return ua.includes('simulator') || ua.includes('x86_64');
+};
+
+const detectCameraAvailabilityIssue = async (): Promise<string | null> => {
+  if (typeof navigator !== 'undefined' && navigator.mediaDevices && typeof navigator.mediaDevices.enumerateDevices === 'function') {
+    try {
+      const devices = await navigator.mediaDevices.enumerateDevices();
+      if (Array.isArray(devices) && devices.length > 0 && !devices.some((device) => device.kind === 'videoinput')) {
+        return 'No camera detected on this runtime.';
+      }
+    } catch {
+      void 0;
+    }
+  }
+
+  if (isTauriShell()) {
+    try {
+      const os = await import('@tauri-apps/plugin-os');
+      const host = await os.hostname();
+      if (typeof host === 'string' && host.trim().toLowerCase().includes('simulator')) {
+        return 'Camera is unavailable in simulator runtime.';
+      }
+    } catch {
+      void 0;
+    }
+  }
+
+  if (isLikelySimulatorRuntime()) {
+    return 'Camera is unavailable in simulator runtime.';
+  }
+
+  return null;
+};
+
+const getRuntimeKind = (): string => {
+  if (isVSCodeRuntime()) {
+    return 'vscode';
+  }
+  if (isTauriMobileShell()) {
+    return 'mobile';
+  }
+  if (isDesktopShell()) {
+    return 'desktop';
+  }
+  return 'web';
 };
 
 const getRuntimeDescriptor = (): RuntimeDescriptor | null => {
@@ -962,6 +1087,116 @@ export const authenticateWithBiometrics = async (
   } catch {
     return false;
   }
+};
+
+export const getRuntimeDevicePlatformMetadata = async (): Promise<DevicePlatformMetadata> => {
+  const ua = typeof navigator !== 'undefined' ? navigator.userAgent : '';
+  const runtime = normalizeMetadataField(getRuntimeKind(), 24);
+  const fallbackModel = normalizeMetadataField(inferModelFromUserAgent(ua));
+  const fallbackOs = normalizeMetadataField(inferOsFromUserAgent(ua));
+
+  if (!isTauriShell()) {
+    return {
+      ...(fallbackOs ? { os: fallbackOs } : {}),
+      ...(fallbackModel ? { model: fallbackModel } : {}),
+      ...(runtime ? { runtime } : {}),
+    };
+  }
+
+  try {
+    const os = await import('@tauri-apps/plugin-os');
+    const platform = normalizeMetadataField(os.platform());
+    const type = normalizeMetadataField(os.type());
+    const version = normalizeMetadataField(os.version(), 120);
+    const arch = normalizeMetadataField(os.arch());
+
+    return {
+      ...(platform ? { os: platform } : fallbackOs ? { os: fallbackOs } : {}),
+      ...(fallbackModel ? { model: fallbackModel } : {}),
+      ...(version ? { version } : {}),
+      ...(arch ? { arch } : {}),
+      ...(type ? { type } : {}),
+      ...(runtime ? { runtime } : {}),
+    };
+  } catch {
+    return {
+      ...(fallbackOs ? { os: fallbackOs } : {}),
+      ...(fallbackModel ? { model: fallbackModel } : {}),
+      ...(runtime ? { runtime } : {}),
+    };
+  }
+};
+
+export const scanQrCodeFromCamera = async (): Promise<QrScanResult> => {
+  if (!isNativeMobileApp()) {
+    return { status: 'unavailable', message: 'not_mobile_runtime' };
+  }
+
+  const cameraIssue = await detectCameraAvailabilityIssue();
+  if (cameraIssue) {
+    return { status: 'camera_unavailable', message: cameraIssue };
+  }
+
+  try {
+    const barcode = await import('@tauri-apps/plugin-barcode-scanner');
+
+    let permission = await barcode.checkPermissions();
+    if (permission !== 'granted') {
+      permission = await barcode.requestPermissions();
+    }
+
+    if (permission !== 'granted') {
+      return { status: 'denied', message: `camera_permission_${permission}` };
+    }
+
+    const scanned = await barcode.scan({
+      cameraDirection: 'back',
+      formats: [barcode.Format.QRCode],
+      windowed: true,
+    });
+
+    const content = typeof scanned?.content === 'string' ? scanned.content.trim() : '';
+    if (!content) {
+      return { status: 'error', message: 'empty_scan_result' };
+    }
+
+    return { status: 'ok', content };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error ?? 'scan_failed');
+    const normalized = message.toLowerCase();
+    if (normalized.includes('cancel')) {
+      return { status: 'cancelled', message };
+    }
+    if (
+      normalized.includes('camera')
+      || normalized.includes('permission denied')
+      || normalized.includes('not available')
+      || normalized.includes('simulator')
+      || normalized.includes('no camera')
+    ) {
+      return { status: 'camera_unavailable', message };
+    }
+    return { status: 'error', message };
+  }
+};
+
+export const getQrScannerAvailability = async (): Promise<{ available: boolean; reason?: string }> => {
+  if (!isNativeMobileApp()) {
+    return {
+      available: false,
+      reason: 'QR scanning is only available on mobile app runtime.',
+    };
+  }
+
+  const cameraIssue = await detectCameraAvailabilityIssue();
+  if (cameraIssue) {
+    return {
+      available: false,
+      reason: `${cameraIssue} Use manual URL entry or run on a physical device.`,
+    };
+  }
+
+  return { available: true };
 };
 
 export const clearDesktopCache = async (): Promise<boolean> => {

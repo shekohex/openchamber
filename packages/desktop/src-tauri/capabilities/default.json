@@ -17,7 +17,10 @@
       "https://*/*"
     ]
   },
-  "windows": ["main", "main-*"],
+  "windows": [
+    "main",
+    "main-*"
+  ],
   "permissions": [
     "core:default",
     "core:window:default",
@@ -45,6 +48,7 @@
     "window-state:default",
     "updater:default",
     "updater:allow-check",
-    "updater:allow-download-and-install"
+    "updater:allow-download-and-install",
+    "os:default"
   ]
 }

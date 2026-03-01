@@ -13,6 +13,10 @@ pub fn run() {
     use std::time::Duration;
     use tauri::{Manager, WebviewUrl, WebviewWindowBuilder};
 
+    if rustls::crypto::CryptoProvider::get_default().is_none() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    }
+
     let log_builder = tauri_plugin_log::Builder::default()
         .level(log::LevelFilter::Info)
         .clear_targets()
@@ -22,6 +26,7 @@ pub fn run() {
         ]);
 
     let builder = tauri::Builder::default()
+        .plugin(tauri_plugin_os::init())
         .plugin(tauri_plugin_clipboard_manager::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_notification::init())
@@ -29,6 +34,7 @@ pub fn run() {
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_haptics::init())
         .plugin(tauri_plugin_biometric::init())
+        .plugin(tauri_plugin_barcode_scanner::init())
         .plugin(log_builder.build())
         .setup(|app| {
             let label = "main";
@@ -56,7 +62,12 @@ pub fn run() {
                     .ok()
                     .map(|value| value.trim().to_string())
                     .filter(|value| !value.is_empty())
-                    .unwrap_or_else(|| "127.0.0.1".to_string());
+                    .unwrap_or_else(|| "localhost".to_string());
+                let host = if cfg!(target_os = "ios") && host == "127.0.0.1" {
+                    "localhost".to_string()
+                } else {
+                    host
+                };
                 let port = std::env::var("TAURI_DEV_PORT")
                     .ok()
                     .and_then(|value| value.trim().parse::<u16>().ok())

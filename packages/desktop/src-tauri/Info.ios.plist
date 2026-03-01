@@ -6,6 +6,8 @@
 	<string>OpenChamber needs local network access in development to connect to the local web server.</string>
 	<key>NSFaceIDUsageDescription</key>
 	<string>OpenChamber uses Face ID to unlock the app.</string>
+	<key>NSCameraUsageDescription</key>
+	<string>OpenChamber uses the camera to scan QR codes for device pairing.</string>
 	<key>NSAppTransportSecurity</key>
 	<dict>
 		<key>NSAllowsArbitraryLoadsInWebContent</key>

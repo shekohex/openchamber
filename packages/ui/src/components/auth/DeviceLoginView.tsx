@@ -3,18 +3,69 @@ import QRCode from 'qrcode';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { toast } from '@/components/ui';
-import { startDeviceFlow, pollDeviceToken, type DeviceStartResponse, type DevicePollingState } from '@/lib/auth/deviceFlow';
+import {
+  buildDevicePairingPayload,
+  DeviceFlowRequestError,
+  parseDevicePairingPayload,
+  pollDeviceToken,
+  startDeviceFlow,
+  type DevicePollingState,
+  type DeviceStartResponse,
+} from '@/lib/auth/deviceFlow';
 import { resolveInstanceApiBaseUrlAfterLogin } from '@/lib/auth/resolveInstanceAfterLogin';
 import { setToken } from '@/lib/auth/tokenStorage';
 import { useInstancesStore } from '@/stores/useInstancesStore';
 import { useUIStore } from '@/stores/useUIStore';
-import { openExternalUrl, writeTextToClipboard } from '@/lib/desktop';
+import {
+  getQrScannerAvailability,
+  getRuntimeDevicePlatformMetadata,
+  isNativeMobileApp,
+  openExternalUrl,
+  scanQrCodeFromCamera,
+  writeTextToClipboard,
+} from '@/lib/desktop';
 
 type DeviceLoginViewProps = {
   forceOpen?: boolean;
 };
 
 type FlowState = 'idle' | 'starting' | 'pending' | 'denied' | 'expired' | 'error' | 'success';
+
+const describeStartFlowError = (error: unknown, instanceUrl: string): string => {
+  const origin = (() => {
+    try {
+      return new URL(instanceUrl).origin;
+    } catch {
+      return instanceUrl;
+    }
+  })();
+
+  if (error instanceof DeviceFlowRequestError) {
+    if (error.code === 'network_error') {
+      return `Connection error: unable to reach ${origin}. Check URL, network, and that server is running.`;
+    }
+    if (error.code === 'server_error') {
+      return 'Server error: the instance failed to create a device login request. Try again in a moment.';
+    }
+    if (error.code === 'auth_required') {
+      return 'Authentication error: this instance rejected device login request.';
+    }
+    if (error.code === 'invalid_response') {
+      return 'Protocol error: instance returned an invalid device-login response.';
+    }
+    const detail = error.details || error.message || error.code;
+    return `Device login failed: ${detail}`;
+  }
+
+  const fallback = error instanceof Error ? error.message : String(error ?? 'unknown_error');
+  if (fallback === 'access_denied') {
+    return 'Request declined from the server approval prompt.';
+  }
+  if (fallback === 'expired_token') {
+    return 'The device code expired before approval. Start login again.';
+  }
+  return `Device login failed: ${fallback}`;
+};
 
 export const DeviceLoginView: React.FC<DeviceLoginViewProps> = ({ forceOpen = false }) => {
   const instances = useInstancesStore((state) => state.instances);
@@ -34,7 +85,11 @@ export const DeviceLoginView: React.FC<DeviceLoginViewProps> = ({ forceOpen = fa
   const [flow, setFlow] = React.useState<(DeviceStartResponse & { apiBaseUrl: string }) | null>(null);
   const [qrDataUrl, setQrDataUrl] = React.useState<string | null>(null);
   const [secondsLeft, setSecondsLeft] = React.useState<number>(0);
+  const [isScanningQr, setIsScanningQr] = React.useState(false);
+  const [isCheckingScannerAvailability, setIsCheckingScannerAvailability] = React.useState(false);
+  const [scannerUnavailableReason, setScannerUnavailableReason] = React.useState<string | null>(null);
   const pollAbortRef = React.useRef<AbortController | null>(null);
+  const isNativeMobile = React.useMemo(() => isNativeMobileApp(), []);
 
   const canClose = forceOpen ? instances.length > 0 : true;
 
@@ -70,7 +125,12 @@ export const DeviceLoginView: React.FC<DeviceLoginViewProps> = ({ forceOpen = fa
       return;
     }
 
-    const payload = `openchamber://device?instance=${encodeURIComponent(flow.apiBaseUrl)}`;
+    if (isNativeMobile) {
+      setQrDataUrl(null);
+      return;
+    }
+
+    const payload = buildDevicePairingPayload(flow.apiBaseUrl);
     void QRCode.toDataURL(payload, {
       margin: 1,
       width: 180,
@@ -82,7 +142,40 @@ export const DeviceLoginView: React.FC<DeviceLoginViewProps> = ({ forceOpen = fa
       .catch(() => {
         setQrDataUrl(null);
       });
-  }, [flow]);
+  }, [flow, isNativeMobile]);
+
+  React.useEffect(() => {
+    if (!isNativeMobile) {
+      setIsCheckingScannerAvailability(false);
+      setScannerUnavailableReason(null);
+      return;
+    }
+
+    let cancelled = false;
+    setIsCheckingScannerAvailability(true);
+    void getQrScannerAvailability()
+      .then((status) => {
+        if (cancelled) {
+          return;
+        }
+        setScannerUnavailableReason(status.available ? null : status.reason || 'Camera unavailable for QR scanning.');
+      })
+      .catch(() => {
+        if (cancelled) {
+          return;
+        }
+        setScannerUnavailableReason('Unable to verify camera availability. You can still use manual URL entry.');
+      })
+      .finally(() => {
+        if (!cancelled) {
+          setIsCheckingScannerAvailability(false);
+        }
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [isNativeMobile]);
 
   const resetFlow = React.useCallback(() => {
     clearPolling();
@@ -109,15 +202,22 @@ export const DeviceLoginView: React.FC<DeviceLoginViewProps> = ({ forceOpen = fa
     try {
       resolved = resolveInstanceApiBaseUrlAfterLogin({ enteredUrl: instanceUrl });
     } catch (error) {
+      const reason = error instanceof Error ? error.message : 'Invalid instance URL';
       setPhase('error');
-      setErrorMessage(error instanceof Error ? error.message : 'Invalid instance URL');
+      setErrorMessage(reason);
+      toast.error('Invalid instance URL', {
+        description: `${reason}. Expected: https://host or https://host/api`,
+      });
       return;
     }
 
     try {
       clearPolling();
+      const platform = await getRuntimeDevicePlatformMetadata();
       const started = await startDeviceFlow(resolved.apiBaseUrl, {
         name: deviceName.trim() || undefined,
+        platform,
+        verificationApiBaseUrl: resolved.apiBaseUrl,
       });
       const nextFlow = {
         ...started,
@@ -155,26 +255,83 @@ export const DeviceLoginView: React.FC<DeviceLoginViewProps> = ({ forceOpen = fa
       setCurrentInstance(instanceId);
       touchInstance(instanceId);
 
+      clearPolling();
       setPhase('success');
       setDeviceLoginOpen(false);
-      window.setTimeout(() => {
-        window.location.reload();
-      }, 150);
+      toast.success('Device approved. Opening app...');
     } catch (error) {
       if (error instanceof DOMException && error.name === 'AbortError') {
         return;
       }
-      const message = error instanceof Error ? error.message : 'Device login failed';
-      if (message === 'access_denied') {
+      const message = describeStartFlowError(error, resolved.apiBaseUrl);
+      const rawCode = error instanceof Error ? error.message : '';
+      if (rawCode === 'access_denied') {
         setPhase('denied');
-      } else if (message === 'expired_token') {
+      } else if (rawCode === 'expired_token') {
         setPhase('expired');
       } else {
         setPhase('error');
       }
       setErrorMessage(message);
+      toast.error('Device login failed', {
+        description: message,
+      });
     }
   }, [addInstance, clearPolling, deviceName, instanceUrl, setCurrentInstance, setDefaultInstance, setDeviceLoginOpen, touchInstance]);
+
+  const handleScanQr = React.useCallback(async () => {
+    if (scannerUnavailableReason) {
+      toast.error('Camera unavailable', {
+        description: scannerUnavailableReason,
+      });
+      return;
+    }
+
+    setIsScanningQr(true);
+    try {
+      const result = await scanQrCodeFromCamera();
+      if (result.status === 'cancelled') {
+        toast.info('QR scan cancelled', {
+          description: result.message || 'Scanning was cancelled before a QR code was captured.',
+        });
+        return;
+      }
+      if (result.status === 'denied') {
+        toast.error('Camera permission denied', {
+          description: 'Grant camera permission to OpenChamber and retry QR scan.',
+        });
+        return;
+      }
+      if (result.status === 'unavailable') {
+        toast.error('QR scanning is only available on mobile app runtime');
+        return;
+      }
+      if (result.status === 'camera_unavailable') {
+        setScannerUnavailableReason(result.message || 'Camera unavailable for QR scanning.');
+        toast.error('Camera unavailable', {
+          description: result.message || 'Scanner could not access a camera. On simulator, use manual URL entry or a physical device.',
+        });
+        return;
+      }
+      if (result.status !== 'ok') {
+        toast.error('Failed to scan QR code', {
+          description: result.message || 'Unknown scanner error',
+        });
+        return;
+      }
+
+      const parsed = parseDevicePairingPayload(result.content);
+      if (!parsed) {
+        toast.error('Invalid pairing QR');
+        return;
+      }
+
+      setInstanceUrl(parsed.apiBaseUrl);
+      toast.success('Instance URL captured from QR');
+    } finally {
+      setIsScanningQr(false);
+    }
+  }, [scannerUnavailableReason]);
 
   const handleCopy = React.useCallback(async (text: string, label: string) => {
     try {
@@ -210,14 +367,33 @@ export const DeviceLoginView: React.FC<DeviceLoginViewProps> = ({ forceOpen = fa
 
         <div className="grid gap-3 sm:grid-cols-2">
           <div className="space-y-1.5 sm:col-span-2">
-            <label htmlFor="device-instance-url" className="typography-ui-label text-foreground">Instance URL</label>
+            <div className="flex items-center justify-between gap-2">
+              <label htmlFor="device-instance-url" className="typography-ui-label text-foreground">Instance URL</label>
+              {isNativeMobile ? (
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  disabled={waiting || isScanningQr || phase === 'starting' || Boolean(scannerUnavailableReason)}
+                  onClick={() => void handleScanQr()}
+                >
+                  {isScanningQr ? 'Scanning...' : 'Scan QR'}
+                </Button>
+              ) : null}
+            </div>
             <Input
               id="device-instance-url"
               value={instanceUrl}
               onChange={(event) => setInstanceUrl(event.target.value)}
               placeholder="https://example.com or https://example.com/api"
-              disabled={waiting}
+              disabled={waiting || isScanningQr}
             />
+            {isNativeMobile && isCheckingScannerAvailability ? (
+              <p className="typography-micro text-muted-foreground">Checking camera availability...</p>
+            ) : null}
+            {isNativeMobile && scannerUnavailableReason ? (
+              <p className="typography-micro text-status-warning">QR scan unavailable: {scannerUnavailableReason}</p>
+            ) : null}
           </div>
 
           <div className="space-y-1.5 sm:col-span-2">
@@ -248,7 +424,7 @@ export const DeviceLoginView: React.FC<DeviceLoginViewProps> = ({ forceOpen = fa
             </div>
 
             <div className="flex flex-col items-center gap-2">
-              {qrDataUrl ? <img src={qrDataUrl} alt="Device login QR" className="h-[180px] w-[180px] rounded border border-border/60 bg-background" /> : null}
+              {!isNativeMobile && qrDataUrl ? <img src={qrDataUrl} alt="Device login QR" className="h-[180px] w-[180px] rounded border border-border/60 bg-background" /> : null}
               <Button type="button" variant="outline" size="sm" onClick={() => void handleCopy(flow.userCode, 'Code')}>Copy Code</Button>
               <Button type="button" variant="outline" size="sm" onClick={() => void openVerificationUrl(flow.verificationUriComplete || flow.verificationUri)}>Open Verification</Button>
             </div>

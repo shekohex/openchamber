@@ -1,5 +1,10 @@
 export type LocalSidecarStatus = 'unknown' | 'running' | 'not-running';
 
+type InstanceCandidate = {
+  id: string;
+  lastUsedAt: number | null;
+};
+
 export const isLikelyLocalHostname = (hostname: string): boolean => {
   const host = hostname.trim().toLowerCase();
   if (!host) {
@@ -72,4 +77,26 @@ export const shouldBypassDeviceLoginForVerification = (search: string): boolean 
     return true;
   }
   return false;
+};
+
+export const getAuthenticatedInstanceIdsByRecency = (
+  instances: InstanceCandidate[],
+  hasAccessToken: (instanceId: string) => boolean,
+): string[] => {
+  return [...instances]
+    .sort((a, b) => (b.lastUsedAt ?? 0) - (a.lastUsedAt ?? 0))
+    .filter((instance) => hasAccessToken(instance.id))
+    .map((instance) => instance.id);
+};
+
+export const shouldForceMobileDeviceLogin = (input: {
+  isMobileRuntime: boolean;
+  hydrated: boolean;
+  hasDesktopSidecar: boolean;
+  authenticatedInstancesCount: number;
+}): boolean => {
+  return input.isMobileRuntime
+    && input.hydrated
+    && !input.hasDesktopSidecar
+    && input.authenticatedInstancesCount === 0;
 };

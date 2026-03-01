@@ -4,11 +4,14 @@ import { useUIStore } from '@/stores/useUIStore';
 import { DeviceLoginView } from './DeviceLoginView';
 import type { RuntimeAPIs } from '@/lib/api/types';
 import { isMobileRuntime } from '@/lib/desktop';
+import { getAccessToken } from '@/lib/auth/tokenStorage';
 import {
+  getAuthenticatedInstanceIdsByRecency,
   isLikelyLocalHostname,
   isLocalOpenChamberHealthPayload,
   shouldBypassDeviceLoginForVerification,
   shouldForceDeviceLogin,
+  shouldForceMobileDeviceLogin,
 } from '@/lib/auth/deviceLoginGate';
 
 type DeviceLoginGateProps = {
@@ -16,10 +19,11 @@ type DeviceLoginGateProps = {
 };
 
 export const DeviceLoginGate: React.FC<DeviceLoginGateProps> = ({ children }) => {
+  const instances = useInstancesStore((state) => state.instances);
+  const currentInstanceId = useInstancesStore((state) => state.currentInstanceId);
+  const setCurrentInstance = useInstancesStore((state) => state.setCurrentInstance);
   const hydrated = useInstancesStore((state) => state.hydrated);
-  const instancesCount = useInstancesStore((state) => state.instances.length);
   const isDeviceLoginOpen = useUIStore((state) => state.isDeviceLoginOpen);
-  const [localSidecarStatus, setLocalSidecarStatus] = React.useState<'unknown' | 'running' | 'not-running'>('unknown');
 
   const runtime = React.useMemo(() => {
     if (typeof window === 'undefined') {
@@ -32,7 +36,38 @@ export const DeviceLoginGate: React.FC<DeviceLoginGateProps> = ({ children }) =>
     };
   }, []);
 
+  const [localSidecarStatus, setLocalSidecarStatus] = React.useState<'unknown' | 'running' | 'not-running'>(
+    runtime.isMobileRuntime ? 'not-running' : 'unknown',
+  );
+
+  const instancesCount = instances.length;
+  const authenticatedInstanceIds = React.useMemo(() => {
+    return getAuthenticatedInstanceIdsByRecency(instances, (instanceId) => Boolean(getAccessToken(instanceId)));
+  }, [instances]);
+
+  const authenticatedInstancesCount = authenticatedInstanceIds.length;
+
+  const preferredAuthenticatedInstanceId = authenticatedInstanceIds[0] ?? null;
+
   const hasDesktopSidecar = runtime.hasDesktopSidecar;
+  const instancesForGate = runtime.isMobileRuntime ? authenticatedInstancesCount : instancesCount;
+  const mobileMustGate = shouldForceMobileDeviceLogin({
+    isMobileRuntime: runtime.isMobileRuntime,
+    hydrated,
+    hasDesktopSidecar,
+    authenticatedInstancesCount,
+  });
+
+  React.useEffect(() => {
+    if (!hydrated || !runtime.isMobileRuntime || hasDesktopSidecar) {
+      return;
+    }
+    if (!preferredAuthenticatedInstanceId || preferredAuthenticatedInstanceId === currentInstanceId) {
+      return;
+    }
+    setCurrentInstance(preferredAuthenticatedInstanceId);
+  }, [currentInstanceId, hasDesktopSidecar, hydrated, preferredAuthenticatedInstanceId, runtime.isMobileRuntime, setCurrentInstance]);
+
   const bypassDeviceLoginGate = React.useMemo(() => {
     if (typeof window === 'undefined') {
       return false;
@@ -41,7 +76,7 @@ export const DeviceLoginGate: React.FC<DeviceLoginGateProps> = ({ children }) =>
   }, []);
 
   React.useEffect(() => {
-    if (!hydrated || instancesCount !== 0 || hasDesktopSidecar) {
+    if (!hydrated || instancesForGate !== 0 || hasDesktopSidecar) {
       return;
     }
 
@@ -99,15 +134,20 @@ export const DeviceLoginGate: React.FC<DeviceLoginGateProps> = ({ children }) =>
       window.clearTimeout(timer);
       controller.abort();
     };
-  }, [hydrated, instancesCount, hasDesktopSidecar, runtime.isMobileRuntime]);
+  }, [hasDesktopSidecar, hydrated, instancesForGate, runtime.isMobileRuntime]);
 
-  const mustGate = shouldForceDeviceLogin({ hydrated, instancesCount, hasDesktopSidecar, localSidecarStatus });
+  const mustGate = mobileMustGate || shouldForceDeviceLogin({
+    hydrated,
+    instancesCount: instancesForGate,
+    hasDesktopSidecar,
+    localSidecarStatus,
+  });
 
   if (bypassDeviceLoginGate) {
     return <>{children}</>;
   }
 
-  if (hydrated && instancesCount === 0 && !hasDesktopSidecar && localSidecarStatus === 'unknown' && !isDeviceLoginOpen) {
+  if (!mobileMustGate && hydrated && instancesForGate === 0 && !hasDesktopSidecar && localSidecarStatus === 'unknown' && !isDeviceLoginOpen) {
     return <>{children}</>;
   }
 

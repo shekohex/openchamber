@@ -40,7 +40,9 @@
     "type-check": "bun -e \"process.exit(0)\"",
     "lint": "bun -e \"process.exit(0)\""
   },
-  "dependencies": {},
+  "dependencies": {
+    "@tauri-apps/plugin-os": "~2"
+  },
   "devDependencies": {
     "@tauri-apps/cli": "^2",
     "@types/node": "^24.3.1",

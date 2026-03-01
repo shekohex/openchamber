@@ -1,10 +1,12 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import {
+  getAuthenticatedInstanceIdsByRecency,
   isLikelyLocalHostname,
   isLocalOpenChamberHealthPayload,
   shouldBypassDeviceLoginForVerification,
   shouldForceDeviceLogin,
+  shouldForceMobileDeviceLogin,
 } from '../src/lib/auth/deviceLoginGate';
 
 describe('device login gate helpers', () => {
@@ -73,5 +75,49 @@ describe('device login gate helpers', () => {
     assert.equal(shouldBypassDeviceLoginForVerification('?settings=settings&section=openchamber&devices=1&user_code=ABCD-EFGH'), true);
     assert.equal(shouldBypassDeviceLoginForVerification('?user_code=ABCD-EFGH'), true);
     assert.equal(shouldBypassDeviceLoginForVerification('?section=openchamber'), false);
+  });
+
+  it('selects authenticated instances by recency', () => {
+    const ids = getAuthenticatedInstanceIdsByRecency(
+      [
+        { id: 'inst-a', lastUsedAt: 20 },
+        { id: 'inst-b', lastUsedAt: 30 },
+        { id: 'inst-c', lastUsedAt: null },
+        { id: 'inst-d', lastUsedAt: 10 },
+      ],
+      (instanceId) => instanceId === 'inst-a' || instanceId === 'inst-b' || instanceId === 'inst-c',
+    );
+
+    assert.deepEqual(ids, ['inst-b', 'inst-a', 'inst-c']);
+  });
+
+  it('forces mobile device login only when no authenticated remote instances exist', () => {
+    assert.equal(shouldForceMobileDeviceLogin({
+      isMobileRuntime: true,
+      hydrated: true,
+      hasDesktopSidecar: false,
+      authenticatedInstancesCount: 0,
+    }), true);
+
+    assert.equal(shouldForceMobileDeviceLogin({
+      isMobileRuntime: true,
+      hydrated: true,
+      hasDesktopSidecar: false,
+      authenticatedInstancesCount: 1,
+    }), false);
+
+    assert.equal(shouldForceMobileDeviceLogin({
+      isMobileRuntime: true,
+      hydrated: true,
+      hasDesktopSidecar: true,
+      authenticatedInstancesCount: 0,
+    }), false);
+
+    assert.equal(shouldForceMobileDeviceLogin({
+      isMobileRuntime: false,
+      hydrated: true,
+      hasDesktopSidecar: false,
+      authenticatedInstancesCount: 0,
+    }), false);
   });
 });

@@ -20,6 +20,37 @@ export type DevicePollingState =
   | 'access_denied'
   | 'network_error';
 
+export type DevicePlatformMetadata = {
+  os?: string;
+  model?: string;
+  version?: string;
+  arch?: string;
+  type?: string;
+  runtime?: string;
+};
+
+export class DeviceFlowRequestError extends Error {
+  readonly endpoint: 'start' | 'token';
+  readonly status: number | null;
+  readonly code: string;
+  readonly details?: string;
+
+  constructor(params: {
+    endpoint: 'start' | 'token';
+    message: string;
+    code: string;
+    status?: number | null;
+    details?: string;
+  }) {
+    super(params.message);
+    this.name = 'DeviceFlowRequestError';
+    this.endpoint = params.endpoint;
+    this.status = params.status ?? null;
+    this.code = params.code;
+    this.details = params.details;
+  }
+}
+
 type PollingUpdate = {
   state: DevicePollingState;
   intervalMs: number;
@@ -62,20 +93,78 @@ const normalizeApiBaseUrl = (value: string): string => value.replace(/\/+$/, '')
 
 export const startDeviceFlow = async (
   apiBaseUrl: string,
-  options?: { name?: string },
+  options?: {
+    name?: string;
+    platform?: DevicePlatformMetadata;
+    verificationOrigin?: string;
+    verificationApiBaseUrl?: string;
+  },
 ): Promise<DeviceStartResponse> => {
-  const response = await fetch(`${normalizeApiBaseUrl(apiBaseUrl)}/auth/device/start`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Accept: 'application/json',
-    },
-    body: JSON.stringify({ name: options?.name || undefined }),
-  });
+  const platform = options?.platform ?? undefined;
+  const hasPlatform = Boolean(
+    platform
+    && (
+      (typeof platform.os === 'string' && platform.os.trim().length > 0)
+      || (typeof platform.model === 'string' && platform.model.trim().length > 0)
+      || (typeof platform.version === 'string' && platform.version.trim().length > 0)
+      || (typeof platform.arch === 'string' && platform.arch.trim().length > 0)
+      || (typeof platform.type === 'string' && platform.type.trim().length > 0)
+      || (typeof platform.runtime === 'string' && platform.runtime.trim().length > 0)
+    ),
+  );
+
+  let response: Response;
+  try {
+    response = await fetch(`${normalizeApiBaseUrl(apiBaseUrl)}/auth/device/start`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Accept: 'application/json',
+      },
+      body: JSON.stringify({
+        name: options?.name || undefined,
+        platform: hasPlatform ? platform : undefined,
+        verification_origin: options?.verificationOrigin || undefined,
+        verification_api_base_url: options?.verificationApiBaseUrl || undefined,
+      }),
+    });
+  } catch (error) {
+    throw new DeviceFlowRequestError({
+      endpoint: 'start',
+      code: 'network_error',
+      message: 'Unable to reach instance',
+      details: error instanceof Error ? error.message : String(error ?? ''),
+    });
+  }
 
   const payload = (await response.json().catch(() => null)) as Record<string, unknown> | null;
-  if (!response.ok || !payload) {
-    throw new Error((payload?.error as string) || response.statusText || 'Failed to start device flow');
+  if (!response.ok) {
+    const code = typeof payload?.error === 'string'
+      ? payload.error
+      : response.status === 401 || response.status === 403
+        ? 'auth_required'
+        : 'request_failed';
+    const details = typeof payload?.error_description === 'string'
+      ? payload.error_description
+      : typeof payload?.message === 'string'
+        ? payload.message
+        : undefined;
+    throw new DeviceFlowRequestError({
+      endpoint: 'start',
+      status: response.status,
+      code,
+      message: details || code,
+      details,
+    });
+  }
+
+  if (!payload) {
+    throw new DeviceFlowRequestError({
+      endpoint: 'start',
+      status: response.status,
+      code: 'invalid_response',
+      message: 'Invalid response from instance',
+    });
   }
 
   const deviceCode = typeof payload.device_code === 'string' ? payload.device_code : '';
@@ -86,7 +175,12 @@ export const startDeviceFlow = async (
   const interval = Number.isFinite(payload.interval) ? Number(payload.interval) : 5;
 
   if (!deviceCode || !userCode || !verificationUri || expiresIn <= 0) {
-    throw new Error('Invalid device flow response');
+    throw new DeviceFlowRequestError({
+      endpoint: 'start',
+      status: response.status,
+      code: 'invalid_response',
+      message: 'Invalid device flow response',
+    });
   }
 
   return {
@@ -97,6 +191,61 @@ export const startDeviceFlow = async (
     expiresIn,
     interval: Math.max(1, interval),
   };
+};
+
+export const buildDevicePairingPayload = (apiBaseUrl: string): string => {
+  const normalized = normalizeApiBaseUrl(apiBaseUrl.trim());
+  return `openchamber://device?instance=${encodeURIComponent(normalized)}`;
+};
+
+export const parseDevicePairingPayload = (payload: string): { apiBaseUrl: string } | null => {
+  const value = payload.trim();
+  if (!value) {
+    return null;
+  }
+
+  if (value.startsWith('openchamber://')) {
+    let parsed: URL;
+    try {
+      parsed = new URL(value);
+    } catch {
+      return null;
+    }
+    if (parsed.protocol !== 'openchamber:' || parsed.hostname !== 'device') {
+      return null;
+    }
+    const rawInstance = parsed.searchParams.get('instance') || '';
+    if (!rawInstance) {
+      return null;
+    }
+    try {
+      const target = new URL(rawInstance);
+      if (target.protocol !== 'http:' && target.protocol !== 'https:') {
+        return null;
+      }
+      return {
+        apiBaseUrl: normalizeApiBaseUrl(target.toString()),
+      };
+    } catch {
+      return null;
+    }
+  }
+
+  try {
+    const parsed = new URL(value);
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+      return null;
+    }
+    const pathname = parsed.pathname.replace(/\/+$/, '');
+    const apiBaseUrl = pathname.endsWith('/api')
+      ? `${parsed.origin}${pathname}`
+      : `${parsed.origin}/api`;
+    return {
+      apiBaseUrl: normalizeApiBaseUrl(apiBaseUrl),
+    };
+  } catch {
+    return null;
+  }
 };
 
 export const pollDeviceToken = async (

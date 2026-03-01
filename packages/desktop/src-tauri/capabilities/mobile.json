@@ -30,6 +30,8 @@
     "haptics:allow-notification-feedback",
     "haptics:allow-selection-feedback",
     "haptics:allow-vibrate",
-    "biometric:default"
+    "barcode-scanner:default",
+    "biometric:default",
+    "os:default"
   ]
 }
